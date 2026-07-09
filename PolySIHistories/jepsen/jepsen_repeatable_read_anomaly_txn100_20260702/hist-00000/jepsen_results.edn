@@ -1,0 +1,126 @@
+{:perf {:latency-graph {:valid? true},
+        :rate-graph {:valid? true},
+        :valid? true},
+ :clock {:valid? true},
+ :stats {:valid? true,
+         :count 101,
+         :ok-count 101,
+         :fail-count 0,
+         :info-count 0,
+         :by-f {:init {:valid? true,
+                       :count 1,
+                       :ok-count 1,
+                       :fail-count 0,
+                       :info-count 0},
+                :txn {:valid? true,
+                      :count 100,
+                      :ok-count 100,
+                      :fail-count 0,
+                      :info-count 0}}},
+ :exceptions {:valid? true},
+ :workload {:closed-predicate {:valid? :unknown,
+                               :error {:via [{:type java.util.concurrent.ExecutionException,
+                                              :message "java.io.IOException: Cannot run program \"dot\": error=2, No such file or directory",
+                                              :at [java.util.concurrent.FutureTask
+                                                   report
+                                                   "FutureTask.java"
+                                                   122]}
+                                             {:type java.io.IOException,
+                                              :message "Cannot run program \"dot\": error=2, No such file or directory",
+                                              :at [java.lang.ProcessBuilder
+                                                   start
+                                                   "ProcessBuilder.java"
+                                                   1170]}
+                                             {:type java.io.IOException,
+                                              :message "error=2, No such file or directory",
+                                              :at [java.lang.ProcessImpl
+                                                   forkAndExec
+                                                   "ProcessImpl.java"
+                                                   -2]}],
+                                       :trace [[java.lang.ProcessImpl
+                                                forkAndExec
+                                                "ProcessImpl.java"
+                                                -2]
+                                               [java.lang.ProcessImpl
+                                                <init>
+                                                "ProcessImpl.java"
+                                                295]
+                                               [java.lang.ProcessImpl
+                                                start
+                                                "ProcessImpl.java"
+                                                225]
+                                               [java.lang.ProcessBuilder
+                                                start
+                                                "ProcessBuilder.java"
+                                                1126]
+                                               [java.lang.ProcessBuilder
+                                                start
+                                                "ProcessBuilder.java"
+                                                1089]
+                                               [java.lang.Runtime
+                                                exec
+                                                "Runtime.java"
+                                                681]
+                                               [clojure.java.shell$sh
+                                                invokeStatic
+                                                "shell.clj"
+                                                113]
+                                               [clojure.java.shell$sh
+                                                doInvoke
+                                                "shell.clj"
+                                                79]
+                                               [clojure.lang.RestFn
+                                                invoke
+                                                "RestFn.java"
+                                                460]
+                                               [rhizome.viz$dot__GT_svg
+                                                invokeStatic
+                                                "viz.clj"
+                                                130]
+                                               [rhizome.viz$dot__GT_svg
+                                                invoke
+                                                "viz.clj"
+                                                126]
+                                               [elle.viz$save_dot_BANG_
+                                                invokeStatic
+                                                "viz.clj"
+                                                198]
+                                               [elle.viz$save_dot_BANG_
+                                                invoke
+                                                "viz.clj"
+                                                188]
+                                               [elle.viz$plot_analysis_BANG_$fn__3467$fn__3471
+                                                invoke
+                                                "viz.clj"
+                                                226]
+                                               [clojure.core$binding_conveyor_fn$fn__5844
+                                                invoke
+                                                "core.clj"
+                                                2051]
+                                               [clojure.lang.AFn
+                                                call
+                                                "AFn.java"
+                                                18]
+                                               [java.util.concurrent.FutureTask
+                                                run
+                                                "FutureTask.java"
+                                                317]
+                                               [java.util.concurrent.ThreadPoolExecutor
+                                                runWorker
+                                                "ThreadPoolExecutor.java"
+                                                1144]
+                                               [java.util.concurrent.ThreadPoolExecutor$Worker
+                                                run
+                                                "ThreadPoolExecutor.java"
+                                                642]
+                                               [java.lang.Thread
+                                                run
+                                                "Thread.java"
+                                                1575]],
+                                       :cause "error=2, No such file or directory"}},
+            :critical {:valid? true, :error-types (), :errors {}},
+            :missing-table-column {:valid? true,
+                                   :error-types nil,
+                                   :errors {}},
+            :valid? :unknown},
+ :valid? :unknown}

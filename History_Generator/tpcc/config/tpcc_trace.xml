@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!--
+  Copy this file outside the repository and replace the PostgreSQL connection
+  placeholders.  Do not commit a password.  The weights retain only the first
+  implementation tranche: NewOrder, Payment, and StockLevel.
+-->
+<parameters>
+    <type>POSTGRES</type>
+    <driver>org.postgresql.Driver</driver>
+    <url>jdbc:postgresql://127.0.0.1:5432/REPLACE_TPCC_DATABASE?sslmode=disable&amp;ApplicationName=benchbase-tpcc-ser-trace&amp;reWriteBatchedInserts=true</url>
+    <username>REPLACE_TPCC_USER</username>
+    <password>REPLACE_WITH_LOCAL_SECRET</password>
+    <reconnectOnConnectionFailure>true</reconnectOnConnectionFailure>
+    <isolation>TRANSACTION_SERIALIZABLE</isolation>
+    <batchsize>128</batchsize>
+
+    <!-- BenchBase TPC-C scale factor: number of warehouses. -->
+    <scalefactor>1</scalefactor>
+    <terminals>2</terminals>
+    <works>
+        <work>
+            <time>30</time>
+            <rate>unlimited</rate>
+            <!-- NewOrder, Payment, OrderStatus, Delivery, StockLevel -->
+            <weights>45,45,0,0,10</weights>
+        </work>
+    </works>
+    <transactiontypes>
+        <transactiontype><name>NewOrder</name></transactiontype>
+        <transactiontype><name>Payment</name></transactiontype>
+        <transactiontype><name>OrderStatus</name></transactiontype>
+        <transactiontype><name>Delivery</name></transactiontype>
+        <transactiontype><name>StockLevel</name></transactiontype>
+    </transactiontypes>
+</parameters>

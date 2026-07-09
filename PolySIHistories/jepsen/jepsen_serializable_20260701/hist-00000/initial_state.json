@@ -1,0 +1,72 @@
+[
+  {
+    "key": "kv:0",
+    "value": 0
+  },
+  {
+    "key": "kv:1",
+    "value": 1
+  },
+  {
+    "absent": true,
+    "key": "kv:11",
+    "value": -1000000000011
+  },
+  {
+    "absent": true,
+    "key": "kv:12",
+    "value": -1000000000012
+  },
+  {
+    "absent": true,
+    "key": "kv:14",
+    "value": -1000000000014
+  },
+  {
+    "absent": true,
+    "key": "kv:17",
+    "value": -1000000000017
+  },
+  {
+    "absent": true,
+    "key": "kv:18",
+    "value": -1000000000018
+  },
+  {
+    "key": "kv:2",
+    "value": 2
+  },
+  {
+    "absent": true,
+    "key": "kv:20",
+    "value": -1000000000020
+  },
+  {
+    "key": "kv:3",
+    "value": 3
+  },
+  {
+    "key": "kv:4",
+    "value": 4
+  },
+  {
+    "key": "kv:5",
+    "value": 5
+  },
+  {
+    "key": "kv:6",
+    "value": 6
+  },
+  {
+    "key": "kv:7",
+    "value": 7
+  },
+  {
+    "key": "kv:8",
+    "value": 8
+  },
+  {
+    "key": "kv:9",
+    "value": 9
+  }
+]

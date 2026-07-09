@@ -1,0 +1,596 @@
+2026-07-02 18:23:44,735{GMT}	INFO	[jepsen test runner] jepsen.core: Test version bcf8eb3df7bb3440e42e580444d6626a382ff338 (plus uncommitted changes)
+2026-07-02 18:23:44,737{GMT}	INFO	[jepsen test runner] jepsen.core: Command line:
+lein run test --existing-postgres --nodes 127.0.0.1 --workload kv-predicate --time-limit 60 --concurrency 4 --rate 20 --postgres-user tpcc_user --postgres-password 12345678 --postgres-port 5432 --postgres-sslmode disable --isolation read-uncommitted --expected-consistency-model serializable --mop-delay 0 --key-count 10 --max-txn-length 4 --max-writes-per-key 64 --predicate-group-count 4 --txn-limit 100 --kv-predicate-anomaly write-skew --kv-predicate-anomaly-delay-ms 1000
+2026-07-02 18:23:44,854{GMT}	INFO	[jepsen test runner] jepsen.core: Running test:
+{:remote
+ #jepsen.control.retry.Remote{:remote #jepsen.control.scp.Remote{:cmd-remote #jepsen.control.sshj.SSHJRemote{:concurrency-limit 6,
+                                                                                                             :conn-spec nil,
+                                                                                                             :client nil,
+                                                                                                             :semaphore nil},
+                                                                 :conn-spec nil},
+                              :conn nil}
+ :postgres-user "tpcc_user"
+ :kv-predicate-anomaly :write-skew
+ :postgres-sslmode "disable"
+ :max-txn-length 4
+ :isolation :read-uncommitted
+ :concurrency 4
+ :wfr-keys? true
+ :key-count 10
+ :existing-postgres true
+ :db
+ #object[jepsen.db$reify__13854 "0x28532753" "jepsen.db$reify__13854@28532753"]
+ :max-writes-per-key 64
+ :expected-consistency-model :serializable
+ :leave-db-running? false
+ :postgres-password "12345678"
+ :key-dist :exponential
+ :name "postgres kv-predicate RU (S)"
+ :logging-json? false
+ :start-time
+ #object[org.joda.time.DateTime "0x21399e53" "2026-07-02T18:23:44.693+08:00"]
+ :nemesis-interval 5
+ :net
+ #object[jepsen.net$iptables_with_dev$reify__14120
+         "0x2a6871ad"
+         "jepsen.net$iptables_with_dev$reify__14120@2a6871ad"]
+ :client
+ #jepsen.sql.client.ClientWrapper{:client #jepsen.sql.workload.kv_predicate.Client{:node nil},
+                                  :open #object[jepsen.postgres.client$open
+                                                "0x260043d"
+                                                "jepsen.postgres.client$open@260043d"],
+                                  :error-fn #object[jepsen.postgres.client$error_fn
+                                                    "0x3338d29d"
+                                                    "jepsen.postgres.client$error_fn@3338d29d"],
+                                  :conn nil}
+ :barrier
+ #object[java.util.concurrent.CyclicBarrier
+         "0x5e1e19af"
+         "java.util.concurrent.CyclicBarrier@5e1e19af"]
+ :linearizable-keys? false
+ :ssh {:dummy? true}
+ :rate 20
+ :encodings
+ (:character :character-varying :decimal :double-precision :integer :text)
+ :checker
+ #jepsen.checker.Compose{:checkers {:perf #jepsen.checker.Compose{:checkers {:latency-graph #jepsen.checker.LatencyGraph{:opts {:nemeses nil}},
+                                                                             :rate-graph #jepsen.checker.RateGraph{:opts {:nemeses nil}}}},
+                                    :clock #jepsen.checker.ClockPlot{},
+                                    :stats #jepsen.checker.Stats{},
+                                    :exceptions #jepsen.checker.UnhandledExceptions{},
+                                    :workload #jepsen.checker.Compose{:checkers {:closed-predicate #jepsen.sql.workload.kv_predicate.ClosedPredicateChecker{:opts {:consistency-models [:serializable],
+                                                                                                                                                                   :additional-graphs [#object[jepsen.sql.workload.kv_predicate$w_ww_graph
+                                                                                                                                                                                               "0x3792fed8"
+                                                                                                                                                                                               "jepsen.sql.workload.kv_predicate$w_ww_graph@3792fed8"]]}},
+                                                                                 :critical #jepsen.sql.checker.CriticalChecker{},
+                                                                                 :missing-table-column #jepsen.sql.checker.MissingTableColumnChecker{}}}}}
+ :sequential-keys? false
+ :indirection? false
+ :argv
+ ("test"
+  "--existing-postgres"
+  "--nodes"
+  "127.0.0.1"
+  "--workload"
+  "kv-predicate"
+  "--time-limit"
+  "60"
+  "--concurrency"
+  "4"
+  "--rate"
+  "20"
+  "--postgres-user"
+  "tpcc_user"
+  "--postgres-password"
+  "12345678"
+  "--postgres-port"
+  "5432"
+  "--postgres-sslmode"
+  "disable"
+  "--isolation"
+  "read-uncommitted"
+  "--expected-consistency-model"
+  "serializable"
+  "--mop-delay"
+  "0"
+  "--key-count"
+  "10"
+  "--max-txn-length"
+  "4"
+  "--max-writes-per-key"
+  "64"
+  "--predicate-group-count"
+  "4"
+  "--txn-limit"
+  "100"
+  "--kv-predicate-anomaly"
+  "write-skew"
+  "--kv-predicate-anomaly-delay-ms"
+  "1000")
+ :nemesis #unprintable "jepsen.nemesis$reify__14243@35d145fb"
+ :nodes ["127.0.0.1"]
+ :test-count 1
+ :generator
+ #object[jepsen.util.Forgettable
+         "0x75aeec0a"
+         (jepsen.generator.Synchronize
+          {:gen (jepsen.generator.TimeLimit
+                 {:limit 60000000000,
+                  :cutoff nil,
+                  :gen (jepsen.generator.OnThreads
+                        {:f #jepsen.generator.context.AllBut{:element :nemesis},
+                         :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__4292
+                                                 "0x1e7797db"
+                                                 "jepsen.generator.context$make_thread_filter$lazy_filter__4292@1e7797db"],
+                         :gen (jepsen.generator.Stagger
+                               {:dt 100000000,
+                                :next-time nil,
+                                :gen ((jepsen.generator.Synchronize
+                                       {:gen (jepsen.generator.Limit
+                                              {:remaining 1,
+                                               :gen {:type :invoke,
+                                                     :process 0,
+                                                     :f :init,
+                                                     :value {0 0,
+                                                             1 1,
+                                                             2 2,
+                                                             3 3,
+                                                             4 4,
+                                                             5 5,
+                                                             6 6,
+                                                             7 7,
+                                                             ...}}})})
+                                      (jepsen.generator.Synchronize
+                                       {:gen (jepsen.generator.Limit
+                                              {:remaining 100,
+                                               :gen ({:type :invoke,
+                                                      :f :txn,
+                                                      :value [[:rp [:= 0] nil]
+                                                              [:sleep 1000 nil]
+                                                              [:w 1 10]]}
+                                                     {:type :invoke,
+                                                      :f :txn,
+                                                      :value [[:rp [:= 1] nil]
+                                                              [:sleep 1000 nil]
+                                                              [:w 0 11]]}
+                                                     {:type :invoke,
+                                                      :f :txn,
+                                                      :value [[:rp
+                                                               [:mod 4 0]
+                                                               nil]
+                                                              [:r 9 nil]
+                                                              [:w 8 12]]}
+                                                     {:type :invoke,
+                                                      :f :txn,
+                                                      :value [[:rp
+                                                               [:mod 4 3]
+                                                               nil]
+                                                              [:r 9 nil]
+                                                              [:w 9 13]]}
+                                                     {:type :invoke,
+                                                      :f :txn,
+                                                      :value [[:rp :true nil]]}
+                                                     {:type :invoke,
+                                                      :f :txn,
+                                                      :value [[:r 6 nil]
+                                                              [:r 9 nil]
+                                                              [:rp [:= 9] nil]]}
+                                                     {:type :invoke,
+                                                      :f :txn,
+                                                      :value [[:rp [:= 0] nil]
+                                                              [:w 8 14]
+                                                              [:rp
+                                                               [:mod 4 1]
+                                                               nil]
+                                                              [:rp :true nil]]}
+                                                     {:type :invoke,
+                                                      :f :txn,
+                                                      :value [[:w 5 15]
+                                                              [:r 9 nil]]}
+                                                     ...)})}))})})})})]
+ :postgres-port 5432
+ :mop-delay 0
+ :key-types [:primary :secondary]
+ :predicate-group-count 4
+ :os
+ #object[jepsen.os$reify__14540 "0xd164938" "jepsen.os$reify__14540@d164938"]
+ :time-limit 60
+ :version "0.16.0"
+ :savepoints true
+ :workload :kv-predicate
+ :txn-limit 100
+ :upsert-types [:update-insert-update :copy-on-write :on-conflict]
+ :kv-predicate-anomaly-delay-ms 1000}
+
+2026-07-02 18:23:46,614{GMT}	INFO	[jepsen test runner] jepsen.db: Tearing down DB
+2026-07-02 18:23:46,616{GMT}	INFO	[jepsen test runner] jepsen.db: Setting up DB
+2026-07-02 18:23:46,618{GMT}	INFO	[jepsen test runner] jepsen.core: Relative time begins now
+2026-07-02 18:23:46,839{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:init	{0 0, 1 1, 2 2, 3 3, 4 4, 5 5, 6 6, 7 7, 8 8, 9 9}
+2026-07-02 18:23:46,900{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:init	{0 0, 1 1, 2 2, 3 3, 4 4, 5 5, 6 6, 7 7, 8 8, 9 9}
+2026-07-02 18:23:46,901{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:rp [:= 0] nil] [:sleep 1000 nil] [:w 1 10]]
+2026-07-02 18:23:46,937{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:rp [:= 1] nil] [:sleep 1000 nil] [:w 0 11]]
+2026-07-02 18:23:46,981{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:rp [:mod 4 0] nil] [:r 9 nil] [:w 8 12]]
+2026-07-02 18:23:46,997{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp [:mod 4 3] nil] [:r 9 nil] [:w 9 13]]
+2026-07-02 18:23:47,010{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp [:mod 4 3] {3 3, 7 7}] [:r 9 9] [:w 9 13]]
+2026-07-02 18:23:47,015{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:rp [:mod 4 0] {0 0, 4 4, 8 8}] [:r 9 9] [:w 8 12]]
+2026-07-02 18:23:47,073{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp :true nil]]
+2026-07-02 18:23:47,078{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 5, 6 6, 7 7, 8 12, 9 13}]]
+2026-07-02 18:23:47,149{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:r 6 nil] [:r 9 nil] [:rp [:= 9] nil]]
+2026-07-02 18:23:47,156{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:r 6 6] [:r 9 13] [:rp [:= 9] {}]]
+2026-07-02 18:23:47,160{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:rp [:= 0] nil] [:w 8 14] [:rp [:mod 4 1] nil] [:rp :true nil]]
+2026-07-02 18:23:47,166{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:rp [:= 0] {0 0}] [:w 8 14] [:rp [:mod 4 1] {1 1, 5 5, 9 13}] [:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 5, 6 6, 7 7, 8 14, 9 13}]]
+2026-07-02 18:23:47,174{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:w 5 15] [:r 9 nil]]
+2026-07-02 18:23:47,176{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp :true nil] [:r 9 nil] [:w 8 16]]
+2026-07-02 18:23:47,178{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:w 5 15] [:r 9 13]]
+2026-07-02 18:23:47,182{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 15, 6 6, 7 7, 8 14, 9 13}] [:r 9 13] [:w 8 16]]
+2026-07-02 18:23:47,231{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp [:mod 4 2] nil] [:rp :true nil] [:r 6 nil]]
+2026-07-02 18:23:47,236{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp [:mod 4 2] {2 2, 6 6}] [:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 15, 6 6, 7 7, 8 16, 9 13}] [:r 6 6]]
+2026-07-02 18:23:47,276{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:w 6 17] [:rp :true nil] [:r 8 nil] [:r 8 nil]]
+2026-07-02 18:23:47,282{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:w 6 17] [:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 15, 6 17, 7 7, 8 16, 9 13}] [:r 8 16] [:r 8 16]]
+2026-07-02 18:23:47,338{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:rp :true nil] [:w 7 18] [:rp :true nil] [:rp [:mod 4 3] nil]]
+2026-07-02 18:23:47,340{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 19] [:rp [:mod 4 3] nil]]
+2026-07-02 18:23:47,344{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 15, 6 17, 7 7, 8 16, 9 13}] [:w 7 18] [:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 15, 6 17, 7 18, 8 16, 9 13}] [:rp [:mod 4 3] {3 3, 5 15}]]
+2026-07-02 18:23:47,344{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 19] [:rp [:mod 4 3] {3 3, 5 15, 7 7, 9 19}]]
+2026-07-02 18:23:47,399{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp [:= 8] nil] [:r 8 nil] [:rp [:mod 4 2] nil]]
+2026-07-02 18:23:47,412{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp [:= 8] {}] [:r 8 16] [:rp [:mod 4 2] {2 2, 7 18}]]
+2026-07-02 18:23:47,425{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 20]]
+2026-07-02 18:23:47,434{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 20]]
+2026-07-02 18:23:47,508{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:w 9 21] [:rp :true nil] [:r 5 nil]]
+2026-07-02 18:23:47,514{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:w 9 21] [:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 15, 6 17, 7 18, 8 16, 9 21}] [:r 5 15]]
+2026-07-02 18:23:47,575{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:rp :true nil]]
+2026-07-02 18:23:47,579{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 15, 6 17, 7 18, 8 16, 9 21}]]
+2026-07-02 18:23:47,582{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:w 8 22] [:r 8 nil] [:w 9 23]]
+2026-07-02 18:23:47,586{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:w 8 22] [:r 8 22] [:w 9 23]]
+2026-07-02 18:23:47,629{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 5 24] [:w 8 25] [:rp [:= 2] nil] [:r 8 nil]]
+2026-07-02 18:23:47,635{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 5 24] [:w 8 25] [:rp [:= 2] {2 2}] [:r 8 25]]
+2026-07-02 18:23:47,677{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp :true nil]]
+2026-07-02 18:23:47,682{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 24, 6 17, 7 18, 8 25, 9 23}]]
+2026-07-02 18:23:47,687{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:r 9 nil]]
+2026-07-02 18:23:47,690{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:r 9 23]]
+2026-07-02 18:23:47,773{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:w 9 26] [:w 7 27] [:rp [:= 11] nil]]
+2026-07-02 18:23:47,778{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:w 9 26] [:w 7 27] [:rp [:= 11] {}]]
+2026-07-02 18:23:47,832{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:rp :true nil]]
+2026-07-02 18:23:47,835{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:rp :true {0 0, 1 1, 2 2, 3 3, 4 4, 5 24, 6 17, 7 27, 8 25, 9 26}]]
+2026-07-02 18:23:47,932{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:rp [:= 0] {0 0}] [:w 1 10]]
+2026-07-02 18:23:47,933{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp [:= 4] nil] [:rp [:mod 4 0] nil] [:w 9 28] [:rp [:= 1] nil]]
+2026-07-02 18:23:47,960{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp [:= 4] {4 4}] [:rp [:mod 4 0] {0 0, 4 4, 5 24}] [:w 9 28] [:rp [:= 1] {}]]
+2026-07-02 18:23:47,972{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:rp [:= 1] {1 1}] [:w 0 11]]
+2026-07-02 18:23:48,035{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:r 9 nil] [:w 7 29] [:rp [:= 12] nil]]
+2026-07-02 18:23:48,040{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:r 9 28] [:w 7 29] [:rp [:= 12] {}]]
+2026-07-02 18:23:48,051{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:rp :true nil] [:w 8 30]]
+2026-07-02 18:23:48,057{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:rp :true {0 11, 1 10, 2 2, 3 3, 4 4, 5 24, 6 17, 7 29, 8 25, 9 28}] [:w 8 30]]
+2026-07-02 18:23:48,086{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:w 5 31] [:w 8 32]]
+2026-07-02 18:23:48,091{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:w 5 31] [:w 8 32]]
+2026-07-02 18:23:48,106{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:r 9 nil] [:rp [:= 24] nil] [:rp [:mod 4 1] nil] [:rp [:= 10] nil]]
+2026-07-02 18:23:48,112{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:r 9 28] [:rp [:= 24] {}] [:rp [:mod 4 1] {6 17, 7 29}] [:rp [:= 10] {1 10}]]
+2026-07-02 18:23:48,205{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp :true nil]]
+2026-07-02 18:23:48,208{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp :true {0 11, 1 10, 2 2, 3 3, 4 4, 5 31, 6 17, 7 29, 8 32, 9 28}]]
+2026-07-02 18:23:48,227{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:r 8 nil] [:rp [:= 22] nil] [:w 9 33] [:w 8 34]]
+2026-07-02 18:23:48,232{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:r 8 32] [:rp [:= 22] {}] [:w 9 33] [:w 8 34]]
+2026-07-02 18:23:48,284{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:rp [:mod 4 1] nil]]
+2026-07-02 18:23:48,287{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:rp [:mod 4 1] {6 17, 7 29, 9 33}]]
+2026-07-02 18:23:48,379{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:w 8 35] [:rp :true nil] [:rp [:mod 4 2] nil]]
+2026-07-02 18:23:48,384{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:w 8 35] [:rp :true {0 11, 1 10, 2 2, 3 3, 4 4, 5 31, 6 17, 7 29, 8 35, 9 33}] [:rp [:mod 4 2] {1 10, 2 2}]]
+2026-07-02 18:23:48,469{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:r 9 nil] [:rp [:mod 4 3] nil] [:w 9 36] [:rp [:= 33] nil]]
+2026-07-02 18:23:48,474{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:r 9 33] [:rp [:mod 4 3] {0 11, 3 3, 5 31, 8 35}] [:w 9 36] [:rp [:= 33] {}]]
+2026-07-02 18:23:48,541{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp [:= 29] nil] [:w 8 37] [:rp :true nil]]
+2026-07-02 18:23:48,546{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp [:= 29] {7 29}] [:w 8 37] [:rp :true {0 11, 1 10, 2 2, 3 3, 4 4, 5 31, 6 17, 7 29, 8 37, 9 36}]]
+2026-07-02 18:23:48,619{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:r 9 nil] [:w 6 38] [:rp :true nil] [:w 9 39]]
+2026-07-02 18:23:48,626{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:r 9 36] [:w 6 38] [:rp :true {0 11, 1 10, 2 2, 3 3, 4 4, 5 31, 6 38, 7 29, 8 37, 9 36}] [:w 9 39]]
+2026-07-02 18:23:48,638{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:r 9 nil] [:r 7 nil] [:w 7 40]]
+2026-07-02 18:23:48,646{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:r 9 39] [:r 7 29] [:w 7 40]]
+2026-07-02 18:23:48,678{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:w 4 41] [:rp :true nil] [:rp [:= 21] nil]]
+2026-07-02 18:23:48,683{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:w 4 41] [:rp :true {0 11, 1 10, 2 2, 3 3, 4 41, 5 31, 6 38, 7 40, 8 37, 9 39}] [:rp [:= 21] {}]]
+2026-07-02 18:23:48,717{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:r 9 nil] [:rp [:= 11] nil] [:r 9 nil]]
+2026-07-02 18:23:48,722{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:r 9 39] [:rp [:= 11] {0 11}] [:r 9 39]]
+2026-07-02 18:23:48,785{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 42] [:w 8 43]]
+2026-07-02 18:23:48,789{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 42] [:w 8 43]]
+2026-07-02 18:23:48,859{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp [:= 33] nil] [:w 9 44]]
+2026-07-02 18:23:48,863{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp [:= 33] {}] [:w 9 44]]
+2026-07-02 18:23:48,882{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:r 9 nil] [:r 7 nil] [:w 5 45]]
+2026-07-02 18:23:48,887{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:r 9 44] [:r 7 40] [:w 5 45]]
+2026-07-02 18:23:48,961{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:r 7 nil] [:r 9 nil] [:rp [:mod 4 1] nil] [:r 7 nil]]
+2026-07-02 18:23:48,966{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:r 7 40] [:r 9 44] [:rp [:mod 4 1] {4 41, 5 45}] [:r 7 40]]
+2026-07-02 18:23:48,992{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:w 7 46] [:rp [:= 10] nil]]
+2026-07-02 18:23:48,996{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:w 7 46] [:rp [:= 10] {1 10}]]
+2026-07-02 18:23:49,052{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 47] [:w 8 48]]
+2026-07-02 18:23:49,056{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 47] [:w 8 48]]
+2026-07-02 18:23:49,134{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp :true nil] [:r 8 nil] [:rp [:mod 4 2] nil] [:rp :true nil]]
+2026-07-02 18:23:49,140{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp :true {0 11, 1 10, 2 2, 3 3, 4 41, 5 45, 6 38, 7 46, 8 48, 9 47}] [:r 8 48] [:rp [:mod 4 2] {1 10, 2 2, 6 38, 7 46}] [:rp :true {0 11, 1 10, 2 2, 3 3, 4 41, 5 45, 6 38, 7 46, 8 48, 9 47}]]
+2026-07-02 18:23:49,183{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:r 8 nil] [:rp [:= 17] nil]]
+2026-07-02 18:23:49,187{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:r 8 48] [:rp [:= 17] {}]]
+2026-07-02 18:23:49,258{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:r 9 nil] [:r 9 nil] [:r 8 nil] [:rp [:mod 4 0] nil]]
+2026-07-02 18:23:49,263{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:r 9 47] [:r 9 47] [:r 8 48] [:rp [:mod 4 0] {8 48}]]
+2026-07-02 18:23:49,354{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:r 9 nil] [:rp [:= 31] nil] [:rp :true nil]]
+2026-07-02 18:23:49,358{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:r 9 47] [:rp [:= 31] {}] [:rp :true {0 11, 1 10, 2 2, 3 3, 4 41, 5 45, 6 38, 7 46, 8 48, 9 47}]]
+2026-07-02 18:23:49,395{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:r 9 nil] [:w 7 49] [:rp [:mod 4 3] nil]]
+2026-07-02 18:23:49,400{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:r 9 47] [:w 7 49] [:rp [:mod 4 3] {0 11, 3 3, 9 47}]]
+2026-07-02 18:23:49,490{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 50] [:w 7 51]]
+2026-07-02 18:23:49,495{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 50] [:w 7 51]]
+2026-07-02 18:23:49,575{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:rp [:mod 4 1] nil] [:rp [:= 39] nil] [:rp [:= 31] nil]]
+2026-07-02 18:23:49,579{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:rp [:mod 4 1] {4 41, 5 45}] [:rp [:= 39] {}] [:rp [:= 31] {}]]
+2026-07-02 18:23:49,613{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:r 8 nil] [:rp :true nil] [:w 5 52]]
+2026-07-02 18:23:49,618{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:r 8 48] [:rp :true {0 11, 1 10, 2 2, 3 3, 4 41, 5 45, 6 38, 7 51, 8 48, 9 50}] [:w 5 52]]
+2026-07-02 18:23:49,664{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:w 9 53] [:r 9 nil]]
+2026-07-02 18:23:49,667{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:w 9 53] [:r 9 53]]
+2026-07-02 18:23:49,704{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 54] [:rp :true nil]]
+2026-07-02 18:23:49,708{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 54] [:rp :true {0 11, 1 10, 2 2, 3 3, 4 41, 5 52, 6 38, 7 51, 8 48, 9 54}]]
+2026-07-02 18:23:49,719{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 8 55] [:r 5 nil]]
+2026-07-02 18:23:49,722{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 8 55] [:r 5 52]]
+2026-07-02 18:23:49,748{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:r 7 nil] [:r 8 nil] [:w 9 56]]
+2026-07-02 18:23:49,753{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:r 7 51] [:r 8 55] [:w 9 56]]
+2026-07-02 18:23:49,821{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:r 9 nil] [:w 8 57] [:r 9 nil] [:w 9 58]]
+2026-07-02 18:23:49,825{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:r 9 56] [:w 8 57] [:r 9 56] [:w 9 58]]
+2026-07-02 18:23:49,903{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:r 7 nil] [:r 2 nil] [:r 9 nil] [:w 1 59]]
+2026-07-02 18:23:49,907{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:r 7 51] [:r 2 2] [:r 9 58] [:w 1 59]]
+2026-07-02 18:23:49,908{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp :true nil] [:rp :true nil]]
+2026-07-02 18:23:49,911{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp :true {0 11, 1 59, 2 2, 3 3, 4 41, 5 52, 6 38, 7 51, 8 57, 9 58}] [:rp :true {0 11, 1 59, 2 2, 3 3, 4 41, 5 52, 6 38, 7 51, 8 57, 9 58}]]
+2026-07-02 18:23:49,973{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:r 6 nil] [:r 5 nil] [:w 6 60]]
+2026-07-02 18:23:49,978{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:r 6 38] [:r 5 52] [:w 6 60]]
+2026-07-02 18:23:50,036{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:w 8 61]]
+2026-07-02 18:23:50,039{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:w 8 61]]
+2026-07-02 18:23:50,114{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:rp [:mod 4 2] nil] [:w 8 62]]
+2026-07-02 18:23:50,118{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:rp [:mod 4 2] {2 2, 9 58}] [:w 8 62]]
+2026-07-02 18:23:50,128{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:r 9 nil] [:rp :true nil] [:r 9 nil]]
+2026-07-02 18:23:50,131{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:r 9 58] [:rp :true {0 11, 1 59, 2 2, 3 3, 4 41, 5 52, 6 60, 7 51, 8 62, 9 58}] [:r 9 58]]
+2026-07-02 18:23:50,186{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp :true nil] [:w 9 63] [:w 8 64] [:r 9 nil]]
+2026-07-02 18:23:50,190{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp :true {0 11, 1 59, 2 2, 3 3, 4 41, 5 52, 6 60, 7 51, 8 62, 9 58}] [:w 9 63] [:w 8 64] [:r 9 63]]
+2026-07-02 18:23:50,284{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 65] [:rp [:= 25] nil]]
+2026-07-02 18:23:50,289{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 65] [:rp [:= 25] {}]]
+2026-07-02 18:23:50,325{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:rp [:= 29] nil]]
+2026-07-02 18:23:50,328{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:rp [:= 29] {}]]
+2026-07-02 18:23:50,385{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:r 9 nil] [:rp [:= 37] nil] [:w 9 66] [:r 9 nil]]
+2026-07-02 18:23:50,390{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:r 9 65] [:rp [:= 37] {}] [:w 9 66] [:r 9 66]]
+2026-07-02 18:23:50,484{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:w 9 67] [:w 8 68] [:w 6 69] [:r 9 nil]]
+2026-07-02 18:23:50,488{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:w 9 67] [:w 8 68] [:w 6 69] [:r 9 67]]
+2026-07-02 18:23:50,559{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 8 70] [:r 6 nil] [:rp [:= 12] nil]]
+2026-07-02 18:23:50,562{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 8 70] [:r 6 69] [:rp [:= 12] {}]]
+2026-07-02 18:23:50,603{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:r 7 nil] [:rp [:mod 4 2] nil] [:rp [:= 46] nil]]
+2026-07-02 18:23:50,607{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:r 7 51] [:rp [:mod 4 2] {2 2, 8 70}] [:rp [:= 46] {}]]
+2026-07-02 18:23:50,668{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:r 8 nil]]
+2026-07-02 18:23:50,671{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:r 8 70]]
+2026-07-02 18:23:50,692{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:r 8 nil]]
+2026-07-02 18:23:50,695{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:r 8 70]]
+2026-07-02 18:23:50,719{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:r 7 nil] [:r 7 nil] [:rp :true nil]]
+2026-07-02 18:23:50,723{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:r 7 51] [:r 7 51] [:rp :true {0 11, 1 59, 2 2, 3 3, 4 41, 5 52, 6 69, 7 51, 8 70, 9 67}]]
+2026-07-02 18:23:50,751{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 5 71]]
+2026-07-02 18:23:50,754{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 5 71]]
+2026-07-02 18:23:50,807{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:r 9 nil]]
+2026-07-02 18:23:50,810{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:r 9 67]]
+2026-07-02 18:23:50,818{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:rp [:mod 4 3] nil]]
+2026-07-02 18:23:50,821{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:rp [:mod 4 3] {0 11, 1 59, 3 3, 5 71, 7 51, 9 67}]]
+2026-07-02 18:23:50,904{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:r 9 nil] [:r 9 nil] [:w 5 72] [:r 9 nil]]
+2026-07-02 18:23:50,909{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:r 9 67] [:r 9 67] [:w 5 72] [:r 9 67]]
+2026-07-02 18:23:50,964{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:rp [:= 37] nil] [:rp [:= 9] nil] [:rp [:mod 4 3] nil]]
+2026-07-02 18:23:50,968{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:rp [:= 37] {}] [:rp [:= 9] {}] [:rp [:mod 4 3] {0 11, 1 59, 3 3, 7 51, 9 67}]]
+2026-07-02 18:23:51,064{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 73] [:rp [:mod 4 1] nil]]
+2026-07-02 18:23:51,069{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 73] [:rp [:mod 4 1] {4 41, 6 69, 9 73}]]
+2026-07-02 18:23:51,107{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 74] [:r 9 nil] [:rp :true nil]]
+2026-07-02 18:23:51,111{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 74] [:r 9 74] [:rp :true {0 11, 1 59, 2 2, 3 3, 4 41, 5 72, 6 69, 7 51, 8 70, 9 74}]]
+2026-07-02 18:23:51,206{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:w 9 75] [:w 7 76]]
+2026-07-02 18:23:51,210{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:w 9 75] [:w 7 76]]
+2026-07-02 18:23:51,258{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:rp [:mod 4 0] nil]]
+2026-07-02 18:23:51,261{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:rp [:mod 4 0] {5 72, 7 76}]]
+2026-07-02 18:23:51,326{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:w 6 77] [:rp [:mod 4 1] nil] [:w 3 78] [:w 9 79]]
+2026-07-02 18:23:51,331{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:w 6 77] [:rp [:mod 4 1] {4 41, 6 77}] [:w 3 78] [:w 9 79]]
+2026-07-02 18:23:51,343{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 80] [:w 5 81] [:rp [:mod 4 3] nil]]
+2026-07-02 18:23:51,347{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 80] [:w 5 81] [:rp [:mod 4 3] {0 11, 1 59}]]
+2026-07-02 18:23:51,442{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp [:mod 4 1] nil] [:w 4 82] [:rp :true nil] [:rp :true nil]]
+2026-07-02 18:23:51,446{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp [:mod 4 1] {4 41, 5 81, 6 77}] [:w 4 82] [:rp :true {0 11, 1 59, 2 2, 3 78, 4 82, 5 81, 6 77, 7 76, 8 70, 9 80}] [:rp :true {0 11, 1 59, 2 2, 3 78, 4 82, 5 81, 6 77, 7 76, 8 70, 9 80}]]
+2026-07-02 18:23:51,487{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:w 4 83] [:rp [:mod 4 3] nil]]
+2026-07-02 18:23:51,490{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:w 4 83] [:rp [:mod 4 3] {0 11, 1 59, 4 83}]]
+2026-07-02 18:23:51,506{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:w 9 84]]
+2026-07-02 18:23:51,508{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:w 9 84]]
+2026-07-02 18:23:51,554{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:rp [:= 74] nil] [:rp :true nil]]
+2026-07-02 18:23:51,558{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:rp [:= 74] {}] [:rp :true {0 11, 1 59, 2 2, 3 78, 4 83, 5 81, 6 77, 7 76, 8 70, 9 84}]]
+2026-07-02 18:23:51,570{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:rp :true nil] [:r 8 nil] [:rp [:= 44] nil]]
+2026-07-02 18:23:51,573{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:rp :true {0 11, 1 59, 2 2, 3 78, 4 83, 5 81, 6 77, 7 76, 8 70, 9 84}] [:r 8 70] [:rp [:= 44] {}]]
+2026-07-02 18:23:51,627{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 85] [:w 7 86] [:rp :true nil]]
+2026-07-02 18:23:51,632{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 85] [:w 7 86] [:rp :true {0 11, 1 59, 2 2, 3 78, 4 83, 5 81, 6 77, 7 86, 8 70, 9 85}]]
+2026-07-02 18:23:51,686{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:w 7 87] [:r 9 nil] [:r 9 nil]]
+2026-07-02 18:23:51,691{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:w 7 87] [:r 9 85] [:r 9 85]]
+2026-07-02 18:23:51,785{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:w 9 88]]
+2026-07-02 18:23:51,788{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:w 9 88]]
+2026-07-02 18:23:51,808{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:rp [:= 35] nil] [:r 9 nil] [:r 7 nil] [:rp :true nil]]
+2026-07-02 18:23:51,812{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:rp [:= 35] {}] [:r 9 88] [:r 7 87] [:rp :true {0 11, 1 59, 2 2, 3 78, 4 83, 5 81, 6 77, 7 87, 8 70, 9 88}]]
+2026-07-02 18:23:51,827{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 6 89] [:r 8 nil] [:rp [:mod 4 2] nil]]
+2026-07-02 18:23:51,830{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 6 89] [:r 8 70] [:rp [:mod 4 2] {2 2, 3 78, 8 70}]]
+2026-07-02 18:23:51,853{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 8 90] [:r 9 nil]]
+2026-07-02 18:23:51,857{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 8 90] [:r 9 88]]
+2026-07-02 18:23:51,858{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:invoke	:txn	[[:rp :true nil]]
+2026-07-02 18:23:51,860{GMT}	INFO	[jepsen worker 1] jepsen.print: 1	:ok	:txn	[[:rp :true {0 11, 1 59, 2 2, 3 78, 4 83, 5 81, 6 89, 7 87, 8 90, 9 88}]]
+2026-07-02 18:23:51,906{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:invoke	:txn	[[:rp [:= 5] nil] [:rp [:mod 4 1] nil] [:r 7 nil] [:rp [:mod 4 2] nil]]
+2026-07-02 18:23:51,910{GMT}	INFO	[jepsen worker 2] jepsen.print: 2	:ok	:txn	[[:rp [:= 5] {}] [:rp [:mod 4 1] {5 81, 6 89}] [:r 7 87] [:rp [:mod 4 2] {2 2, 3 78, 8 90}]]
+2026-07-02 18:23:51,922{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:invoke	:txn	[[:rp :true nil] [:w 8 91] [:r 9 nil] [:rp [:mod 4 0] nil]]
+2026-07-02 18:23:51,925{GMT}	INFO	[jepsen worker 3] jepsen.print: 3	:ok	:txn	[[:rp :true {0 11, 1 59, 2 2, 3 78, 4 83, 5 81, 6 89, 7 87, 8 90, 9 88}] [:w 8 91] [:r 9 88] [:rp [:mod 4 0] {9 88}]]
+2026-07-02 18:23:51,989{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 9 92]]
+2026-07-02 18:23:51,991{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 9 92]]
+2026-07-02 18:23:52,081{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:invoke	:txn	[[:w 7 93]]
+2026-07-02 18:23:52,085{GMT}	INFO	[jepsen worker 0] jepsen.print: 0	:ok	:txn	[[:w 7 93]]
+2026-07-02 18:23:52,119{GMT}	INFO	[jepsen test runner] jepsen.core: Run complete, writing
+2026-07-02 18:23:52,194{GMT}	INFO	[jepsen test runner] jepsen.core: Analyzing...
+2026-07-02 18:23:52,315{GMT}	WARN	[clojure-agent-send-off-pool-7] jepsen.checker: Error while checking history:
+java.util.concurrent.ExecutionException: java.io.IOException: Cannot run program "dot": error=2, No such file or directory
+	at java.base/java.util.concurrent.FutureTask.report(FutureTask.java:122)
+	at java.base/java.util.concurrent.FutureTask.get(FutureTask.java:191)
+	at clojure.core$deref_future.invokeStatic(core.clj:2321)
+	at clojure.core$future_call$reify__8578.deref(core.clj:7125)
+	at clojure.core$deref.invokeStatic(core.clj:2341)
+	at clojure.core$deref.invoke(core.clj:2327)
+	at clojure.core$map$fn__5956.invoke(core.clj:2776)
+	at clojure.lang.LazySeq.force(LazySeq.java:50)
+	at clojure.lang.LazySeq.sval(LazySeq.java:62)
+	at clojure.lang.LazySeq.unwrap(LazySeq.java:75)
+	at clojure.lang.LazySeq.realize(LazySeq.java:91)
+	at clojure.lang.LazySeq.seq(LazySeq.java:104)
+	at clojure.lang.RT.seq(RT.java:555)
+	at clojure.core$seq__5488.invokeStatic(core.clj:139)
+	at clojure.core$dorun.invokeStatic(core.clj:3145)
+	at clojure.core$dorun.invoke(core.clj:3145)
+	at elle.viz$plot_analysis_BANG_.invokeStatic(viz.clj:217)
+	at elle.viz$plot_analysis_BANG_.invoke(viz.clj:200)
+	at elle.txn$cycles_BANG_.invokeStatic(txn.clj:985)
+	at elle.txn$cycles_BANG_.invoke(txn.clj:965)
+	at elle.closed_predicate$check.invokeStatic(closed_predicate.clj:708)
+	at elle.closed_predicate$check.invoke(closed_predicate.clj:689)
+	at jepsen.sql.workload.kv_predicate.ClosedPredicateChecker.check(kv_predicate.clj:401)
+	at jepsen.checker$check_safe.invokeStatic(checker.clj:95)
+	at jepsen.checker$check_safe.invoke(checker.clj:87)
+	at jepsen.checker.Compose$fn__12829.invoke(checker.clj:106)
+	at clojure.core$pmap$fn__8586$fn__8587.invoke(core.clj:7173)
+	at clojure.core$binding_conveyor_fn$fn__5844.invoke(core.clj:2051)
+	at clojure.lang.AFn.call(AFn.java:18)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1575)
+Caused by: java.io.IOException: Cannot run program "dot": error=2, No such file or directory
+	at java.base/java.lang.ProcessBuilder.start(ProcessBuilder.java:1170)
+	at java.base/java.lang.ProcessBuilder.start(ProcessBuilder.java:1089)
+	at java.base/java.lang.Runtime.exec(Runtime.java:681)
+	at clojure.java.shell$sh.invokeStatic(shell.clj:113)
+	at clojure.java.shell$sh.doInvoke(shell.clj:79)
+	at clojure.lang.RestFn.invoke(RestFn.java:460)
+	at rhizome.viz$dot__GT_svg.invokeStatic(viz.clj:130)
+	at rhizome.viz$dot__GT_svg.invoke(viz.clj:126)
+	at elle.viz$save_dot_BANG_.invokeStatic(viz.clj:198)
+	at elle.viz$save_dot_BANG_.invoke(viz.clj:188)
+	at elle.viz$plot_analysis_BANG_$fn__3467$fn__3471.invoke(viz.clj:226)
+	... 6 common frames omitted
+Caused by: java.io.IOException: error=2, No such file or directory
+	at java.base/java.lang.ProcessImpl.forkAndExec(Native Method)
+	at java.base/java.lang.ProcessImpl.<init>(ProcessImpl.java:295)
+	at java.base/java.lang.ProcessImpl.start(ProcessImpl.java:225)
+	at java.base/java.lang.ProcessBuilder.start(ProcessBuilder.java:1126)
+	... 16 common frames omitted
+2026-07-02 18:23:52,372{GMT}	INFO	[jepsen test runner] jepsen.core: Analysis complete
+2026-07-02 18:23:52,387{GMT}	INFO	[jepsen results] jepsen.store: Wrote /home/lc/Desktop/tpcc/log_jepsen/jepsen-kv-predicate/postgres/postgres/store/postgres kv-predicate RU (S)/20260702T182344.693+0800/results.edn
+2026-07-02 18:23:52,400{GMT}	INFO	[jepsen test runner] jepsen.core: {:perf {:latency-graph {:valid? true},
+        :rate-graph {:valid? true},
+        :valid? true},
+ :clock {:valid? true},
+ :stats {:valid? true,
+         :count 101,
+         :ok-count 101,
+         :fail-count 0,
+         :info-count 0,
+         :by-f {:init {:valid? true,
+                       :count 1,
+                       :ok-count 1,
+                       :fail-count 0,
+                       :info-count 0},
+                :txn {:valid? true,
+                      :count 100,
+                      :ok-count 100,
+                      :fail-count 0,
+                      :info-count 0}}},
+ :exceptions {:valid? true},
+ :workload {:closed-predicate {:valid? :unknown,
+                               :error {:via [{:type java.util.concurrent.ExecutionException,
+                                              :message "java.io.IOException: Cannot run program \"dot\": error=2, No such file or directory",
+                                              :at [java.util.concurrent.FutureTask
+                                                   report
+                                                   "FutureTask.java"
+                                                   122]}
+                                             {:type java.io.IOException,
+                                              :message "Cannot run program \"dot\": error=2, No such file or directory",
+                                              :at [java.lang.ProcessBuilder
+                                                   start
+                                                   "ProcessBuilder.java"
+                                                   1170]}
+                                             {:type java.io.IOException,
+                                              :message "error=2, No such file or directory",
+                                              :at [java.lang.ProcessImpl
+                                                   forkAndExec
+                                                   "ProcessImpl.java"
+                                                   -2]}],
+                                       :trace [[java.lang.ProcessImpl
+                                                forkAndExec
+                                                "ProcessImpl.java"
+                                                -2]
+                                               [java.lang.ProcessImpl
+                                                <init>
+                                                "ProcessImpl.java"
+                                                295]
+                                               [java.lang.ProcessImpl
+                                                start
+                                                "ProcessImpl.java"
+                                                225]
+                                               [java.lang.ProcessBuilder
+                                                start
+                                                "ProcessBuilder.java"
+                                                1126]
+                                               [java.lang.ProcessBuilder
+                                                start
+                                                "ProcessBuilder.java"
+                                                1089]
+                                               [java.lang.Runtime
+                                                exec
+                                                "Runtime.java"
+                                                681]
+                                               [clojure.java.shell$sh
+                                                invokeStatic
+                                                "shell.clj"
+                                                113]
+                                               [clojure.java.shell$sh
+                                                doInvoke
+                                                "shell.clj"
+                                                79]
+                                               [clojure.lang.RestFn
+                                                invoke
+                                                "RestFn.java"
+                                                460]
+                                               [rhizome.viz$dot__GT_svg
+                                                invokeStatic
+                                                "viz.clj"
+                                                130]
+                                               [rhizome.viz$dot__GT_svg
+                                                invoke
+                                                "viz.clj"
+                                                126]
+                                               [elle.viz$save_dot_BANG_
+                                                invokeStatic
+                                                "viz.clj"
+                                                198]
+                                               [elle.viz$save_dot_BANG_
+                                                invoke
+                                                "viz.clj"
+                                                188]
+                                               [elle.viz$plot_analysis_BANG_$fn__3467$fn__3471
+                                                invoke
+                                                "viz.clj"
+                                                226]
+                                               [clojure.core$binding_conveyor_fn$fn__5844
+                                                invoke
+                                                "core.clj"
+                                                2051]
+                                               [clojure.lang.AFn
+                                                call
+                                                "AFn.java"
+                                                18]
+                                               [java.util.concurrent.FutureTask
+                                                run
+                                                "FutureTask.java"
+                                                317]
+                                               [java.util.concurrent.ThreadPoolExecutor
+                                                runWorker
+                                                "ThreadPoolExecutor.java"
+                                                1144]
+                                               [java.util.concurrent.ThreadPoolExecutor$Worker
+                                                run
+                                                "ThreadPoolExecutor.java"
+                                                642]
+                                               [java.lang.Thread
+                                                run
+                                                "Thread.java"
+                                                1575]],
+                                       :cause "error=2, No such file or directory"}},
+            :critical {:valid? true, :error-types (), :errors {}},
+            :missing-table-column {:valid? true,
+                                   :error-types nil,
+                                   :errors {}},
+            :valid? :unknown},
+ :valid? :unknown}
+
+
+Errors occurred during analysis, but no anomalies found. ಠ~ಠ

@@ -1,0 +1,37 @@
+<?xml version='1.0' encoding='utf-8'?>
+<parameters>
+    <type>POSTGRES</type>
+    <driver>org.postgresql.Driver</driver>
+    <url>jdbc:postgresql://127.0.0.1:5432/kvpredicate_trace_benchbase?sslmode=disable&amp;ApplicationName=benchbase-kvpredicate-ser-trace&amp;reWriteBatchedInserts=true</url>
+    <username>kvpredicate_user</username>
+    <password>kvpredicate_password</password>
+    <reconnectOnConnectionFailure>true</reconnectOnConnectionFailure>
+    <isolation>TRANSACTION_REPEATABLE_READ</isolation>
+    <batchsize>128</batchsize>
+
+    <scalefactor>1</scalefactor>
+    <keyCount>2</keyCount>
+    <keyDist>uniform</keyDist>
+    <keyDistBase>2.0</keyDistBase>
+    <minTxnLength>1</minTxnLength>
+    <maxTxnLength>4</maxTxnLength>
+    <maxWritesPerKey>256</maxWritesPerKey>
+    <predicateGroupCount>2</predicateGroupCount>
+    <mopDelayMs>0</mopDelayMs>
+
+    
+    <kvPredicateAnomaly>write-skew</kvPredicateAnomaly>
+    <kvPredicateAnomalyDelayMs>1000</kvPredicateAnomalyDelayMs>
+
+    <terminals>2</terminals>
+    <works>
+        <work>
+            <time>5</time>
+            <rate>20</rate>
+            <weights>100</weights>
+        </work>
+    </works>
+    <transactiontypes>
+        <transactiontype><name>Txn</name></transactiontype>
+    </transactiontypes>
+</parameters>

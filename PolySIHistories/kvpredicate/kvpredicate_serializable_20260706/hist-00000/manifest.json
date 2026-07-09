@@ -1,0 +1,21 @@
+{
+  "captured_aborted_attempts": 0,
+  "case_kind": "real_postgresql_kvpredicate",
+  "dataset_name": "kvpredicate_serializable_20260706",
+  "files": {
+    "history": "history.prhist.jsonl",
+    "initial_state": "initial_state.json",
+    "raw_trace": "raw_kvpredicate_trace.jsonl"
+  },
+  "format": "prhist-v2-kv-relational-predicate",
+  "generator": "log_kvpredicate/kvpredicate_trace_to_prhist.py",
+  "initial_keys": 10,
+  "operations": 261,
+  "point_reads": 90,
+  "predicate_mapping": "Predicate reads emit SQL-shaped kv predicates: TRUE, value equality, value modulo, value greater-than, and value less-than.",
+  "predicate_reads": 71,
+  "source": "BenchBase kvpredicate on PostgreSQL with JDBC reads and trigger writes",
+  "transactions": 102,
+  "version_mapping": "kv.value is globally unique and is used as both business value and PRHIST version id.",
+  "writes": 100
+}

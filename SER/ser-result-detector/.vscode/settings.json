@@ -1,0 +1,14 @@
+{
+  "java.import.gradle.enabled": true,
+  "java.import.gradle.wrapper.enabled": true,
+  "java.import.gradle.java.home": "/usr/lib/jvm/java-11-openjdk-amd64",
+  "java.configuration.updateBuildConfiguration": "automatic",
+  "java.configuration.runtimes": [
+    {
+      "name": "JavaSE-11",
+      "path": "/usr/lib/jvm/java-11-openjdk-amd64",
+      "default": true
+    }
+  ],
+  "java.compile.nullAnalysis.mode": "automatic"
+}

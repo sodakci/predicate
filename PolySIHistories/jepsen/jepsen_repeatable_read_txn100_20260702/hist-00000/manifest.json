@@ -1,0 +1,31 @@
+{
+  "captured_failed_attempts": 1,
+  "captured_info_attempts": 0,
+  "case_kind": "jepsen_kv_predicate_postgres",
+  "dataset_name": "jepsen_kv_predicate_postgresql_java23_repeatable_read_txn100_20260702",
+  "files": {
+    "history": "history.prhist.jsonl",
+    "initial_state": "initial_state.json",
+    "jepsen_log": "jepsen.log",
+    "jepsen_results": "jepsen_results.edn",
+    "jepsen_test": "test.jepsen",
+    "raw_history_txt": "jepsen_history.txt",
+    "raw_jepsen_history": "raw_jepsen_history.edn",
+    "raw_jepsen_history_jsonl": "raw_jepsen_history.jsonl",
+    "raw_trace": "raw_jepsen_history.edn"
+  },
+  "format": "prhist-v2-kv-relational-predicate",
+  "generator": "log_jepsen/jepsen_history_to_prhist.py",
+  "initial_keys": 10,
+  "notes": [
+    "Original Jepsen artifacts are preserved in place.",
+    "PRHIST output uses compact key/value version references without source provenance.",
+    "Nil point reads are represented by virtual absent initial versions."
+  ],
+  "operations": 253,
+  "point_reads": 84,
+  "predicate_reads": 82,
+  "source": "Jepsen/Postgres kv-predicate workload history.edn",
+  "transactions": 99,
+  "writes": 87
+}
