@@ -3,7 +3,7 @@
 本目录用于运行改造后的 BenchBase workload，在真实 PostgreSQL 上采集事务历史，并生成：
 
 ```text
-/home/lc/Desktop/predicate/PolySIHistories/<workload>/<case>/hist-00000
+PolySIHistories/<workload>/<case>/hist-00000
 ```
 
 当前支持两个 workload：
@@ -45,7 +45,7 @@ hist-00000/
 所有命令默认从这里执行：
 
 ```bash
-cd /home/lc/Desktop/predicate/History_Generator
+cd History_Generator
 ```
 
 需要：
@@ -65,7 +65,7 @@ benchbase/target/
 首次使用时先准备项目本地 Java 23：
 
 ```bash
-cd /home/lc/Desktop/predicate/History_Generator/.tools
+cd History_Generator/.tools
 python3 download_java23.py
 tar -xzf OpenJDK23U-jdk_x64_linux_hotspot_23.0.2_7.tar.gz
 mv jdk-23.0.2+7 jdk-23
@@ -103,7 +103,7 @@ host:port:database:user:password
 ## 构建 BenchBase
 
 ```bash
-cd /home/lc/Desktop/predicate/History_Generator
+cd History_Generator
 source .tools/java23.env
 cd benchbase
 ./mvnw -q -DskipTests -Dfmt.skip=true -Ddescriptors=src/main/assembly/dir.xml -P postgres package
@@ -125,8 +125,8 @@ KV 一键脚本默认会自动构建；TPC-C 脚本需要显式设置 `BENCHBASE
 推荐使用一键脚本：
 
 ```bash
-cd /home/lc/Desktop/predicate/History_Generator
-PGPASSFILE=/home/lc/Desktop/predicate/History_Generator/kv/.runtime/pgpass \
+cd History_Generator
+PGPASSFILE=kv/.runtime/pgpass \
 CASE_NAME=kvpredicate_serializable_20260706 \
 ISOLATION=TRANSACTION_SERIALIZABLE \
 KEY_COUNT=10 \
@@ -143,7 +143,7 @@ PREDICATE_GROUP_COUNT=4 \
 输出：
 
 ```text
-/home/lc/Desktop/predicate/PolySIHistories/kvpredicate/kvpredicate_serializable_20260706/hist-00000
+../PolySIHistories/kvpredicate/kvpredicate_serializable_20260706/hist-00000
 ```
 
 常用参数：
@@ -202,17 +202,17 @@ KV_PREDICATE_ANOMALY_DELAY_MS
 
 ```bash
 python3 kv/audit_kvpredicate_prhist.py \
-  /home/lc/Desktop/predicate/PolySIHistories/kvpredicate/<case>/hist-00000
+  ../PolySIHistories/kvpredicate/<case>/hist-00000
 ```
 
 SER detector 审计：
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd ../SER/ser-result-detector
 ./gradlew jar
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit /home/lc/Desktop/predicate/PolySIHistories/kvpredicate/<case>/hist-00000
+  audit ../../PolySIHistories/kvpredicate/<case>/hist-00000
 ```
 
 ## 运行 KV Write-Skew 对照
@@ -220,8 +220,8 @@ java -Djava.library.path=build/monosat -Xmx8g \
 REPEATABLE READ：
 
 ```bash
-cd /home/lc/Desktop/predicate/History_Generator
-PGPASSFILE=/home/lc/Desktop/predicate/History_Generator/kv/.runtime/pgpass \
+cd History_Generator
+PGPASSFILE=kv/.runtime/pgpass \
 CASE_NAME=kvpredicate_repeatable_read_write_skew_20260706 \
 ISOLATION=TRANSACTION_REPEATABLE_READ \
 KV_PREDICATE_ANOMALY=write-skew \
@@ -240,7 +240,7 @@ PREDICATE_GROUP_COUNT=2 \
 SERIALIZABLE：
 
 ```bash
-PGPASSFILE=/home/lc/Desktop/predicate/History_Generator/kv/.runtime/pgpass \
+PGPASSFILE=kv/.runtime/pgpass \
 CASE_NAME=kvpredicate_serializable_write_skew_20260706 \
 ISOLATION=TRANSACTION_SERIALIZABLE \
 KV_PREDICATE_ANOMALY=write-skew \
@@ -263,13 +263,13 @@ PREDICATE_GROUP_COUNT=2 \
 先构建 BenchBase，然后准备 TPC-C 配置和连接：
 
 ```bash
-cd /home/lc/Desktop/predicate/History_Generator
+cd History_Generator
 source .tools/java23.env
 
-export BENCHBASE_JAR=/home/lc/Desktop/predicate/History_Generator/benchbase/target/benchbase-postgres/benchbase-postgres/benchbase.jar
+export BENCHBASE_JAR=benchbase/target/benchbase-postgres/benchbase-postgres/benchbase.jar
 export TPCC_DSN='postgresql://tpcc_user@127.0.0.1:5432/tpcc_trace'
-export PGPASSFILE=/home/lc/Desktop/predicate/History_Generator/tpcc/.runtime/pgpass
-export BENCHBASE_CONFIG=/home/lc/Desktop/predicate/History_Generator/tpcc/.runtime/tpcc_trace.xml
+export PGPASSFILE=tpcc/.runtime/pgpass
+export BENCHBASE_CONFIG=tpcc/.runtime/tpcc_trace.xml
 
 CASE_NAME=tpcc_serializable_20260706 \
 ./tpcc/run_tpcc_trace.sh --load
@@ -280,7 +280,7 @@ CASE_NAME=tpcc_serializable_20260706 \
 输出：
 
 ```text
-/home/lc/Desktop/predicate/PolySIHistories/tpcc/tpcc_serializable_20260706/hist-00000
+../PolySIHistories/tpcc/tpcc_serializable_20260706/hist-00000
 ```
 
 TPC-C 脚本必需环境变量：
@@ -303,7 +303,7 @@ CASE_NAME
 
 ```bash
 python3 tpcc/audit_tpcc_prhist.py \
-  /home/lc/Desktop/predicate/PolySIHistories/tpcc/<case>/hist-00000
+  ../PolySIHistories/tpcc/<case>/hist-00000
 ```
 
 注意：TPC-C case 当前主要用于保存真实 PostgreSQL evidence 和关系谓词 PRHIST。当前 SER loader 只支持 KV value 谓词，不能把它对 TPC-C StockLevel 的结果当作完整验证结论。
@@ -326,7 +326,7 @@ export SERIAL_ORDER='73001 73002 73003'
 运行：
 
 ```bash
-cd /home/lc/Desktop/predicate/History_Generator
+cd History_Generator
 source .tools/java23.env
 cd benchbase
 ./mvnw -q -DskipTests -Dfmt.skip=true -Ddescriptors=src/main/assembly/dir.xml -P postgres package

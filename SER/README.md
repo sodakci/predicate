@@ -45,7 +45,7 @@ sudo apt install openjdk-11-jdk cmake g++ make
 如果当前 shell 里默认 Java 不是 11，可以进入 detector 后启用项目自带的 Java 11 环境脚本：
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd SER/ser-result-detector
 source ./jdk11-env.sh
 java -version
 ```
@@ -57,7 +57,7 @@ java -version
 ## 构建
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd SER/ser-result-detector
 ./gradlew jar
 ```
 
@@ -77,7 +77,7 @@ build/monosat/monosat.jar
 如果只想运行测试：
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd SER/ser-result-detector
 ./gradlew test
 ```
 
@@ -154,7 +154,7 @@ value < n
 先构建 jar，然后运行：
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd SER/ser-result-detector
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
   audit -t PRHIST /absolute/path/to/hist-00000
@@ -210,7 +210,7 @@ java -Djava.library.path=build/monosat -Xmx8g \
 java -Djava.library.path=build/monosat -Xmx12g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
   audit --compare-derived-predicate-edges --solver-stats \
-  /home/lc/Desktop/predicate/PolySIHistories/kvpredicate/kvpredicate_serializable_20260706/hist-00000
+  ../../PolySIHistories/kvpredicate/kvpredicate_serializable_20260706/hist-00000
 ```
 
 ## 查看统计和 dump
@@ -218,7 +218,7 @@ java -Djava.library.path=build/monosat -Xmx12g \
 统计历史规模：
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd SER/ser-result-detector
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
   stat /absolute/path/to/hist-00000
@@ -237,8 +237,8 @@ java -Djava.library.path=build/monosat -Xmx8g \
 `tools/audit-prhist.sh` 会递归查找输入目录下所有 `history.prhist.jsonl`，逐个调用 detector，并把完整日志写到输出目录。
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
-tools/audit-prhist.sh /home/lc/Desktop/predicate/PolySIHistories/kvpredicate
+cd SER/ser-result-detector
+tools/audit-prhist.sh ../../PolySIHistories/kvpredicate
 ```
 
 常用环境变量：
@@ -265,7 +265,7 @@ SER_RESULT_DETECTOR_OUTPUT_DIR
 ```bash
 SER_RESULT_DETECTOR_HEAP=12g \
 SER_RESULT_DETECTOR_OUTPUT_DIR=/tmp/ser-kv-audit \
-tools/audit-prhist.sh /home/lc/Desktop/predicate/PolySIHistories/kvpredicate
+tools/audit-prhist.sh ../../PolySIHistories/kvpredicate
 ```
 
 脚本最后会输出汇总：
@@ -281,7 +281,7 @@ Summary: ACCEPT=... REJECT=... RUNTIME_ERROR=...
 当历史集合提供 `catalog.json` 且其中有 `expected_verdict` 时，可以用 catalog runner 做可复现实验：
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd SER/ser-result-detector
 ./gradlew jar
 tools/run_catalog_experiment.py \
   /absolute/path/to/catalog.json \
@@ -319,16 +319,16 @@ machine.json
 `History_Generator` 默认把新 case 写到仓库根目录：
 
 ```text
-/home/lc/Desktop/predicate/PolySIHistories/<workload>/<case>/hist-00000
+PolySIHistories/<workload>/<case>/hist-00000
 ```
 
 KV predicate case 可以直接交给当前 SER detector：
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd SER/ser-result-detector
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit /home/lc/Desktop/predicate/PolySIHistories/kvpredicate/<case>/hist-00000
+  audit ../../PolySIHistories/kvpredicate/<case>/hist-00000
 ```
 
 TPC-C generator 当前能采集、导出和审计 raw evidence，但 StockLevel 会输出多表 SQL-shaped predicate；在当前 SER loader 只支持 KV `value` 谓词的情况下，不应把 TPC-C StockLevel 历史当作已被当前 detector 完整支持的输入。
@@ -342,7 +342,7 @@ TPC-C generator 当前能采集、导出和审计 raw evidence，但 StockLevel 
 处理：
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd SER/ser-result-detector
 ./gradlew jar
 ls build/monosat/libmonosat.so
 ```
@@ -364,7 +364,7 @@ java -version
 如需固定 Java 11：
 
 ```bash
-cd /home/lc/Desktop/predicate/SER/ser-result-detector
+cd SER/ser-result-detector
 source ./jdk11-env.sh
 ./gradlew jar
 ```
