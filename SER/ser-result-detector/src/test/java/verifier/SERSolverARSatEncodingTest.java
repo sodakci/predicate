@@ -56,7 +56,17 @@ class SERSolverARSatEncodingTest {
     }
 
     private static Event.PredEval<String, Integer> keyAtLeast(String key, int threshold) {
-        return (k, v) -> key.equals(k) && v >= threshold;
+        return new Event.PredEval<>() {
+            @Override
+            public boolean test(String candidateKey, Integer value) {
+                return key.equals(candidateKey) && value >= threshold;
+            }
+
+            @Override
+            public boolean covers(String candidateKey) {
+                return key.equals(candidateKey);
+            }
+        };
     }
 
     private static boolean solveSer(History<String, Integer> history) {
@@ -185,6 +195,8 @@ class SERSolverARSatEncodingTest {
                         List.of(new Event.PredResult<>("x", 10)))));
 
         var graph = new KnownGraph<>(history);
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
         var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
 
         assertFalse(solver.solve(), "predicate result source must be visible before the predicate read");
@@ -287,7 +299,24 @@ class SERSolverARSatEncodingTest {
     }
 
     @Test
-    void multiplePredicateReadsInOneTransactionSecondReadSeesPriorSelfWrite() {
+    void externalPredicateReadRequiresAVisibleWriterFrontier() {
+        var history = singleTxnHistory();
+        var txn = history.getTransaction(1L);
+        history.addPredicateReadEvent(txn, keyAtLeast("x", 5), List.of());
+        history.addEvent(txn, WRITE, "x", 3);
+        commitAll(history);
+
+        var graph = new KnownGraph<>(history);
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
+
+        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        assertFalse(solver.solve(),
+                "an external covered key must select one visible writer, but the only writer is later in program order");
+    }
+
+    @Test
+    void selfWrittenPredicateKeysAreDeferredFromCurrentPredicatePath() {
         var history = singleTxnHistory();
         var txn = history.getTransaction(1L);
         history.addEvent(txn, WRITE, "x", 100);
@@ -298,17 +327,23 @@ class SERSolverARSatEncodingTest {
                 List.of(new Event.PredResult<>("y", 120)));
         commitAll(history);
 
-        // Theory: only one real transaction exists. The serial order [T1] is
-        // valid. The first PR observes self W(x=100); the second PR observes
-        // the later self W(y=120). Required edges: no cross-txn SO/WR/WW/RW,
-        // and no cross-txn PR_WR/PR_RW.
-        assertTrue(solveSer(history),
-                "the second predicate read must use its own event position and see W(y=120)");
+        var graph = new KnownGraph<>(history);
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(1).getPredicateReadType("y"));
+
+        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        assertTrue(solver.solve(), "self-written predicate keys must not enter the external predicate path");
     }
 
     @Test
-    void multiplePredicateReadsInOneTransactionHaveSeparateObservationBoundaries() {
-        var history = singleTxnHistory();
+    void repeatedPredicateKeyIsDeferredAfterExternalObservation() {
+        var history = makeHistory(
+                Set.of(-1L, 1L),
+                Map.of(-1L, List.of(-1L), 1L, List.of(1L)),
+                Map.of(-1L, List.of(Triple.of(WRITE, "y", 0))),
+                Map.of());
         var txn = history.getTransaction(1L);
         history.addPredicateReadEvent(txn, keyAtLeast("y", 100), List.of());
         history.addEvent(txn, WRITE, "y", 120);
@@ -316,26 +351,30 @@ class SERSolverARSatEncodingTest {
                 List.of(new Event.PredResult<>("y", 120)));
         commitAll(history);
 
-        // Theory: serial order [T1]. PR1 has empty result before the self write;
-        // PR2 returns y after the self write. The two predicate-read boundaries
-        // are different and must not both resolve to PR1's index.
-        assertTrue(solveSer(history),
-                "later predicate reads must not be positioned at an equal earlier PR event");
+        var graph = new KnownGraph<>(history);
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("y"));
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(1).getPredicateReadType("y"));
+
+        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        assertTrue(solver.solve(), "the repeated same-predicate key must not select a new external frontier");
     }
 
     @Test
-    void predicateReadMissingEarlierSelfWriteIsRejected() {
+    void internalPredicateReadIsDeferredFromCurrentPredicatePath() {
         var history = singleTxnHistory();
         var txn = history.getTransaction(1L);
         history.addEvent(txn, WRITE, "y", 120);
         history.addPredicateReadEvent(txn, keyAtLeast("y", 100), List.of());
         commitAll(history);
 
-        // Theory: serial order [T1] still includes T1's own earlier W(y=120).
-        // The empty PR misses a matching visible tuple, so no SER order can
-        // explain the observed predicate result.
-        assertFalse(solveSer(history),
-                "a predicate read must reject an empty result when an earlier self-write matches");
+        var graph = new KnownGraph<>(history);
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("y"));
+
+        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        assertTrue(solver.solve(), "internal predicate validation is handled before solver construction");
     }
 
     @Test

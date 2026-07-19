@@ -236,6 +236,9 @@ public class SERVerifier<KeyType, ValueType> {
 
             for (var resultEntry : resultSourceByKey.entrySet()) {
                 var key = resultEntry.getKey();
+                if (observation.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
+                    continue;
+                }
                 var resultSource = resultEntry.getValue();
                 if (!writeRowIsInPredicateResult(resultSource, predicateRead)) {
                     continue;
@@ -265,6 +268,9 @@ public class SERVerifier<KeyType, ValueType> {
 
             for (var entry : writesByKey.entrySet()) {
                 var key = entry.getKey();
+                if (observation.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
+                    continue;
+                }
                 if (resultSourceByKey.containsKey(key)) {
                     continue;
                 }
@@ -678,6 +684,9 @@ public class SERVerifier<KeyType, ValueType> {
 
             for (var entry : unresolvedByKey.entrySet()) {
                 var key = entry.getKey();
+                if (obs.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
+                    continue;
+                }
                 var writesOnKey = entry.getValue();
                 boolean keyCanAffectObservation = resultKeys.contains(key)
                         || writesOnKey.stream().anyMatch(w -> writeRowIsInPredicateResult(w, predicateRead));
@@ -714,7 +723,7 @@ public class SERVerifier<KeyType, ValueType> {
      * Clear and rebuild all derived PR_WR / PR_RW edges.
      *
      * Algorithm:
-     * 1. For each predicate observation S ⊢ PR(P,M,x):
+     * 1. For each external predicate observation S ⊢ PR(P,M,x):
      *    Resolve T = max_AR(VIS^-1(S) ∩ WriteTx_x).
      *    If T exists and T != S, emit PR_WR(T→S, x).
      *
@@ -765,12 +774,10 @@ public class SERVerifier<KeyType, ValueType> {
             // Iterate over keys with confirmed total write order.
             for (var entry : orderedWritesByKey.entrySet()) {
                 var key = entry.getKey();
-                var orderedWrites = entry.getValue();
-                boolean keyInResult = resultSourceByKey.containsKey(key);
-                if (!keyInResult
-                        && orderedWrites.stream().noneMatch(w -> writeRowIsInPredicateResult(w, pr))) {
+                if (obs.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
                     continue;
                 }
+                var orderedWrites = entry.getValue();
 
                 int obsIdx = resolveObservationIndex(
                         key, b, pr, orderedWrites, resultSourceByKey, graph);

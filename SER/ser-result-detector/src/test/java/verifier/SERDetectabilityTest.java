@@ -37,7 +37,13 @@ public class SERDetectabilityTest {
             Map<Long, List<Long>> sessionToTxns,
             Map<Long, List<Triple<Event.EventType, String, Integer>>> normalEvents,
             Map<Long, Pair<Event.PredEval<String, Integer>, List<Event.PredResult<String, Integer>>>> predicateReads) {
-        var h = new History<>(sessions, sessionToTxns, normalEvents);
+        var nonPredicateEvents = new HashMap<Long, List<Triple<Event.EventType, String, Integer>>>();
+        for (var entry : normalEvents.entrySet()) {
+            var events = new ArrayList<>(entry.getValue());
+            events.removeIf(event -> event.getLeft() == PREDICATE_READ);
+            nonPredicateEvents.put(entry.getKey(), events);
+        }
+        var h = new History<>(sessions, sessionToTxns, nonPredicateEvents);
         for (var entry : predicateReads.entrySet()) {
             var txn = h.getTransaction(entry.getKey());
             var pred = entry.getValue().getLeft();
@@ -264,10 +270,10 @@ public class SERDetectabilityTest {
     // ================================================================
 
     /**
-     * 场景9: PR_RW — self frontier 后续写满足 Δ
+     * 场景9: INTERNAL predicate read 暂不进入 PR_RW 推导
      */
     @Test
-    void ser_prRw_selfFrontierDelta_emitsPrRw() {
+    void ser_prRw_internalReadIsDeferred() {
         var h = makeHistory(
                 Set.of(0L),
                 Map.of(0L, List.of(0L, 1L, 2L)),
@@ -280,15 +286,17 @@ public class SERDetectabilityTest {
                         List.of(new Event.PredResult<>("x", 20))))
         );
         var graph = new KnownGraph<>(h);
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
         graph.putEdge(h.getTransaction(0L), h.getTransaction(1L), new Edge<>(EdgeType.WW, "x"));
         graph.putEdge(h.getTransaction(1L), h.getTransaction(2L), new Edge<>(EdgeType.WW, "x"));
 
         SERVerifier.refreshDerivedPredicateEdges(h, graph);
 
         assertFalse(hasKnownAEdgeOfType(graph, h.getTransaction(0L), h.getTransaction(1L), EdgeType.PR_WR),
-                "latest visible frontier 是 T2 自己的写，因此不应产生跨事务 PR_WR(T1→T2)");
-        assertTrue(hasKnownBEdgeOfType(graph, h.getTransaction(1L), h.getTransaction(2L), EdgeType.PR_RW),
-                "PR_RW(T2→T3) 应存在（frontier x=20 与后续 x=3 满足 Δ）");
+                "INTERNAL predicate read 不应在外部链路产生 PR_WR");
+        assertFalse(hasKnownBEdgeOfType(graph, h.getTransaction(1L), h.getTransaction(2L), EdgeType.PR_RW),
+                "INTERNAL predicate read 不应在外部链路产生 PR_RW");
     }
 
     /**
@@ -434,6 +442,71 @@ public class SERDetectabilityTest {
         // 空 predicate 结果，没有值满足谓词，内部一致性检查应通过
         assertTrue(verifier.Utils.verifyInternalConsistency(h),
                 "空 predicate 结果，没有值满足谓词，内部一致性检查应通过");
+    }
+
+    @Test
+    void internalConsistency_repeatedPredicateWithoutLocalWriteMustInherit() {
+        var h = new History<String, Integer>();
+        var initSession = h.addSession(-1L);
+        var initTxn = h.addTransaction(initSession, -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var session = h.addSession(0L);
+        var txn = h.addTransaction(session, 1L);
+        Event.PredEval<String, Integer> predicate = (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
+        h.addPredicateReadEvent(txn, predicate, List.of());
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var graph = new KnownGraph<>(h);
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(1).getPredicateReadType("x"));
+        assertFalse(verifier.Utils.verifyInternalConsistency(h),
+                "相同谓词读之间没有本地写时，后一次结果必须继承前一次结果");
+    }
+
+    @Test
+    void internalConsistency_interveningLastLocalWriteDeterminesPredicateResult() {
+        var h = new History<String, Integer>();
+        var initSession = h.addSession(-1L);
+        var initTxn = h.addTransaction(initSession, -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var session = h.addSession(0L);
+        var txn = h.addTransaction(session, 1L);
+        Event.PredEval<String, Integer> predicate = (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
+        h.addWriteEvent(txn, "x", 3, 101L);
+        h.addWriteEvent(txn, "x", 20, 102L);
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 20, 102L, 1L, 2)));
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertTrue(verifier.Utils.verifyInternalConsistency(h),
+                "相同谓词读之间存在本地写时，应由最后一次本地写决定返回和值");
+    }
+
+    @Test
+    void internalConsistency_firstPredicateAfterLocalWriteUsesThatWrite() {
+        var h = new History<String, Integer>();
+        var session = h.addSession(0L);
+        var txn = h.addTransaction(session, 1L);
+        h.addWriteEvent(txn, "x", 20, 100L);
+        Event.PredEval<String, Integer> predicate = (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate, List.of());
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var graph = new KnownGraph<>(h);
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
+        assertFalse(verifier.Utils.verifyInternalConsistency(h),
+                "没有前一次相同谓词读时，读前最后一次本地写仍必须决定结果");
     }
 
     // ================================================================

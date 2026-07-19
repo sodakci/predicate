@@ -462,9 +462,9 @@ public class SERVerifierPredicateIntegrationTest {
     }
 
     @Test
-    void refreshDerivedPredicateEdges_prWr_noMatchingFrontier_noPrWrEdge() throws Exception {
+    void refreshDerivedPredicateEdges_prWr_emptyResultUsesLatestNonMatchingWriter() throws Exception {
         // T0: W(x,1) [不满足 v>5]; T1: W(x,2) [不满足 v>5]; T2: PRED_READ(P={v>5}, results=[])
-        // 所有写都不满足谓词且结果为空；该 key 没有需要生成跨事务 PR_WR 的 matching frontier。
+        // 所有写都不满足谓词且结果为空；仍应由最新可见 writer T1 解释 x 未返回。
         var predResults = List.<Event.PredResult<String, Integer>>of();  // 空结果
 
         var h = buildHistoryWithPredicateRead(
@@ -477,21 +477,29 @@ public class SERVerifierPredicateIntegrationTest {
                         predResults))
         );
         var graph = makeGraph(h);
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
 
         SERVerifier.refreshDerivedPredicateEdges(h, graph);
 
-        // 空结果且没有匹配谓词的写 -> 不建立 PR_WR
-        var edges = graph.getKnownGraphA().edges();
-        boolean hasPrWr = edges.stream().anyMatch(ep -> {
-            var opt = graph.getKnownGraphA().edgeValue(ep.source(), ep.target());
-            return opt.isPresent() && opt.get().stream().anyMatch(e -> e.getType() == EdgeType.PR_WR);
-        });
-        assertFalse(hasPrWr, "No matching frontier should produce no PR_WR edge");
+        boolean latestWriterHasPrWr = graph.getKnownGraphA()
+                .edgeValue(h.getTransaction(1L), h.getTransaction(2L))
+                .orElse(List.of()).stream()
+                .anyMatch(e -> e.getType() == EdgeType.PR_WR && "x".equals(e.getKey()));
+        boolean olderWriterHasPrWr = graph.getKnownGraphA()
+                .edgeValue(h.getTransaction(0L), h.getTransaction(2L))
+                .orElse(List.of()).stream()
+                .anyMatch(e -> e.getType() == EdgeType.PR_WR && "x".equals(e.getKey()));
+
+        assertTrue(latestWriterHasPrWr,
+                "latest visible non-matching writer should produce PR_WR for an omitted key");
+        assertFalse(olderWriterHasPrWr,
+                "only the latest visible writer should produce PR_WR for the key");
     }
 
     @Test
-    void refreshDerivedPredicateEdges_prRw_frontierDeltaCondition() throws Exception {
-        // 根据最新可见 frontier 结构的 PR_WR/PR_RW 推导逻辑:
+    void refreshDerivedPredicateEdges_internalReadIsDeferred() throws Exception {
+        // T1 在谓词读前已写 x，因此该 key 是 INTERNAL，不进入当前 PR_WR/PR_RW 推导链。
         //
         // 场景设计:
         //   T0: W(x,10) [满足 v>5]
@@ -524,15 +532,17 @@ public class SERVerifierPredicateIntegrationTest {
         assertFalse(graph.getPredicateObservations().isEmpty(), "Predicate observation must be registered");
         assertEquals(1L, graph.getPredicateObservations().get(0).getTxn().getId(),
                 "Predicate observation should be from T1");
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
 
         SERVerifier.refreshDerivedPredicateEdges(h, graph);
 
         var edgeValues = graph.getKnownGraphA().edgeValue(h.getTransaction(0L), h.getTransaction(1L));
         boolean hasPrWr = edgeValues.orElse(List.of()).stream()
                 .anyMatch(e -> e.getType() == EdgeType.PR_WR);
-        assertFalse(hasPrWr, "self frontier should not emit cross-transaction PR_WR");
-        assertTrue(graph.getKnownGraphB().hasEdgeConnecting(h.getTransaction(1L), h.getTransaction(2L)),
-                "PR_RW should be emitted because the self frontier and later writer satisfy Δ");
+        assertFalse(hasPrWr, "internal predicate reads must not emit PR_WR in the external path");
+        assertFalse(graph.getKnownGraphB().hasEdgeConnecting(h.getTransaction(1L), h.getTransaction(2L)),
+                "internal predicate reads must not emit PR_RW in the external path");
     }
 
     @Test

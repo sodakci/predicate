@@ -191,9 +191,10 @@ class SERSolverAR<KeyType, ValueType> {
      * Encodes predicate-read consistency without pre-materializing PR_* edges.
      *
      * <p>For each observed predicate read and each key, the encoding identifies
-     * the latest visible write frontier. That frontier writer implies PR_WR.
-     * PR_RW then follows a later WW writer when Delta(frontier, later, key)
-     * holds under the canonical predicate result.</p>
+     * the latest visible write frontier. Only external observations enter this
+     * PR_WR/PR_RW derivation path. Internal observations are validated by
+     * {@link Utils#verifyInternalConsistency(History)} before this solver is
+     * constructed.</p>
      */
     private void encodePredicateConstraints() {
         for (var observation : graph.getPredicateObservations()) {
@@ -215,7 +216,7 @@ class SERSolverAR<KeyType, ValueType> {
                 }
 
                 boolean keyInResult = resultSourcesByKey.containsKey(key);
-                if (!keyInResult && writes.stream().noneMatch(write -> writeRowIsInPredicateResult(write, predicateRead))) {
+                if (observation.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
                     continue;
                 }
 
@@ -223,6 +224,7 @@ class SERSolverAR<KeyType, ValueType> {
                 var observationFrontier = keyInResult
                         ? fixedObservationFrontier(resultSourcesByKey.get(key), writes, predicateRead)
                         : createObservationFrontierLits(visibleWriters, writes);
+                solver.assertTrue(or(observationFrontier));
                 if (!keyInResult) {
                     assertObservationFrontierMatchesResult(false, observationFrontier, writes, predicateRead);
                 }
@@ -347,8 +349,9 @@ class SERSolverAR<KeyType, ValueType> {
     }
 
     /**
-     * Selects the latest visible write for the observed key.  At most one write
-     * can be on this frontier because AR is a total order.
+     * Selects the latest visible write for the observed key. At most one write
+     * can be on this frontier because AR is a total order; the caller requires
+     * one frontier write for every external covered key.
      */
     private List<Lit> createObservationFrontierLits(
             List<Lit> visibleWriters,

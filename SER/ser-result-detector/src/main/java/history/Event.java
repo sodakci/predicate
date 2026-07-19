@@ -17,6 +17,19 @@ public class Event<KeyType, ValueType> {
 
     public interface PredEval<KeyType, ValueType> {
         boolean test(KeyType key, ValueType value);
+
+        default boolean covers(KeyType key) {
+            return true;
+        }
+
+        /**
+         * Stable identity used to match repeated reads of the same logical
+         * predicate inside one transaction. Programmatic callers can reuse the
+         * same evaluator instance or override this method with a value identity.
+         */
+        default Object identity() {
+            return this;
+        }
     }
 
     @Data
