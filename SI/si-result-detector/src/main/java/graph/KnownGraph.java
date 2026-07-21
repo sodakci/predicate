@@ -31,6 +31,10 @@ import lombok.Getter;
 @SuppressWarnings("UnstableApiUsage")
 @Getter
 public class KnownGraph<KeyType, ValueType> {
+    public enum PredicateReadType {
+        EXTERNAL, INTERNAL
+    }
+
     @Data
     public static class WriteRef<KeyType, ValueType> {
         private final Transaction<KeyType, ValueType> txn;
@@ -52,6 +56,11 @@ public class KnownGraph<KeyType, ValueType> {
         private final Event<KeyType, ValueType> predicateReadEvent;
         private final int eventIndex;
         private final List<PredicateTupleSource<KeyType, ValueType>> tupleSources;
+        private final Map<KeyType, PredicateReadType> predicateReadTypes;
+
+        public PredicateReadType getPredicateReadType(KeyType key) {
+            return predicateReadTypes.get(key);
+        }
     }
 
     private final MutableValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> readFrom = ValueGraphBuilder
@@ -126,11 +135,27 @@ public class KnownGraph<KeyType, ValueType> {
             putEdge(writeTxn, txn, new Edge<KeyType>(EdgeType.WR, ev.getKey()));
         });
 
-        // collect predicate-read observations only, no PR_* edge generation here
+        // Build the finite key universe represented by the history. Each
+        // predicate narrows this universe through PredEval.covers(key).
+        var predicateKeyUniverse = new HashSet<KeyType>();
+        for (var write : allWrites) {
+            predicateKeyUniverse.add(write.getEvent().getKey());
+        }
+
+        // Collect predicate-read observations and classify each covered key.
+        // A key is internal when any earlier predicate read in this transaction
+        // covered it, regardless of predicate identity, or when this transaction
+        // wrote the key before this read.
         history.getTransactions().forEach(txn -> {
             var txnEvents = txn.getEvents();
+            var writtenKeys = new HashSet<KeyType>();
+            var predicateObservedKeys = new HashSet<KeyType>();
             for (int i = 0; i < txnEvents.size(); i++) {
                 var ev = txnEvents.get(i);
+                if (ev.getType() == WRITE) {
+                    writtenKeys.add(ev.getKey());
+                    continue;
+                }
                 if (ev.getType() != PREDICATE_READ) {
                     continue;
                 }
@@ -139,7 +164,20 @@ public class KnownGraph<KeyType, ValueType> {
                     var sourceWrite = resolvePredicateResultSource(result);
                     tupleSources.add(new PredicateTupleSource<>(result.getKey(), result.getValue(), sourceWrite));
                 }
-                predicateObservations.add(new PredicateObservation<>(txn, ev, i, tupleSources));
+                var predicateReadTypes = new HashMap<KeyType, PredicateReadType>();
+                var predicate = ev.getPredicate();
+                for (var key : predicateKeyUniverse) {
+                    if (predicate != null && !predicate.covers(key)) {
+                        continue;
+                    }
+                    var type = predicateObservedKeys.contains(key) || writtenKeys.contains(key)
+                            ? PredicateReadType.INTERNAL
+                            : PredicateReadType.EXTERNAL;
+                    predicateReadTypes.put(key, type);
+                }
+                predicateObservations.add(new PredicateObservation<>(txn, ev, i, tupleSources,
+                        Map.copyOf(predicateReadTypes)));
+                predicateObservedKeys.addAll(predicateReadTypes.keySet());
             }
         });
     }

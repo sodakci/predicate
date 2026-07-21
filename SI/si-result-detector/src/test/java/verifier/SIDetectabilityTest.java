@@ -264,10 +264,10 @@ public class SIDetectabilityTest {
     // ================================================================
 
     /**
-     * 场景9: PR_RW — self frontier 后续写满足 Δ
+     * 场景9: INTERNAL predicate read 暂不进入 PR_RW 推导
      */
     @Test
-    void ser_prRw_selfFrontierDelta_emitsPrRw() {
+    void ser_prRw_internalReadIsDeferred() {
         var h = makeHistory(
                 Set.of(0L),
                 Map.of(0L, List.of(0L, 1L, 2L)),
@@ -287,8 +287,8 @@ public class SIDetectabilityTest {
 
         assertFalse(hasKnownAEdgeOfType(graph, h.getTransaction(0L), h.getTransaction(1L), EdgeType.PR_WR),
                 "latest visible frontier 是 T2 自己的写，因此不应产生跨事务 PR_WR(T1→T2)");
-        assertTrue(hasKnownBEdgeOfType(graph, h.getTransaction(1L), h.getTransaction(2L), EdgeType.PR_RW),
-                "PR_RW(T2→T3) 应存在（frontier x=20 与后续 x=3 满足 Δ）");
+        assertFalse(hasKnownBEdgeOfType(graph, h.getTransaction(1L), h.getTransaction(2L), EdgeType.PR_RW),
+                "INTERNAL predicate read 暂不进入 external PR_RW 推导");
     }
 
     /**

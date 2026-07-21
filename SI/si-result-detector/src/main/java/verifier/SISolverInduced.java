@@ -148,9 +148,7 @@ class SISolverInduced<KeyType, ValueType> {
                 }
 
                 boolean keyInResult = resultSourcesByKey.containsKey(key);
-                boolean keyCanAffectObservation = keyInResult
-                        || writes.stream().anyMatch(write -> writeRowIsInPredicateResult(write, predicateRead));
-                if (!keyCanAffectObservation) {
+                if (observation.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
                     continue;
                 }
 

@@ -329,7 +329,7 @@ public class SIVerifierPredicateIntegrationTest {
     }
 
     @Test
-    void refreshDerivedPredicateEdges_prRw_frontierDeltaCondition() throws Exception {
+    void refreshDerivedPredicateEdges_internalReadIsDeferred() throws Exception {
         // 根据最新可见 frontier 结构的 PR_WR/PR_RW 推导逻辑:
         //
         // 场景设计:
@@ -363,6 +363,8 @@ public class SIVerifierPredicateIntegrationTest {
         assertFalse(graph.getPredicateObservations().isEmpty(), "Predicate observation must be registered");
         assertEquals(1L, graph.getPredicateObservations().get(0).getTxn().getId(),
                 "Predicate observation should be from T1");
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
 
         SIVerifier.refreshDerivedPredicateEdges(h, graph);
 
@@ -370,8 +372,8 @@ public class SIVerifierPredicateIntegrationTest {
         boolean hasPrWr = edgeValues.orElse(List.of()).stream()
                 .anyMatch(e -> e.getType() == EdgeType.PR_WR);
         assertFalse(hasPrWr, "self frontier should not emit cross-transaction PR_WR");
-        assertTrue(graph.getKnownGraphB().hasEdgeConnecting(h.getTransaction(1L), h.getTransaction(2L)),
-                "PR_RW should be emitted because the self frontier and later writer satisfy Δ");
+        assertFalse(graph.getKnownGraphB().hasEdgeConnecting(h.getTransaction(1L), h.getTransaction(2L)),
+                "internal predicate reads must not emit PR_RW in the external path");
     }
 
     @Test

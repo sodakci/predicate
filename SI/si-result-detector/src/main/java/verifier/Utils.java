@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -36,6 +37,12 @@ class Utils {
         private final Long writeId;
     }
 
+    @lombok.Data
+    private static class PredicateReadState<KeyType, ValueType> {
+        private final int eventIndex;
+        private final Map<KeyType, ValueType> resultByKey;
+    }
+
     static <KeyType, ValueType> boolean verifyInternalConsistency(History<KeyType, ValueType> history) {
         var writesById = new HashMap<Long, WriteRef<KeyType, ValueType>>();
         var writesByKeyValue = new HashMap<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>>();
@@ -66,11 +73,25 @@ class Utils {
             }
         }
 
-        for (var p : getEvents.apply(Event.EventType.PREDICATE_READ).collect(Collectors.toList())) {
-            var i = p.getLeft();
-            var ev = p.getRight();
-            if (!checkPredicateRead(ev, i, writesById, writesByKeyValue, txnWrites)) {
-                return false;
+        for (var txn : history.getTransactions()) {
+            var previousPredicateReads = new HashMap<Object, PredicateReadState<KeyType, ValueType>>();
+            var events = txn.getEvents();
+            for (int i = 0; i < events.size(); i++) {
+                var ev = events.get(i);
+                if (ev.getType() != Event.EventType.PREDICATE_READ) {
+                    continue;
+                }
+                var predicate = ev.getPredicate();
+                var predicateIdentity = predicate == null ? null : predicate.identity();
+                var previous = predicate == null
+                        ? null
+                        : previousPredicateReads.get(predicateIdentity);
+                var current = checkPredicateRead(
+                        ev, i, writesById, writesByKeyValue, txnWrites, previous);
+                if (current == null) {
+                    return false;
+                }
+                previousPredicateReads.put(predicateIdentity, current);
             }
         }
         return true;
@@ -122,15 +143,17 @@ class Utils {
         return transaction.getStatus() == Transaction.TransactionStatus.COMMIT;
     }
 
-    private static <KeyType, ValueType> boolean checkPredicateRead(Event<KeyType, ValueType> ev, int pos,
+    private static <KeyType, ValueType> PredicateReadState<KeyType, ValueType> checkPredicateRead(
+            Event<KeyType, ValueType> ev, int pos,
             Map<Long, WriteRef<KeyType, ValueType>> writesById,
             Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue,
-            Map<Pair<Transaction<KeyType, ValueType>, KeyType>, ArrayList<Integer>> txnWrites) {
+            Map<Pair<Transaction<KeyType, ValueType>, KeyType>, ArrayList<Integer>> txnWrites,
+            PredicateReadState<KeyType, ValueType> previous) {
         var predicate = ev.getPredicate();
         var results = ev.getPredResults();
         if (predicate == null || results == null) {
             System.err.printf("%s has null predicate or results\n", ev);
-            return false;
+            return null;
         }
 
         var resultByKey = new HashMap<KeyType, ValueType>();
@@ -140,52 +163,46 @@ class Utils {
 
             if (resultByKey.containsKey(key)) {
                 System.err.printf("%s has duplicate key %s in predicate result\n", ev, key);
-                return false;
+                return null;
             }
             resultByKey.put(key, value);
 
             var ref = resolvePredicateResultSource(ev, result, writesById, writesByKeyValue);
             if (ref == null) {
-                return false;
+                return null;
             }
             if (!isCommitted(ref.getTransaction())) {
                 System.err.printf("%s result (%s,%s) comes from non-committed transaction %s\n", ev, key, value,
                         ref.getTransaction());
-                return false;
+                return null;
             }
-            if (!predicate.test(key, value)) {
+            if (!predicate.covers(key) || !predicate.test(key, value)) {
                 System.err.printf("%s result (%s,%s) does not satisfy predicate\n", ev, key, value);
-                return false;
-            }
-
-            var selfWrites = txnWrites.getOrDefault(Pair.of(ev.getTransaction(), key), new ArrayList<>());
-            var latestSelf = latestWriteBefore(selfWrites, pos);
-            if (latestSelf >= 0) {
-                var selfEvent = ev.getTransaction().getEvents().get(latestSelf);
-                if (!Objects.equals(selfEvent.getValue(), value)) {
-                    System.err.printf("%s should return own latest write for key %s\n", ev, key);
-                    return false;
-                }
-                continue;
+                return null;
             }
 
             if (ref.getTransaction() != ev.getTransaction()) {
                 var writerIndices = txnWrites.get(Pair.of(ref.getTransaction(), key));
                 if (writerIndices == null) {
                     System.err.printf("%s writer indices missing for (%s,%s)\n", ev, key, value);
-                    return false;
+                    return null;
                 }
                 var j = Collections.binarySearch(writerIndices, ref.getIndex());
                 if (j != writerIndices.size() - 1) {
                     System.err.printf("%s result (%s,%s) reads from intermediate write\n", ev, key, value);
-                    return false;
+                    return null;
                 }
             } else if (ref.getIndex() >= pos) {
                 System.err.printf("%s result (%s,%s) reads from future self write\n", ev, key, value);
-                return false;
+                return null;
             }
         }
 
+        var keysToCheck = new HashSet<KeyType>(resultByKey.keySet());
+        int previousReadIndex = previous == null ? -1 : previous.getEventIndex();
+        if (previous != null) {
+            keysToCheck.addAll(previous.getResultByKey().keySet());
+        }
         for (var p : txnWrites.entrySet()) {
             var txnAndKey = p.getKey();
             if (txnAndKey.getLeft() != ev.getTransaction()) {
@@ -193,27 +210,52 @@ class Utils {
             }
             var key = txnAndKey.getRight();
             var latestSelf = latestWriteBefore(p.getValue(), pos);
-            if (latestSelf < 0) {
+            if (latestSelf <= previousReadIndex) {
                 continue;
             }
-            var selfValue = ev.getTransaction().getEvents().get(latestSelf).getValue();
-            var inResult = resultByKey.containsKey(key);
-            var predTrue = predicate.test(key, selfValue);
-            if (predTrue && !inResult) {
-                System.err.printf("%s misses own visible tuple (%s,%s)\n", ev, key, selfValue);
-                return false;
+            keysToCheck.add(key);
+        }
+
+        for (var key : keysToCheck) {
+            if (!predicate.covers(key)) {
+                continue;
             }
-            if (!predTrue && inResult) {
-                System.err.printf("%s should not include key %s because own latest write fails predicate\n", ev, key);
-                return false;
+            var selfWrites = txnWrites.getOrDefault(Pair.of(ev.getTransaction(), key), new ArrayList<>());
+            var latestSelf = latestWriteBefore(selfWrites, pos);
+            if (latestSelf > previousReadIndex) {
+                var selfValue = ev.getTransaction().getEvents().get(latestSelf).getValue();
+                var inResult = resultByKey.containsKey(key);
+                var predTrue = predicate.test(key, selfValue);
+                if (predTrue && !inResult) {
+                    System.err.printf("%s misses own visible tuple (%s,%s)\n", ev, key, selfValue);
+                    return null;
+                }
+                if (!predTrue && inResult) {
+                    System.err.printf("%s should not include key %s because own latest write fails predicate\n", ev, key);
+                    return null;
+                }
+                if (predTrue && inResult && !Objects.equals(resultByKey.get(key), selfValue)) {
+                    System.err.printf("%s returns wrong own value for key %s\n", ev, key);
+                    return null;
+                }
+                continue;
             }
-            if (predTrue && inResult && !Objects.equals(resultByKey.get(key), selfValue)) {
-                System.err.printf("%s returns wrong own value for key %s\n", ev, key);
-                return false;
+
+            if (previous == null) {
+                continue;
+            }
+            var previousResults = previous.getResultByKey();
+            var previousInResult = previousResults.containsKey(key);
+            var currentInResult = resultByKey.containsKey(key);
+            if (previousInResult != currentInResult
+                    || previousInResult
+                    && !Objects.equals(previousResults.get(key), resultByKey.get(key))) {
+                System.err.printf("%s does not inherit previous predicate result for key %s\n", ev, key);
+                return null;
             }
         }
 
-        return true;
+        return new PredicateReadState<>(pos, new HashMap<>(resultByKey));
     }
 
     private static <KeyType, ValueType> WriteRef<KeyType, ValueType> resolveReadSource(

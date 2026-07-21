@@ -238,6 +238,9 @@ public class SIVerifier<KeyType, ValueType> {
 
             for (var resultEntry : resultSourceByKey.entrySet()) {
                 var key = resultEntry.getKey();
+                if (observation.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
+                    continue;
+                }
                 var resultSource = resultEntry.getValue();
                 if (!writeRowIsInPredicateResult(resultSource, predicateRead)) {
                     continue;
@@ -267,6 +270,9 @@ public class SIVerifier<KeyType, ValueType> {
 
             for (var entry : writesByKey.entrySet()) {
                 var key = entry.getKey();
+                if (observation.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
+                    continue;
+                }
                 if (resultSourceByKey.containsKey(key)) {
                     continue;
                 }
@@ -828,6 +834,9 @@ public class SIVerifier<KeyType, ValueType> {
 
             for (var entry : unresolvedByKey.entrySet()) {
                 var key = entry.getKey();
+                if (obs.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
+                    continue;
+                }
                 var writesOnKey = entry.getValue();
                 boolean keyCanAffectObservation = resultKeys.contains(key)
                         || writesOnKey.stream().anyMatch(w -> writeRowIsInPredicateResult(w, predicateRead));
@@ -933,6 +942,9 @@ public class SIVerifier<KeyType, ValueType> {
             // Iterate over keys with confirmed total write order.
             for (var entry : orderedWritesByKey.entrySet()) {
                 var key = entry.getKey();
+                if (obs.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
+                    continue;
+                }
                 var orderedWrites = entry.getValue();
                 boolean keyInResult = resultSourceByKey.containsKey(key);
                 if (!keyInResult

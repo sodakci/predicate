@@ -12,6 +12,7 @@ import java.io.FileReader;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BiPredicate;
 import java.util.regex.Pattern;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
@@ -159,15 +160,15 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
 
         var clause = where.get(0).asText().trim();
         if ("TRUE".equalsIgnoreCase(clause)) {
-            return (key, value) -> key != null && value != null;
+            return parsedPredicate("TRUE", (key, value) -> key != null && value != null);
         }
 
         var eq = VALUE_EQ.matcher(clause);
         if (eq.matches()) {
             var target = parseLongLiteral(eq.group(1));
-            return (key, value) -> key != null
+            return parsedPredicate("VALUE_EQ:" + target, (key, value) -> key != null
                     && value != null
-                    && value.getEncoded() == target;
+                    && value.getEncoded() == target);
         }
 
         var mod = VALUE_MOD.matcher(clause);
@@ -177,28 +178,44 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
             if (modulus == 0) {
                 throw new InvalidHistoryError();
             }
-            return (key, value) -> key != null
+            return parsedPredicate("VALUE_MOD:" + modulus + ":" + target, (key, value) -> key != null
                     && value != null
-                    && Math.floorMod(value.getEncoded(), modulus) == target;
+                    && Math.floorMod(value.getEncoded(), modulus) == target);
         }
 
         var gt = VALUE_GT.matcher(clause);
         if (gt.matches()) {
             var target = parseLongLiteral(gt.group(1));
-            return (key, value) -> key != null
+            return parsedPredicate("VALUE_GT:" + target, (key, value) -> key != null
                     && value != null
-                    && value.getEncoded() > target;
+                    && value.getEncoded() > target);
         }
 
         var lt = VALUE_LT.matcher(clause);
         if (lt.matches()) {
             var target = parseLongLiteral(lt.group(1));
-            return (key, value) -> key != null
+            return parsedPredicate("VALUE_LT:" + target, (key, value) -> key != null
                     && value != null
-                    && value.getEncoded() < target;
+                    && value.getEncoded() < target);
         }
 
         throw new InvalidHistoryError();
+    }
+
+    private Event.PredEval<String, PredicateValue> parsedPredicate(
+            String identity,
+            BiPredicate<String, PredicateValue> evaluator) {
+        return new Event.PredEval<>() {
+            @Override
+            public boolean test(String key, PredicateValue value) {
+                return evaluator.test(key, value);
+            }
+
+            @Override
+            public Object identity() {
+                return identity;
+            }
+        };
     }
 
     private PredicateValue parseValue(JsonNode node) {
