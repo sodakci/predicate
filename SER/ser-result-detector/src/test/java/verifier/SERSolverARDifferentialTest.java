@@ -403,7 +403,8 @@ class SERSolverARDifferentialTest {
                 var expected = new LinkedHashMap<String, Object>();
                 for (var key : keys) {
                     var latest = latestVisibleWrite(key, txn, i, order, writes);
-                    if (latest != null && event.getPredicate().test(key, latest.event.getValue())) {
+                    if (latest != null && PredicateFixtures.matches(
+                            event.getPredicate(), key, latest.event.getValue())) {
                         expected.put(key, writeToken(latest));
                     }
                 }
@@ -519,7 +520,8 @@ class SERSolverARDifferentialTest {
                 throw new AssertionError("oracle predicate result source points to a different row: "
                         + result);
             }
-            if (!event.getPredicate().test(result.getKey(), result.getValue())) {
+            if (!PredicateFixtures.matches(
+                    event.getPredicate(), result.getKey(), result.getValue())) {
                 throw new AssertionError("oracle predicate result row does not satisfy predicate: " + result);
             }
         }
@@ -717,7 +719,7 @@ class SERSolverARDifferentialTest {
             Map<String, List<WriteChoice<Integer>>> knownWrites) {
         String prefix = random.nextDouble() < 0.25 ? "" : randomKey(random);
         int threshold = random.nextBoolean() ? 50 : 120;
-        Event.PredEval<String, Integer> predicate =
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
                 (candidateKey, value) -> candidateKey.startsWith(prefix) && value >= threshold;
 
         var latestKnown = latestKnownByKey(knownWrites).stream()
@@ -989,7 +991,7 @@ class SERSolverARDifferentialTest {
         }
 
         private TxnBuilder prGe(int threshold, Version... results) {
-            Event.PredEval<String, Integer> predicate = (candidateKey, value) -> value >= threshold;
+            PredicateFixtures.RowPredicate<String, Integer> predicate = (candidateKey, value) -> value >= threshold;
             var predResults = new ArrayList<Event.PredResult<String, Integer>>();
             for (var version : results) {
                 predResults.add(new Event.PredResult<>(version.key, version.value, version.writeId, null, null));

@@ -92,9 +92,10 @@ public class SERVerifierPredicateTest {
 
     private static Event<String, Integer> makePredicateReadEvent(
             Transaction<String, Integer> txn,
-            Event.PredEval<String, Integer> predicate,
+            PredicateFixtures.RowPredicate<String, Integer> predicate,
             List<Event.PredResult<String, Integer>> results) {
-        return new Event<>(txn, Event.EventType.PREDICATE_READ, null, null, predicate, results);
+        return new Event<>(txn, Event.EventType.PREDICATE_READ, null, null,
+                predicate, results, null);
     }
 
     // ================================================================
@@ -133,7 +134,7 @@ public class SERVerifierPredicateTest {
         var graph = makeGraph(h);
 
         // 谓词: value > 5
-        Event.PredEval<String, Integer> pred = (k, v) -> v > 5;
+        PredicateFixtures.RowPredicate<String, Integer> pred = (k, v) -> v > 5;
         var writeRef = makeWriteRef(graph, "x", 10);
 
         // 构造一个最小 predicate read event（用于传参）
@@ -156,7 +157,7 @@ public class SERVerifierPredicateTest {
         var graph = makeGraph(h);
 
         // 谓词: value > 5
-        Event.PredEval<String, Integer> pred = (k, v) -> v > 5;
+        PredicateFixtures.RowPredicate<String, Integer> pred = (k, v) -> v > 5;
         var writeRef = makeWriteRef(graph, "x", 3);
 
         var prEvent = makePredicateReadEvent(
@@ -178,7 +179,7 @@ public class SERVerifierPredicateTest {
         var graph = makeGraph(h);
 
         // 谓词: key == "x"
-        Event.PredEval<String, Integer> pred = (k, v) -> "x".equals(k);
+        PredicateFixtures.RowPredicate<String, Integer> pred = (k, v) -> "x".equals(k);
         var writeRef = makeWriteRef(graph, "x", 100);
 
         var prEvent = makePredicateReadEvent(
@@ -206,7 +207,7 @@ public class SERVerifierPredicateTest {
         ), Map.of(0L, List.of(0L), 1L, List.of(1L)));
         var graph = makeGraph(h);
 
-        var pred = (Event.PredEval<String, Integer>) (k, v) -> v > 5;
+        var pred = (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5;
         var prevRef = makeWriteRef(graph, "x", 1);
         var currRef = makeWriteRef(graph, "x", 10);
 
@@ -230,7 +231,7 @@ public class SERVerifierPredicateTest {
         ), Map.of(0L, List.of(0L), 1L, List.of(1L)));
         var graph = makeGraph(h);
 
-        var pred = (Event.PredEval<String, Integer>) (k, v) -> v > 5;
+        var pred = (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5;
         var prevRef = makeWriteRef(graph, "x", 10);
         var currRef = makeWriteRef(graph, "x", 1);
 
@@ -252,7 +253,7 @@ public class SERVerifierPredicateTest {
         ), Map.of(0L, List.of(0L), 1L, List.of(1L)));
         var graph = makeGraph(h);
 
-        var pred = (Event.PredEval<String, Integer>) (k, v) -> v > 5;
+        var pred = (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5;
         var prevRef = makeWriteRef(graph, "x", 10);
         var currRef = makeWriteRef(graph, "x", 20);
 
@@ -275,7 +276,7 @@ public class SERVerifierPredicateTest {
         h.addWriteEvent(t1, "x", 10, 101L);
         var graph = makeGraph(h);
 
-        var pred = (Event.PredEval<String, Integer>) (k, v) -> v > 5;
+        var pred = (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5;
         var prevRef = makeWriteRefById(graph, 100L);
         var currRef = makeWriteRefById(graph, 101L);
         var prEvent = makePredicateReadEvent(t1, pred, List.of());
@@ -297,7 +298,7 @@ public class SERVerifierPredicateTest {
         h.addWriteEvent(t1, "x", 20, 101L);
         var graph = makeGraph(h);
 
-        var pred = (Event.PredEval<String, Integer>) (k, v) -> v > 5;
+        var pred = (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5;
         var prevRef = makeWriteRefById(graph, 100L);
         var currRef = makeWriteRefById(graph, 101L);
         var prEvent = makePredicateReadEvent(t1, pred, List.of());
@@ -318,7 +319,7 @@ public class SERVerifierPredicateTest {
         ), Map.of(0L, List.of(0L), 1L, List.of(1L)));
         var graph = makeGraph(h);
 
-        var pred = (Event.PredEval<String, Integer>) (k, v) -> v > 5;
+        var pred = (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5;
         var prevRef = makeWriteRef(graph, "x", 1);
         var currRef = makeWriteRef(graph, "x", 2);
 
@@ -340,7 +341,7 @@ public class SERVerifierPredicateTest {
         ));
         var graph = makeGraph(h);
 
-        var pred = (Event.PredEval<String, Integer>) (k, v) -> v > 5;
+        var pred = (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5;
         var currRef = makeWriteRef(graph, "x", 10);
 
         var prEvent = makePredicateReadEvent(h.getTransaction(0L), pred, List.of());

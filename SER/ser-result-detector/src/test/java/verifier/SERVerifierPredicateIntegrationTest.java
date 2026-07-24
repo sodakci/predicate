@@ -62,7 +62,7 @@ public class SERVerifierPredicateIntegrationTest {
             // txnId -> list of (type, key, value) for normal events
             Map<Long, List<Triple<Event.EventType, String, Integer>>> normalEvents,
             // txnId -> (predicateEval, list of (key, value) results)
-            Map<Long, Pair<Event.PredEval<String, Integer>, List<Event.PredResult<String, Integer>>>> predicateReads) {
+            Map<Long, Pair<PredicateFixtures.RowPredicate<String, Integer>, List<Event.PredResult<String, Integer>>>> predicateReads) {
 
         var h = new History<>(sessions, sessionToTxns, normalEvents);
 
@@ -279,7 +279,7 @@ public class SERVerifierPredicateIntegrationTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 1)),
                         1L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         predResults))
         );
         var graph = makeGraph(h);
@@ -321,7 +321,7 @@ public class SERVerifierPredicateIntegrationTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 1)),
                         1L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of()))  // 空结果
         );
         var graph = makeGraph(h);
@@ -359,7 +359,7 @@ public class SERVerifierPredicateIntegrationTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 1)),
                         1L, List.of(Triple.of(WRITE, "x", 5))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 3,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 3,
                         predResults))
         );
         var graph = makeGraph(h);
@@ -394,7 +394,7 @@ public class SERVerifierPredicateIntegrationTest {
         var h = new History<String, Integer>();
         var session = h.addSession(0L);
         var txn = h.addTransaction(session, 1L);
-        var predicate = (Event.PredEval<String, Integer>) (k, v) -> "y".equals(k) && v >= 100;
+        var predicate = (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> "y".equals(k) && v >= 100;
         h.addPredicateReadEvent(txn, predicate, List.of());
         h.addEvent(txn, WRITE, "y", 120);
         h.addPredicateReadEvent(txn, predicate, List.of());
@@ -440,7 +440,7 @@ public class SERVerifierPredicateIntegrationTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 1)),
                         1L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         predResults))
         );
         var graph = makeGraph(h);
@@ -473,7 +473,7 @@ public class SERVerifierPredicateIntegrationTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 1)),
                         1L, List.of(Triple.of(WRITE, "x", 2))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         predResults))
         );
         var graph = makeGraph(h);
@@ -520,7 +520,7 @@ public class SERVerifierPredicateIntegrationTest {
                         2L, List.of(Triple.of(READ, "x", 20),
                                 Triple.of(WRITE, "x", 3))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 20))))
         );
         var graph = makeGraph(h);
@@ -557,7 +557,7 @@ public class SERVerifierPredicateIntegrationTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
                         2L, List.of(Triple.of(WRITE, "x", 20))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         predResults))
         );
         var graph = makeGraph(h);
@@ -583,7 +583,7 @@ public class SERVerifierPredicateIntegrationTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 1)),
                         1L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         predResults))
         );
         var graph = makeGraph(h);

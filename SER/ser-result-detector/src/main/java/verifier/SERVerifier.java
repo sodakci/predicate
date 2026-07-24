@@ -7,6 +7,8 @@ import history.Event;
 import history.History;
 import history.HistoryLoader;
 import history.Transaction;
+import history.query.MapVisibleState;
+import history.query.QueryException;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -194,7 +196,6 @@ public class SERVerifier<KeyType, ValueType> {
             Set<Transaction<KeyType, ValueType>> allowedTxns) {
         for (var ep : known.edges()) {
             var labels = known.edgeValue(ep).orElse(List.of()).stream()
-                    .filter(edge -> edge.getType() != EdgeType.PR_WR && edge.getType() != EdgeType.PR_RW)
                     .map(edge -> String.format("known %s%s",
                             edge.getType(),
                             edge.getKey() == null ? "" : String.format(" key=%s", edge.getKey())))
@@ -1079,7 +1080,24 @@ public class SERVerifier<KeyType, ValueType> {
             KnownGraph.WriteRef<KeyType, ValueType> writeRef,
             Event<KeyType, ValueType> predicateReadEvent) {
         var ev = writeRef.getEvent();
-        return predicateReadEvent.getPredicate()
-                .test(ev.getKey(), ev.getValue());
+        var predicate = predicateReadEvent.getPredicate();
+        var relations = predicate.scope().relations();
+        try {
+            var evaluation = predicate.evaluate(new MapVisibleState<>(
+                    Map.of(ev.getKey(), ev.getValue()), key -> {
+                        var canonical = String.valueOf(key);
+                        var separator = canonical.indexOf(':');
+                        if (separator > 0) {
+                            return canonical.substring(0, separator);
+                        }
+                        if (relations.size() == 1) {
+                            return relations.iterator().next();
+                        }
+                        throw new QueryException("cannot resolve relation for key " + key);
+                    }));
+            return evaluation.inputs().containsKey(ev.getKey());
+        } catch (QueryException exception) {
+            return false;
+        }
     }
 }

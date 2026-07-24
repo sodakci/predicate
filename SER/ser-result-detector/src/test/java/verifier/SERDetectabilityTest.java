@@ -36,7 +36,7 @@ public class SERDetectabilityTest {
             Set<Long> sessions,
             Map<Long, List<Long>> sessionToTxns,
             Map<Long, List<Triple<Event.EventType, String, Integer>>> normalEvents,
-            Map<Long, Pair<Event.PredEval<String, Integer>, List<Event.PredResult<String, Integer>>>> predicateReads) {
+            Map<Long, Pair<PredicateFixtures.RowPredicate<String, Integer>, List<Event.PredResult<String, Integer>>>> predicateReads) {
         var nonPredicateEvents = new HashMap<Long, List<Triple<Event.EventType, String, Integer>>>();
         for (var entry : normalEvents.entrySet()) {
             var events = new ArrayList<>(entry.getValue());
@@ -172,7 +172,7 @@ public class SERDetectabilityTest {
                         1L, List.of(Triple.of(PREDICATE_READ, "x", 10)),
                         2L, List.of(Triple.of(WRITE, "x", 3))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10))))
         );
         var graph = new KnownGraph<>(h);
@@ -199,7 +199,7 @@ public class SERDetectabilityTest {
                         2L, List.of(Triple.of(WRITE, "x", 20)),
                         3L, List.of(Triple.of(PREDICATE_READ, "x", 20))),
                 Map.of(3L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 20))))
         );
         var graph = new KnownGraph<>(h);
@@ -229,7 +229,7 @@ public class SERDetectabilityTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
                         1L, List.of(Triple.of(PREDICATE_READ, "x", 10))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10))))
         );
         var graph = new KnownGraph<>(h);
@@ -253,7 +253,7 @@ public class SERDetectabilityTest {
                         1L, List.of(Triple.of(WRITE, "x", 20),
                                 Triple.of(PREDICATE_READ, "x", 20))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 20))))
         );
         var graph = new KnownGraph<>(h);
@@ -282,7 +282,7 @@ public class SERDetectabilityTest {
                                 Triple.of(PREDICATE_READ, "x", 20)),
                         2L, List.of(Triple.of(WRITE, "x", 3))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 20))))
         );
         var graph = new KnownGraph<>(h);
@@ -311,7 +311,7 @@ public class SERDetectabilityTest {
                         1L, List.of(Triple.of(PREDICATE_READ, "x", 10),
                                 Triple.of(WRITE, "x", 20))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10))))
         );
         var graph = new KnownGraph<>(h);
@@ -396,7 +396,7 @@ public class SERDetectabilityTest {
                 Map.of(0L, List.of(0L, 1L)),
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 3))))  // x=3 不满足 v>5
         );
 
@@ -412,7 +412,7 @@ public class SERDetectabilityTest {
                 Map.of(0L, List.of(0L, 1L)),
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(
                                 new Event.PredResult<>("x", 10),
                                 new Event.PredResult<>("x", 10))))
@@ -435,7 +435,7 @@ public class SERDetectabilityTest {
                 Map.of(0L, List.of(0L)),
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 3))),  // x=3 不满足 v>5
                 Map.of(0L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of()))  // 空结果：没有值满足 v>5
         );
 
@@ -454,7 +454,7 @@ public class SERDetectabilityTest {
 
         var session = h.addSession(0L);
         var txn = h.addTransaction(session, 1L);
-        Event.PredEval<String, Integer> predicate = (key, value) -> "x".equals(key) && value > 5;
+        PredicateFixtures.RowPredicate<String, Integer> predicate = (key, value) -> "x".equals(key) && value > 5;
         h.addPredicateReadEvent(txn, predicate,
                 List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
         h.addPredicateReadEvent(txn, predicate, List.of());
@@ -479,7 +479,7 @@ public class SERDetectabilityTest {
 
         var session = h.addSession(0L);
         var txn = h.addTransaction(session, 1L);
-        Event.PredEval<String, Integer> predicate = (key, value) -> "x".equals(key) && value > 5;
+        PredicateFixtures.RowPredicate<String, Integer> predicate = (key, value) -> "x".equals(key) && value > 5;
         h.addPredicateReadEvent(txn, predicate,
                 List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
         h.addWriteEvent(txn, "x", 3, 101L);
@@ -498,7 +498,7 @@ public class SERDetectabilityTest {
         var session = h.addSession(0L);
         var txn = h.addTransaction(session, 1L);
         h.addWriteEvent(txn, "x", 20, 100L);
-        Event.PredEval<String, Integer> predicate = (key, value) -> "x".equals(key) && value > 5;
+        PredicateFixtures.RowPredicate<String, Integer> predicate = (key, value) -> "x".equals(key) && value > 5;
         h.addPredicateReadEvent(txn, predicate, List.of());
         txn.setStatus(Transaction.TransactionStatus.COMMIT);
 
@@ -527,7 +527,7 @@ public class SERDetectabilityTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
                         1L, List.of(Triple.of(WRITE, "y", 1))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10))))
         );
 

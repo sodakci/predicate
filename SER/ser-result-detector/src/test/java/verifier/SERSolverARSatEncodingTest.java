@@ -26,7 +26,7 @@ class SERSolverARSatEncodingTest {
             Set<Long> sessions,
             Map<Long, List<Long>> sessionToTxns,
             Map<Long, List<Triple<Event.EventType, String, Integer>>> normalEvents,
-            Map<Long, Pair<Event.PredEval<String, Integer>, List<Event.PredResult<String, Integer>>>> predicateReads) {
+            Map<Long, Pair<PredicateFixtures.RowPredicate<String, Integer>, List<Event.PredResult<String, Integer>>>> predicateReads) {
         var h = new History<>(sessions, sessionToTxns, normalEvents);
         for (var entry : predicateReads.entrySet()) {
             h.addPredicateReadEvent(h.getTransaction(entry.getKey()), entry.getValue().getLeft(), entry.getValue().getRight());
@@ -55,8 +55,8 @@ class SERSolverARSatEncodingTest {
         history.getTransactions().forEach(txn -> txn.setStatus(Transaction.TransactionStatus.COMMIT));
     }
 
-    private static Event.PredEval<String, Integer> keyAtLeast(String key, int threshold) {
-        return new Event.PredEval<>() {
+    private static PredicateFixtures.RowPredicate<String, Integer> keyAtLeast(String key, int threshold) {
+        return new PredicateFixtures.RowPredicate<>() {
             @Override
             public boolean test(String candidateKey, Integer value) {
                 return key.equals(candidateKey) && value >= threshold;
@@ -173,7 +173,7 @@ class SERSolverARSatEncodingTest {
                         3L, List.of(Triple.of(READ, "z", 1), Triple.of(WRITE, "x", 3), Triple.of(WRITE, "y", 1)),
                         2L, List.of(Triple.of(READ, "y", 1))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10)))));
 
         var graph = new KnownGraph<>(history);
@@ -191,7 +191,7 @@ class SERSolverARSatEncodingTest {
                 Map.of(1L, List.of(2L, 1L)),
                 Map.of(1L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10)))));
 
         var graph = new KnownGraph<>(history);
@@ -211,7 +211,7 @@ class SERSolverARSatEncodingTest {
                         1L, List.of(Triple.of(WRITE, "x", 10)),
                         2L, List.of(Triple.of(WRITE, "x", 20))),
                 Map.of(3L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10)))));
 
         var graph = new KnownGraph<>(history);
@@ -230,7 +230,7 @@ class SERSolverARSatEncodingTest {
                         3L, List.of(Triple.of(WRITE, "x", 3)),
                         4L, List.of(Triple.of(WRITE, "z", 1))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10)))));
         commitAll(history);
 
@@ -251,7 +251,7 @@ class SERSolverARSatEncodingTest {
                         3L, List.of(Triple.of(READ, "z", 1), Triple.of(WRITE, "x", 8), Triple.of(WRITE, "y", 1)),
                         2L, List.of(Triple.of(READ, "y", 1))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10)))));
 
         var graph = new KnownGraph<>(history);
@@ -273,7 +273,7 @@ class SERSolverARSatEncodingTest {
                         3L, List.of(Triple.of(WRITE, "x", 8), Triple.of(WRITE, "y", 1)),
                         4L, List.of(Triple.of(READ, "y", 1))),
                 Map.of(4L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> k.equals("x") && v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> k.equals("x") && v > 5,
                         List.of())));
 
         var graph = new KnownGraph<>(history);
@@ -289,7 +289,7 @@ class SERSolverARSatEncodingTest {
                 Map.of(1L, List.of(1L, 2L)),
                 Map.of(1L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> k.equals("x") && v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> k.equals("x") && v > 5,
                         List.of())));
 
         var graph = new KnownGraph<>(history);
@@ -299,7 +299,7 @@ class SERSolverARSatEncodingTest {
     }
 
     @Test
-    void externalPredicateReadRequiresAVisibleWriterFrontier() {
+    void externalPredicateReadAllowsAbsentFrontierBeforeInsert() {
         var history = singleTxnHistory();
         var txn = history.getTransaction(1L);
         history.addPredicateReadEvent(txn, keyAtLeast("x", 5), List.of());
@@ -311,8 +311,8 @@ class SERSolverARSatEncodingTest {
                 graph.getPredicateObservations().get(0).getPredicateReadType("x"));
 
         var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
-        assertFalse(solver.solve(),
-                "an external covered key must select one visible writer, but the only writer is later in program order");
+        assertTrue(solver.solve(),
+                "a key without an initial version is absent before its later insert");
     }
 
     @Test
@@ -387,7 +387,7 @@ class SERSolverARSatEncodingTest {
                         3L, List.of(Triple.of(WRITE, "x", 3)),
                         4L, List.of(Triple.of(WRITE, "z", 1))),
                 Map.of(2L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> k.equals("x") && v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> k.equals("x") && v > 5,
                         List.of(new Event.PredResult<>("x", 10)))));
         commitAll(history);
 

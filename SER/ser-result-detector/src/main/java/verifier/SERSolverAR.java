@@ -6,6 +6,10 @@ import graph.KnownGraph;
 import history.Event;
 import history.History;
 import history.Transaction;
+import history.query.MapVisibleState;
+import history.query.QueryEvaluation;
+import history.query.QueryException;
+import history.query.RelationResolver;
 import monosat.Graph;
 import monosat.Lit;
 import monosat.Logic;
@@ -46,6 +50,14 @@ class SERSolverAR<KeyType, ValueType> {
     // Per-key write lists provide the local write order candidates used by WW/RW
     // and predicate-read encodings.
     private final Map<KeyType, List<KnownGraph.WriteRef<KeyType, ValueType>>> writesByKey;
+    // Predicate constraints are refined lazily from concrete SAT models.  This
+    // avoids eagerly enumerating the Cartesian product of every key frontier.
+    private final List<PredicateCheck<KeyType, ValueType>> predicateChecks = new ArrayList<>();
+    // Dependency edges are created with their type/key metadata before their
+    // guards are encoded into AR. This keeps edge construction separate from
+    // constraint encoding and preserves RW/PR_RW as B-side dependencies.
+    private final List<GuardedDependencyEdge<KeyType, ValueType>> dependencyEdgesA = new ArrayList<>();
+    private final List<GuardedDependencyEdge<KeyType, ValueType>> dependencyEdgesB = new ArrayList<>();
     private Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>> conflictEdges =
             Collections.emptyList();
     private Collection<SERConstraint<KeyType, ValueType>> conflictConstraints = Collections.emptyList();
@@ -78,6 +90,7 @@ class SERSolverAR<KeyType, ValueType> {
         encodeRemainingWwChoices();
         encodeRwFromWrAndWw();
         encodePredicateConstraints();
+        encodeDependencyEdges();
         encodeStrictTotalOrder();
     }
 
@@ -86,11 +99,19 @@ class SERSolverAR<KeyType, ValueType> {
      * a reduced explanation; recursive satisfiability checks disable that work.
      */
     boolean solve() {
-        boolean sat = solver.solve();
-        if (sat || !collectConflicts) {
+        while (solver.solve()) {
+            if (refinePredicateConstraints()) {
+                continue;
+            }
             conflictEdges = Collections.emptyList();
             conflictConstraints = Collections.emptyList();
-            return sat;
+            return true;
+        }
+
+        if (!collectConflicts) {
+            conflictEdges = Collections.emptyList();
+            conflictConstraints = Collections.emptyList();
+            return false;
         }
 
         extractConflicts();
@@ -156,10 +177,10 @@ class SERSolverAR<KeyType, ValueType> {
             solver.assertTrue(Logic.xor(forward, backward));
 
             for (var edge : c.getEdges1()) {
-                solver.assertTrue(Logic.implies(forward, ar(edge.getFrom(), edge.getTo())));
+                addDependencyEdge(edge, forward);
             }
             for (var edge : c.getEdges2()) {
-                solver.assertTrue(Logic.implies(backward, ar(edge.getFrom(), edge.getTo())));
+                addDependencyEdge(edge, backward);
             }
         }
     }
@@ -181,209 +202,419 @@ class SERSolverAR<KeyType, ValueType> {
                     }
                     // Algorithm 1, lines 28-30:
                     // if T' --WR(x)--> T and T' --WW(x)--> U then T --RW(x)--> U.
-                    solver.assertTrue(Logic.implies(ar(ep.source(), u), ar(ep.target(), u)));
+                    addDependencyEdge(
+                            new SEREdge<>(ep.target(), u, EdgeType.RW, key),
+                            ar(ep.source(), u));
                 }
             }
         }
     }
 
+    private void addDependencyEdge(SEREdge<KeyType, ValueType> edge, Lit guard) {
+        var guarded = new GuardedDependencyEdge<>(edge, guard);
+        switch (edge.getType()) {
+        case SO:
+        case WR:
+        case WW:
+        case PR_WR:
+            dependencyEdgesA.add(guarded);
+            break;
+        case RW:
+        case PR_RW:
+            dependencyEdgesB.add(guarded);
+            break;
+        }
+    }
+
+    private void encodeDependencyEdges() {
+        for (var guarded : dependencyEdgesA) {
+            encodeDependencyEdge(guarded);
+        }
+        for (var guarded : dependencyEdgesB) {
+            encodeDependencyEdge(guarded);
+        }
+    }
+
+    private void encodeDependencyEdge(GuardedDependencyEdge<KeyType, ValueType> guarded) {
+        var edge = guarded.edge;
+        solver.assertTrue(Logic.implies(
+                guarded.guard, ar(edge.getFrom(), edge.getTo())));
+    }
+
+    private void addKnownPredicateEdge(SEREdge<KeyType, ValueType> edge) {
+        var existing = graph.getKnownGraphA()
+                .edgeValue(edge.getFrom(), edge.getTo())
+                .orElse(Collections.emptyList());
+        var graphEdge = new Edge<KeyType>(edge.getType(), edge.getKey());
+        if (!existing.contains(graphEdge)) {
+            graph.putEdge(edge.getFrom(), edge.getTo(), graphEdge);
+        }
+    }
+
     /**
-     * Encodes predicate-read consistency without pre-materializing PR_* edges.
-     *
-     * <p>For each observed predicate read and each key, the encoding identifies
-     * the latest visible write frontier. Only external observations enter this
-     * PR_WR/PR_RW derivation path. Internal observations are validated by
-     * {@link Utils#verifyInternalConsistency(History)} before this solver is
-     * constructed.</p>
+     * Builds the latest-visible frontier for each predicate read.  Concrete
+     * frontier combinations are checked lazily in solve(): when a SAT model
+     * produces a result different from the recorded query result, that exact
+     * combination is forbidden and the solver is resumed.  The generated
+     * blocking clause is identical to the corresponding eager snapshot clause,
+     * but unreachable and unnecessary combinations are never enumerated.
      */
     private void encodePredicateConstraints() {
         for (var observation : graph.getPredicateObservations()) {
             var predicateRead = observation.getPredicateReadEvent();
-            if (predicateRead.getPredicate() == null) {
+            var predicate = predicateRead.getPredicate();
+            if (predicate == null) {
                 continue;
             }
 
-            var predWrGuardsBySource = new HashMap<Transaction<KeyType, ValueType>, Lit>();
-            var predRwGuardsByTarget = new HashMap<Transaction<KeyType, ValueType>, Lit>();
-            var resultSourcesByKey = observation.getTupleSources().stream()
-                    .collect(Collectors.toMap(KnownGraph.PredicateTupleSource::getKey, KnownGraph.PredicateTupleSource::getSourceWrite));
+            var resultSourcesByKey = new LinkedHashMap<KeyType,
+                    KnownGraph.WriteRef<KeyType, ValueType>>();
+            for (var source : observation.getTupleSources()) {
+                if (resultSourcesByKey.putIfAbsent(source.getKey(), source.getSourceWrite()) != null) {
+                    solver.assertTrue(Lit.False);
+                }
+            }
 
-            for (var entry : writesByKey.entrySet()) {
-                var key = entry.getKey();
-                var writes = entry.getValue();
-                if (writes.isEmpty()) {
+            var scopedEntries = writesByKey.entrySet().stream()
+                    .filter(entry -> predicate.scope().covers(entry.getKey()))
+                    .sorted(Comparator.comparing(entry -> String.valueOf(entry.getKey())))
+                    .collect(Collectors.toList());
+            var frontierEntries = scopedEntries.stream()
+                    .filter(entry -> observation.getPredicateReadType(entry.getKey())
+                            == KnownGraph.PredicateReadType.EXTERNAL)
+                    .collect(Collectors.toList());
+            if (frontierEntries.isEmpty()) {
+                // Internal predicate keys are checked by the same evaluator in
+                // Utils before solver construction.
+                continue;
+            }
+
+            var frontiers = new ArrayList<KeyFrontier<KeyType, ValueType>>(frontierEntries.size());
+            for (var entry : frontierEntries) {
+                frontiers.add(createKeyFrontier(observation, entry.getKey(), entry.getValue(),
+                        resultSourcesByKey.get(entry.getKey())));
+            }
+
+            for (var resultKey : resultSourcesByKey.keySet()) {
+                if (!predicate.scope().covers(resultKey)) {
+                    solver.assertTrue(Lit.False);
+                }
+            }
+
+            var snapshot = new LinkedHashMap<KeyType, ValueType>();
+            var frontierKeys = frontierEntries.stream().map(Map.Entry::getKey)
+                    .collect(Collectors.toSet());
+            for (var entry : scopedEntries) {
+                if (frontierKeys.contains(entry.getKey())) {
                     continue;
                 }
-
-                boolean keyInResult = resultSourcesByKey.containsKey(key);
-                if (observation.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
-                    continue;
-                }
-
-                var visibleWriters = createVisibleWriterLits(observation, key, writes, resultSourcesByKey);
-                var observationFrontier = keyInResult
-                        ? fixedObservationFrontier(resultSourcesByKey.get(key), writes, predicateRead)
-                        : createObservationFrontierLits(visibleWriters, writes);
-                solver.assertTrue(or(observationFrontier));
-                if (!keyInResult) {
-                    assertObservationFrontierMatchesResult(false, observationFrontier, writes, predicateRead);
-                }
-                for (int i = 0; i < writes.size(); i++) {
-                    var t = writes.get(i).getTxn();
-                    if (!t.equals(observation.getTxn())) {
-                        addGuard(predWrGuardsBySource, t, observationFrontier.get(i));
-                    }
-
-                    for (int j = 0; j < writes.size(); j++) {
-                        if (i == j) {
-                            continue;
-                        }
-                        var u = writes.get(j).getTxn();
-                        if (u.equals(observation.getTxn()) || u.equals(t)) {
-                            continue;
-                        }
-
-                        var before = beforeWrite(writes.get(i), writes.get(j));
-                        if (before == Lit.False
-                                || observationFrontier.get(i) == Lit.False
-                                || !writeChangesPredicateResultSet(writes.get(j), writes.get(i), predicateRead)) {
-                            continue;
-                        }
-                        var predRw = and(
-                                observationFrontier.get(i),
-                                before);
-                        addGuard(predRwGuardsByTarget, u, predRw);
-                    }
+                var latestSelf = entry.getValue().stream()
+                        .filter(write -> write.getTxn().equals(observation.getTxn())
+                                && write.getIndex() < observation.getEventIndex())
+                        .max(Comparator.comparingInt(KnownGraph.WriteRef::getIndex))
+                        .orElse(resultSourcesByKey.get(entry.getKey()));
+                if (latestSelf != null) {
+                    snapshot.put(entry.getKey(), latestSelf.getEvent().getValue());
                 }
             }
-
-            for (var entry : predWrGuardsBySource.entrySet()) {
-                solver.assertTrue(Logic.implies(entry.getValue(), ar(entry.getKey(), observation.getTxn())));
-            }
-            for (var entry : predRwGuardsByTarget.entrySet()) {
-                solver.assertTrue(Logic.implies(entry.getValue(), ar(observation.getTxn(), entry.getKey())));
-            }
+            predicateChecks.add(new PredicateCheck<>(predicateRead, frontiers,
+                    snapshot, relationResolverFor(predicateRead)));
         }
     }
 
-    private void addGuard(Map<Transaction<KeyType, ValueType>, Lit> guards,
-                          Transaction<KeyType, ValueType> txn,
-                          Lit guard) {
-        if (guard == Lit.False) {
+    private KeyFrontier<KeyType, ValueType> createKeyFrontier(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            KeyType key,
+            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
+            KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
+        var latestSelf = writes.stream()
+                .filter(write -> write.getTxn().equals(observation.getTxn())
+                        && write.getIndex() < observation.getEventIndex())
+                .max(Comparator.comparingInt(KnownGraph.WriteRef::getIndex))
+                .orElse(null);
+        if (latestSelf != null) {
+            if (recordedSource != null && recordedSource != latestSelf) {
+                solver.assertTrue(Lit.False);
+            }
+            return new KeyFrontier<>(key,
+                    observation.getTxn(),
+                    List.of(new FrontierCandidate<>(latestSelf, Lit.True)), latestSelf);
+        }
+
+        // Only the final write to a key in one transaction can be externally
+        // visible.  Earlier writes in the same transaction can never be a
+        // latest-visible frontier.
+        var latestByWriter = new LinkedHashMap<Transaction<KeyType, ValueType>,
+                KnownGraph.WriteRef<KeyType, ValueType>>();
+        for (var write : writes) {
+            if (!write.getTxn().equals(observation.getTxn())) {
+                latestByWriter.put(write.getTxn(), write);
+            }
+        }
+
+        var candidates = latestByWriter.values().stream()
+                .map(write -> new FrontierCandidate<>(write,
+                        ar(write.getTxn(), observation.getTxn())))
+                .collect(Collectors.toList());
+
+        // The latest candidate is selected from a strict total order.  Create
+        // only the primitive pairwise AR literals here; materializing every
+        // candidate's compound latest-visible guard would be quadratic per
+        // predicate observation and consume most of the solver memory.
+        for (int i = 0; i < candidates.size(); i++) {
+            for (int j = i + 1; j < candidates.size(); j++) {
+                beforeWrite(candidates.get(i).write, candidates.get(j).write);
+            }
+        }
+
+        var frontier = new KeyFrontier<KeyType, ValueType>(
+                key, observation.getTxn(), candidates, recordedSource);
+
+        if (recordedSource == null) {
+            return frontier;
+        }
+
+        var source = candidateFor(frontier, recordedSource);
+        if (source == null) {
+            solver.assertTrue(Lit.False);
+            return frontier;
+        }
+        assertLatestVisible(frontier, source);
+        return frontier;
+    }
+
+    /**
+     * Validates all predicate reads against the current SAT model and adds one
+     * direct no-good clause for every mismatching visible snapshot.
+     */
+    private boolean refinePredicateConstraints() {
+        var refined = false;
+        for (var check : predicateChecks) {
+            var snapshot = new LinkedHashMap<>(check.fixedSnapshot);
+            var selected = new ArrayList<FrontierCandidate<KeyType, ValueType>>(
+                    check.frontiers.size());
+
+            for (var frontier : check.frontiers) {
+                var selectedCandidate = selectedCandidate(frontier);
+                selected.add(selectedCandidate);
+                if (selectedCandidate == null) {
+                    snapshot.remove(frontier.key);
+                } else {
+                    snapshot.put(frontier.key,
+                            selectedCandidate.write.getEvent().getValue());
+                }
+            }
+
+            if (predicateSnapshotMatches(check.predicateRead, snapshot,
+                    check.relationResolver)) {
+                continue;
+            }
+
+            var blockingClause = new ArrayList<Lit>();
+            for (int i = 0; i < check.frontiers.size(); i++) {
+                appendNegatedSelection(check.frontiers.get(i), selected.get(i),
+                        blockingClause);
+            }
+            if (blockingClause.isEmpty()) {
+                solver.addClause(Lit.False);
+            } else {
+                solver.addClause(blockingClause);
+            }
+            refined = true;
+        }
+        return refined;
+    }
+
+    private FrontierCandidate<KeyType, ValueType> selectedCandidate(
+            KeyFrontier<KeyType, ValueType> frontier) {
+        if (frontier.fixedWrite != null) {
+            return candidateFor(frontier, frontier.fixedWrite);
+        }
+
+        FrontierCandidate<KeyType, ValueType> selected = null;
+        for (var candidate : frontier.candidates) {
+            if (!modelValue(candidate.visible)) {
+                continue;
+            }
+            if (selected == null || modelValue(
+                    beforeWrite(selected.write, candidate.write))) {
+                selected = candidate;
+            }
+        }
+        return selected;
+    }
+
+    private FrontierCandidate<KeyType, ValueType> candidateFor(
+            KeyFrontier<KeyType, ValueType> frontier,
+            KnownGraph.WriteRef<KeyType, ValueType> write) {
+        for (var candidate : frontier.candidates) {
+            if (candidate.write == write) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    /** Forces one recorded source to be the latest visible write for its key. */
+    private void assertLatestVisible(KeyFrontier<KeyType, ValueType> frontier,
+            FrontierCandidate<KeyType, ValueType> source) {
+        if (!source.write.getTxn().equals(frontier.reader)) {
+            var edge = new SEREdge<KeyType, ValueType>(
+                    source.write.getTxn(), frontier.reader, EdgeType.PR_WR, frontier.key);
+            addKnownPredicateEdge(edge);
+            addDependencyEdge(edge, Lit.True);
+        } else {
+            solver.assertTrue(source.visible);
+        }
+        for (var other : frontier.candidates) {
+            if (other == source) {
+                continue;
+            }
+            addDependencyEdge(
+                    new SEREdge<>(frontier.reader, other.write.getTxn(),
+                            EdgeType.PR_RW, frontier.key),
+                    beforeWrite(source.write, other.write));
+        }
+    }
+
+    /**
+     * Appends the CNF disjunction for the negation of one selected frontier.
+     * Fixed recorded frontiers are already globally asserted and can be omitted.
+     */
+    private void appendNegatedSelection(
+            KeyFrontier<KeyType, ValueType> frontier,
+            FrontierCandidate<KeyType, ValueType> selected,
+            List<Lit> blockingClause) {
+        if (frontier.fixedWrite != null) {
             return;
         }
-        guards.merge(txn, guard, SERSolverAR::or);
-    }
-
-    /**
-     * For one predicate observation and key, computes whether each write can be
-     * visible to the predicate read under the current AR assignment.
-     */
-    private List<Lit> createVisibleWriterLits(KnownGraph.PredicateObservation<KeyType, ValueType> observation,
-                                              KeyType key,
-                                              List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
-                                              Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
-        var resultSource = resultSourcesByKey.get(key);
-        var result = new ArrayList<Lit>(writes.size());
-        int predicateIndex = observation.getEventIndex();
-        if (resultSource != null) {
-            if (resultSource.getTxn().equals(observation.getTxn())) {
-                solver.assertTrue(resultSource.getIndex() < predicateIndex ? Lit.True : Lit.False);
-            } else {
-                solver.assertTrue(ar(resultSource.getTxn(), observation.getTxn()));
-            }
-        }
-        for (var write : writes) {
-            if (resultSource != null) {
-                solver.assertTrue(Logic.implies(
-                        beforeWrite(resultSource, write),
-                        Logic.not(visibleToPredicateRead(write, observation))));
-                result.add(beforeOrEqualWrite(write, resultSource));
-                continue;
-            }
-            if (write.getTxn().equals(observation.getTxn())) {
-                result.add(write.getIndex() < predicateIndex ? Lit.True : Lit.False);
-                continue;
-            }
-            result.add(ar(write.getTxn(), observation.getTxn()));
-        }
-        return result;
-    }
-
-    private Lit visibleToPredicateRead(KnownGraph.WriteRef<KeyType, ValueType> write,
-                                       KnownGraph.PredicateObservation<KeyType, ValueType> observation) {
-        if (write.getTxn().equals(observation.getTxn())) {
-            return write.getIndex() < observation.getEventIndex() ? Lit.True : Lit.False;
-        }
-        return ar(write.getTxn(), observation.getTxn());
-    }
-
-    /**
-     * The selected latest visible write must agree with the observed
-     * PredicateResult presence for this key.
-     */
-    private void assertObservationFrontierMatchesResult(
-            boolean keyInResult,
-            List<Lit> observationFrontier,
-            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
-            Event<KeyType, ValueType> predicateRead) {
-        for (int i = 0; i < writes.size(); i++) {
-            if (writeRowIsInPredicateResult(writes.get(i), predicateRead) != keyInResult) {
-                solver.assertTrue(Logic.not(observationFrontier.get(i)));
-            }
-        }
-    }
-
-    private List<Lit> fixedObservationFrontier(
-            KnownGraph.WriteRef<KeyType, ValueType> resultSource,
-            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
-            Event<KeyType, ValueType> predicateRead) {
-        var result = new ArrayList<Lit>(writes.size());
-        for (var write : writes) {
-            result.add(write == resultSource ? Lit.True : Lit.False);
-        }
-        if (resultSource != null && !writeRowIsInPredicateResult(resultSource, predicateRead)) {
-            solver.assertTrue(Lit.False);
-        }
-        return result;
-    }
-
-    /**
-     * Selects the latest visible write for the observed key. At most one write
-     * can be on this frontier because AR is a total order; the caller requires
-     * one frontier write for every external covered key.
-     */
-    private List<Lit> createObservationFrontierLits(
-            List<Lit> visibleWriters,
-            List<KnownGraph.WriteRef<KeyType, ValueType>> writes) {
-        var result = new ArrayList<Lit>(writes.size());
-        for (int i = 0; i < writes.size(); i++) {
-            var noLaterVisibleWriterTerms = new ArrayList<Lit>();
-            for (int j = 0; j < writes.size(); j++) {
-                if (i == j) {
-                    continue;
+        if (selected == null) {
+            // ABSENT means every candidate writer is after the reader.
+            for (var candidate : frontier.candidates) {
+                if (!candidate.visible.isConstFalse()) {
+                    blockingClause.add(candidate.visible);
                 }
-                noLaterVisibleWriterTerms.add(Logic.not(and(
-                        visibleWriters.get(j),
-                        beforeWrite(writes.get(i), writes.get(j)))));
             }
-            result.add(and(visibleWriters.get(i), and(noLaterVisibleWriterTerms)));
+            return;
         }
-        for (int i = 0; i < writes.size(); i++) {
-            for (int j = i + 1; j < writes.size(); j++) {
-                solver.assertTrue(Logic.not(and(result.get(i), result.get(j))));
+
+        blockingClause.add(Logic.not(selected.visible));
+        for (var other : frontier.candidates) {
+            if (other == selected) {
+                continue;
+            }
+            var laterVisible = and(other.visible,
+                    beforeWrite(selected.write, other.write));
+            if (laterVisible != Lit.False && !laterVisible.isConstFalse()) {
+                blockingClause.add(laterVisible);
             }
         }
-        return result;
     }
 
-    /** Compares two writes in the local write order, allowing equality. */
-    private Lit beforeOrEqualWrite(KnownGraph.WriteRef<KeyType, ValueType> left,
-                                   KnownGraph.WriteRef<KeyType, ValueType> right) {
-        if (left == right) {
-            return Lit.True;
+    private static boolean modelValue(Lit literal) {
+        if (literal.isConstTrue()) {
+            return true;
         }
-        return beforeWrite(left, right);
+        if (literal.isConstFalse()) {
+            return false;
+        }
+        return literal.value();
+    }
+
+    private boolean predicateSnapshotMatches(
+            Event<KeyType, ValueType> predicateRead,
+            Map<KeyType, ValueType> snapshot,
+            RelationResolver<KeyType> relationResolver) {
+        final QueryEvaluation<KeyType, ValueType> evaluation;
+        try {
+            evaluation = predicateRead.getPredicate().evaluate(
+                    new MapVisibleState<>(snapshot, relationResolver));
+        } catch (QueryException exception) {
+            return false;
+        }
+
+        var recorded = predicateRead.getRecordedPredicateResult();
+        if (recorded != null) {
+            return evaluation.canonicalEquals(recorded);
+        }
+        var expectedInputs = new LinkedHashMap<KeyType, ValueType>();
+        for (var result : predicateRead.getPredResults()) {
+            if (expectedInputs.putIfAbsent(result.getKey(), result.getValue()) != null) {
+                return false;
+            }
+        }
+        return evaluation.inputs().equals(expectedInputs);
+    }
+
+    private RelationResolver<KeyType> relationResolverFor(
+            Event<KeyType, ValueType> predicateRead) {
+        var relations = predicateRead.getPredicate().scope().relations();
+        return key -> {
+            var canonical = String.valueOf(key);
+            var separator = canonical.indexOf(':');
+            if (separator > 0) {
+                return canonical.substring(0, separator);
+            }
+            if (relations.size() == 1) {
+                return relations.iterator().next();
+            }
+            return "__legacy__";
+        };
+    }
+
+    private static final class KeyFrontier<KeyType, ValueType> {
+        private final KeyType key;
+        private final Transaction<KeyType, ValueType> reader;
+        private final List<FrontierCandidate<KeyType, ValueType>> candidates;
+        private final KnownGraph.WriteRef<KeyType, ValueType> fixedWrite;
+
+        private KeyFrontier(KeyType key,
+                Transaction<KeyType, ValueType> reader,
+                List<FrontierCandidate<KeyType, ValueType>> candidates,
+                KnownGraph.WriteRef<KeyType, ValueType> fixedWrite) {
+            this.key = key;
+            this.reader = reader;
+            this.candidates = candidates;
+            this.fixedWrite = fixedWrite;
+        }
+    }
+
+    private static final class FrontierCandidate<KeyType, ValueType> {
+        private final KnownGraph.WriteRef<KeyType, ValueType> write;
+        private final Lit visible;
+
+        private FrontierCandidate(KnownGraph.WriteRef<KeyType, ValueType> write, Lit visible) {
+            this.write = write;
+            this.visible = visible;
+        }
+    }
+
+    private static final class PredicateCheck<KeyType, ValueType> {
+        private final Event<KeyType, ValueType> predicateRead;
+        private final List<KeyFrontier<KeyType, ValueType>> frontiers;
+        private final Map<KeyType, ValueType> fixedSnapshot;
+        private final RelationResolver<KeyType> relationResolver;
+
+        private PredicateCheck(Event<KeyType, ValueType> predicateRead,
+                List<KeyFrontier<KeyType, ValueType>> frontiers,
+                Map<KeyType, ValueType> fixedSnapshot,
+                RelationResolver<KeyType> relationResolver) {
+            this.predicateRead = predicateRead;
+            this.frontiers = List.copyOf(frontiers);
+            this.fixedSnapshot = Collections.unmodifiableMap(
+                    new LinkedHashMap<>(fixedSnapshot));
+            this.relationResolver = relationResolver;
+        }
+    }
+
+    private static final class GuardedDependencyEdge<KeyType, ValueType> {
+        private final SEREdge<KeyType, ValueType> edge;
+        private final Lit guard;
+
+        private GuardedDependencyEdge(SEREdge<KeyType, ValueType> edge, Lit guard) {
+            this.edge = edge;
+            this.guard = guard;
+        }
     }
 
     /**
@@ -399,38 +630,6 @@ class SERSolverAR<KeyType, ValueType> {
             return left.getIndex() < right.getIndex() ? Lit.True : Lit.False;
         }
         return ar(left.getTxn(), right.getTxn());
-    }
-
-    /** Returns true when this write's row appears in the predicate result set. */
-    private boolean writeRowIsInPredicateResult(KnownGraph.WriteRef<KeyType, ValueType> write,
-                                                Event<KeyType, ValueType> predicateRead) {
-        return predicateRead.getPredicate().test(write.getEvent().getKey(), write.getEvent().getValue());
-    }
-
-    /**
-     * Compare the PredicateResult set before and after a write to this key.
-     * Source write identity is deliberately ignored: PR_* is triggered only by
-     * a row entering the result, leaving the result, or changing its key/value.
-     */
-    private boolean samePredicateResultSetAfterWrite(KnownGraph.WriteRef<KeyType, ValueType> left,
-                                                     KnownGraph.WriteRef<KeyType, ValueType> right,
-                                                     Event<KeyType, ValueType> predicateRead) {
-        boolean leftInResult = writeRowIsInPredicateResult(left, predicateRead);
-        boolean rightInResult = writeRowIsInPredicateResult(right, predicateRead);
-        if (!leftInResult && !rightInResult) {
-            return true;
-        }
-        if (leftInResult != rightInResult) {
-            return false;
-        }
-        return Objects.equals(left.getEvent().getKey(), right.getEvent().getKey())
-                && Objects.equals(left.getEvent().getValue(), right.getEvent().getValue());
-    }
-
-    private boolean writeChangesPredicateResultSet(KnownGraph.WriteRef<KeyType, ValueType> after,
-                                                   KnownGraph.WriteRef<KeyType, ValueType> before,
-                                                   Event<KeyType, ValueType> predicateRead) {
-        return !samePredicateResultSetAfterWrite(after, before, predicateRead);
     }
 
     private static Lit and(Lit left, Lit right) {

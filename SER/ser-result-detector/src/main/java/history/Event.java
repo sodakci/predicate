@@ -1,5 +1,7 @@
 package history;
 
+import history.query.PredicateEvaluator;
+import history.query.RecordedQueryResult;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -13,23 +15,6 @@ import lombok.ToString;
 public class Event<KeyType, ValueType> {
 	public enum EventType {
     	READ, WRITE, PREDICATE_READ
-    }
-
-    public interface PredEval<KeyType, ValueType> {
-        boolean test(KeyType key, ValueType value);
-
-        default boolean covers(KeyType key) {
-            return true;
-        }
-
-        /**
-         * Stable identity used to match repeated reads of the same logical
-         * predicate inside one transaction. Programmatic callers can reuse the
-         * same evaluator instance or override this method with a value identity.
-         */
-        default Object identity() {
-            return this;
-        }
     }
 
     @Data
@@ -67,10 +52,13 @@ public class Event<KeyType, ValueType> {
 	private final ValueType value;
 
     // For PREDICATE_READ only.
-    private final PredEval<KeyType, ValueType> predicate;
+    private final PredicateEvaluator<KeyType, ValueType> predicate;
 
     // For PREDICATE_READ only.
     private final Collection<PredResult<KeyType, ValueType>> predResults;
+
+    // For PREDICATE_READ only.
+    private final RecordedQueryResult<KeyType, ValueType> recordedPredicateResult;
 
     // For WRITE only. New PRHIST traces use this as the primary version id.
     private final Long writeId;
@@ -81,22 +69,28 @@ public class Event<KeyType, ValueType> {
     private final Integer sourceOpIndex;
 
     public Event(Transaction<KeyType, ValueType> transaction, Event.EventType type, KeyType key, ValueType value) {
-        this(transaction, type, key, value, null, Collections.emptyList(), null, null, null, null);
+        this(transaction, type, key, value, null, Collections.emptyList(), null,
+                null, null, null, null);
     }
 
     public Event(Transaction<KeyType, ValueType> transaction, Event.EventType type, KeyType key, ValueType value,
             Long writeId, Long sourceWriteId, Long sourceTxnId, Integer sourceOpIndex) {
-        this(transaction, type, key, value, null, Collections.emptyList(), writeId, sourceWriteId, sourceTxnId,
-                sourceOpIndex);
+        this(transaction, type, key, value, null, Collections.emptyList(), null,
+                writeId, sourceWriteId, sourceTxnId, sourceOpIndex);
+    }
+
+    public Event(Transaction<KeyType, ValueType> transaction, Event.EventType type,
+            KeyType key, ValueType value, PredicateEvaluator<KeyType, ValueType> predicate,
+            Collection<PredResult<KeyType, ValueType>> predResults,
+            RecordedQueryResult<KeyType, ValueType> recordedPredicateResult) {
+        this(transaction, type, key, value, predicate, predResults,
+                recordedPredicateResult, null, null, null, null);
     }
 
     public Event(Transaction<KeyType, ValueType> transaction, Event.EventType type, KeyType key, ValueType value,
-            PredEval<KeyType, ValueType> predicate, Collection<PredResult<KeyType, ValueType>> predResults) {
-        this(transaction, type, key, value, predicate, predResults, null, null, null, null);
-    }
-
-    public Event(Transaction<KeyType, ValueType> transaction, Event.EventType type, KeyType key, ValueType value,
-            PredEval<KeyType, ValueType> predicate, Collection<PredResult<KeyType, ValueType>> predResults,
+            PredicateEvaluator<KeyType, ValueType> predicate,
+            Collection<PredResult<KeyType, ValueType>> predResults,
+            RecordedQueryResult<KeyType, ValueType> recordedPredicateResult,
             Long writeId, Long sourceWriteId, Long sourceTxnId, Integer sourceOpIndex) {
         this.transaction = transaction;
         this.type = type;
@@ -104,6 +98,7 @@ public class Event<KeyType, ValueType> {
         this.value = value;
         this.predicate = predicate;
         this.predResults = predResults == null ? Collections.emptyList() : new ArrayList<>(predResults);
+        this.recordedPredicateResult = recordedPredicateResult;
         this.writeId = writeId;
         this.sourceWriteId = sourceWriteId;
         this.sourceTxnId = sourceTxnId;

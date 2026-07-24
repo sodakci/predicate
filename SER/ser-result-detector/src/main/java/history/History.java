@@ -11,6 +11,8 @@ import java.util.stream.Collectors;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.commons.lang3.tuple.Triple;
 
+import history.query.RecordedQueryResult;
+import history.query.PredicateEvaluator;
 import lombok.NoArgsConstructor;
 
 @NoArgsConstructor
@@ -140,14 +142,21 @@ public class History<KeyType, ValueType> {
 	}
 
     public Event<KeyType, ValueType> addPredicateReadEvent(Transaction<KeyType, ValueType> transaction,
-            Event.PredEval<KeyType, ValueType> predicate,
+            PredicateEvaluator<KeyType, ValueType> predicate,
             Collection<Event.PredResult<KeyType, ValueType>> predResults) {
+        return addPredicateReadEvent(transaction, predicate, predResults, null);
+    }
+
+    public Event<KeyType, ValueType> addPredicateReadEvent(Transaction<KeyType, ValueType> transaction,
+            PredicateEvaluator<KeyType, ValueType> predicate,
+            Collection<Event.PredResult<KeyType, ValueType>> predResults,
+            RecordedQueryResult<KeyType, ValueType> recordedPredicateResult) {
         if (!transactions.containsKey(transaction.id)) {
             throw new InvalidHistoryError();
         }
 
         var ev = new Event<KeyType, ValueType>(transaction, Event.EventType.PREDICATE_READ, null, null, predicate,
-                predResults);
+                predResults, recordedPredicateResult);
         transaction.getEvents().add(ev);
         return ev;
     }

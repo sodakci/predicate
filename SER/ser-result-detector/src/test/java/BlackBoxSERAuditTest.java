@@ -554,17 +554,22 @@ class BlackBoxSERAuditTest {
     private static ObjectNode predicateResult(JsonNode op) {
         var result = MAPPER.createObjectNode();
         var inputs = MAPPER.createArrayNode();
-        if (op.has("result")) {
-            for (var input : requiredArray(op.path("result").path("inputs"), "result.inputs")) {
-                inputs.add(compactTuple(input));
-            }
-        } else {
-            for (var input : requiredArray(op.path("results"), "results")) {
-                inputs.add(compactTuple(input));
-            }
+        var values = MAPPER.createArrayNode();
+        var sourceInputs = op.has("result")
+                ? requiredArray(op.path("result").path("inputs"), "result.inputs")
+                : requiredArray(op.path("results"), "results");
+        for (var input : sourceInputs) {
+            var compactInput = compactTuple(input);
+            inputs.add(compactInput);
+            var projected = MAPPER.createObjectNode();
+            var key = compactInput.path("key").asText();
+            var separator = key.indexOf(':');
+            projected.put("k", separator < 0 ? key : key.substring(separator + 1));
+            projected.set("value", compactInput.path("value"));
+            values.add(projected);
         }
         result.set("inputs", inputs);
-        result.set("values", MAPPER.createArrayNode());
+        result.set("values", values);
         return result;
     }
 

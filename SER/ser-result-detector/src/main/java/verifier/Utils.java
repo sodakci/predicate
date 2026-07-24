@@ -4,7 +4,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -27,6 +26,9 @@ import history.Event;
 import history.History;
 import history.Transaction;
 import history.Event.EventType;
+import history.query.MapVisibleState;
+import history.query.QueryException;
+import history.query.RelationResolver;
 
 class Utils {
     @lombok.Data
@@ -74,7 +76,8 @@ class Utils {
         }
 
         for (var txn : history.getTransactions()) {
-            var previousPredicateReads = new HashMap<Object, PredicateReadState<KeyType, ValueType>>();
+            var previousPredicateReads = new HashMap<Object,
+                    PredicateReadState<KeyType, ValueType>>();
             var events = txn.getEvents();
             for (int i = 0; i < events.size(); i++) {
                 var ev = events.get(i);
@@ -82,16 +85,13 @@ class Utils {
                     continue;
                 }
                 var predicate = ev.getPredicate();
-                var predicateIdentity = predicate == null ? null : predicate.identity();
-                var previous = predicate == null
-                        ? null
-                        : previousPredicateReads.get(predicateIdentity);
-                var current = checkPredicateRead(
-                        ev, i, writesById, writesByKeyValue, txnWrites, previous);
+                var identity = predicate == null ? null : predicate.identity();
+                var current = checkPredicateRead(ev, i, writesById, writesByKeyValue,
+                        txnWrites, previousPredicateReads.get(identity));
                 if (current == null) {
                     return false;
                 }
-                previousPredicateReads.put(predicateIdentity, current);
+                previousPredicateReads.put(identity, current);
             }
         }
         return true;
@@ -176,8 +176,8 @@ class Utils {
                         ref.getTransaction());
                 return null;
             }
-            if (!predicate.covers(key) || !predicate.test(key, value)) {
-                System.err.printf("%s result (%s,%s) does not satisfy predicate\n", ev, key, value);
+            if (!predicate.scope().covers(key)) {
+                System.err.printf("%s result (%s,%s) is outside query scope\n", ev, key, value);
                 return null;
             }
 
@@ -192,70 +192,82 @@ class Utils {
                     System.err.printf("%s result (%s,%s) reads from intermediate write\n", ev, key, value);
                     return null;
                 }
-            } else if (ref.getIndex() >= pos) {
-                System.err.printf("%s result (%s,%s) reads from future self write\n", ev, key, value);
-                return null;
-            }
-        }
-
-        var keysToCheck = new HashSet<KeyType>(resultByKey.keySet());
-        int previousReadIndex = previous == null ? -1 : previous.getEventIndex();
-        if (previous != null) {
-            keysToCheck.addAll(previous.getResultByKey().keySet());
-        }
-        for (var p : txnWrites.entrySet()) {
-            var txnAndKey = p.getKey();
-            if (txnAndKey.getLeft() != ev.getTransaction()) {
-                continue;
-            }
-            var key = txnAndKey.getRight();
-            var latestSelf = latestWriteBefore(p.getValue(), pos);
-            if (latestSelf <= previousReadIndex) {
-                continue;
-            }
-            keysToCheck.add(key);
-        }
-
-        for (var key : keysToCheck) {
-            if (!predicate.covers(key)) {
-                continue;
-            }
-            var selfWrites = txnWrites.getOrDefault(Pair.of(ev.getTransaction(), key), new ArrayList<>());
-            var latestSelf = latestWriteBefore(selfWrites, pos);
-            if (latestSelf > previousReadIndex) {
-                var selfValue = ev.getTransaction().getEvents().get(latestSelf).getValue();
-                var inResult = resultByKey.containsKey(key);
-                var predTrue = predicate.test(key, selfValue);
-                if (predTrue && !inResult) {
-                    System.err.printf("%s misses own visible tuple (%s,%s)\n", ev, key, selfValue);
+                var selfWrites = txnWrites.get(Pair.of(ev.getTransaction(), key));
+                if (latestWriteBefore(selfWrites, pos) >= 0) {
+                    System.err.printf("%s result (%s,%s) ignores an earlier self write\n", ev, key, value);
                     return null;
                 }
-                if (!predTrue && inResult) {
-                    System.err.printf("%s should not include key %s because own latest write fails predicate\n", ev, key);
+            } else {
+                var selfWrites = txnWrites.get(Pair.of(ev.getTransaction(), key));
+                var latestSelf = latestWriteBefore(selfWrites, pos);
+                if (ref.getIndex() >= pos || latestSelf != ref.getIndex()) {
+                    System.err.printf("%s result (%s,%s) does not use its latest earlier self write\n",
+                            ev, key, value);
                     return null;
                 }
-                if (predTrue && inResult && !Objects.equals(resultByKey.get(key), selfValue)) {
-                    System.err.printf("%s returns wrong own value for key %s\n", ev, key);
-                    return null;
-                }
-                continue;
-            }
-
-            if (previous == null) {
-                continue;
-            }
-            var previousResults = previous.getResultByKey();
-            var previousInResult = previousResults.containsKey(key);
-            var currentInResult = resultByKey.containsKey(key);
-            if (previousInResult != currentInResult
-                    || previousInResult
-                    && !Objects.equals(previousResults.get(key), resultByKey.get(key))) {
-                System.err.printf("%s does not inherit previous predicate result for key %s\n", ev, key);
-                return null;
             }
         }
 
+        var recorded = ev.getRecordedPredicateResult();
+        if (recorded != null && !recorded.inputs().equals(resultByKey)) {
+            System.err.printf("%s result.inputs disagree with resolved predicate inputs\n", ev);
+            return null;
+        }
+
+        var candidateState = previous == null
+                ? new HashMap<KeyType, ValueType>()
+                : new HashMap<>(previous.getResultByKey());
+        candidateState.putAll(resultByKey);
+        int previousIndex = previous == null ? -1 : previous.getEventIndex();
+        for (var entry : txnWrites.entrySet()) {
+            if (entry.getKey().getLeft() != ev.getTransaction()) {
+                continue;
+            }
+            var candidateKey = entry.getKey().getRight();
+            if (!predicate.scope().covers(candidateKey)) {
+                continue;
+            }
+            var latestSelf = latestWriteBefore(entry.getValue(), pos);
+            if (latestSelf > previousIndex) {
+                candidateState.put(candidateKey,
+                        ev.getTransaction().getEvents().get(latestSelf).getValue());
+            }
+        }
+
+        if (!predicateEvaluationMatches(ev, candidateState, resultByKey)) {
+            System.err.printf("%s recorded result disagrees with its known transaction-local snapshot\n", ev);
+            return null;
+        }
         return new PredicateReadState<>(pos, new HashMap<>(resultByKey));
+    }
+
+    private static <KeyType, ValueType> boolean predicateEvaluationMatches(
+            Event<KeyType, ValueType> event,
+            Map<KeyType, ValueType> candidateState,
+            Map<KeyType, ValueType> expectedInputs) {
+        var predicate = event.getPredicate();
+        var relations = predicate.scope().relations();
+        RelationResolver<KeyType> resolver = key -> {
+            var canonical = String.valueOf(key);
+            var separator = canonical.indexOf(':');
+            if (separator > 0) {
+                return canonical.substring(0, separator);
+            }
+            if (relations.size() == 1) {
+                return relations.iterator().next();
+            }
+            return "__legacy__";
+        };
+
+        try {
+            var evaluation = predicate.evaluate(new MapVisibleState<>(candidateState, resolver));
+            var recorded = event.getRecordedPredicateResult();
+            return recorded == null
+                    ? evaluation.inputs().equals(expectedInputs)
+                    : evaluation.canonicalEquals(recorded);
+        } catch (QueryException exception) {
+            return false;
+        }
     }
 
     private static <KeyType, ValueType> WriteRef<KeyType, ValueType> resolveReadSource(

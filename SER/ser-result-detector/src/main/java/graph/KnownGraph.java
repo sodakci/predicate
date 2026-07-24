@@ -136,7 +136,7 @@ public class KnownGraph<KeyType, ValueType> {
         });
 
         // Build the finite key universe represented by the history. Each
-        // predicate narrows this universe through PredEval.covers(key).
+        // Each evaluator narrows this universe through its query scope.
         var predicateKeyUniverse = new HashSet<KeyType>();
         for (var write : allWrites) {
             predicateKeyUniverse.add(write.getEvent().getKey());
@@ -167,7 +167,7 @@ public class KnownGraph<KeyType, ValueType> {
                 var predicateReadTypes = new HashMap<KeyType, PredicateReadType>();
                 var predicate = ev.getPredicate();
                 for (var key : predicateKeyUniverse) {
-                    if (predicate != null && !predicate.covers(key)) {
+                    if (predicate != null && !predicate.scope().covers(key)) {
                         continue;
                     }
                     var type = predicateObservedKeys.contains(key) || writtenKeys.contains(key)

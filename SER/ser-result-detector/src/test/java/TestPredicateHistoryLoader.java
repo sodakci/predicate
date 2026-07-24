@@ -12,6 +12,7 @@ import history.History;
 import history.InvalidHistoryError;
 import history.Transaction;
 import history.loaders.PredicateHistoryLoader;
+import verifier.PredicateFixtures;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -50,23 +51,23 @@ public class TestPredicateHistoryLoader {
         var value5 = new PredicateHistoryLoader.PredicateValue(5L);
 
         var equalsPredicate = history.getTransaction(0).getEvents().get(0).getPredicate();
-        assertTrue(equalsPredicate.test("kv:0", value0));
-        assertFalse(equalsPredicate.test("kv:1", value1));
+        assertTrue(PredicateFixtures.matches(equalsPredicate, "kv:0", value0));
+        assertFalse(PredicateFixtures.matches(equalsPredicate, "kv:1", value1));
 
         var truePredicate = history.getTransaction(1).getEvents().get(0).getPredicate();
-        assertTrue(truePredicate.test("kv:0", value0));
+        assertTrue(PredicateFixtures.matches(truePredicate, "kv:0", value0));
 
         var modPredicate = history.getTransaction(2).getEvents().get(0).getPredicate();
-        assertTrue(modPredicate.test("kv:1", value2));
-        assertFalse(modPredicate.test("kv:0", value5));
+        assertTrue(PredicateFixtures.matches(modPredicate, "kv:1", value2));
+        assertFalse(PredicateFixtures.matches(modPredicate, "kv:0", value5));
 
         var gtPredicate = history.getTransaction(3).getEvents().get(1).getPredicate();
-        assertTrue(gtPredicate.test("kv:0", value5));
-        assertFalse(gtPredicate.test("kv:1", value2));
+        assertTrue(PredicateFixtures.matches(gtPredicate, "kv:0", value5));
+        assertFalse(PredicateFixtures.matches(gtPredicate, "kv:1", value2));
 
         var ltPredicate = history.getTransaction(4).getEvents().get(0).getPredicate();
-        assertTrue(ltPredicate.test("kv:0", value0));
-        assertFalse(ltPredicate.test("kv:1", value1));
+        assertTrue(PredicateFixtures.matches(ltPredicate, "kv:0", value0));
+        assertFalse(PredicateFixtures.matches(ltPredicate, "kv:1", value1));
 
         var graph = new KnownGraph<>(history);
         assertEquals(5, graph.getPredicateObservations().size());
@@ -221,8 +222,8 @@ public class TestPredicateHistoryLoader {
                 + "\"result\":{\"inputs\":" + inputsJson + ",\"values\":[]}}";
     }
 
-    private static Event.PredEval<String, Integer> scopedPredicate(String coveredKey) {
-        return new Event.PredEval<>() {
+    private static PredicateFixtures.RowPredicate<String, Integer> scopedPredicate(String coveredKey) {
+        return new PredicateFixtures.RowPredicate<>() {
             @Override
             public boolean test(String key, Integer value) {
                 return coveredKey.equals(key);
