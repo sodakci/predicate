@@ -9,6 +9,7 @@ import history.Transaction;
 import history.query.MapVisibleState;
 import history.query.QueryEvaluation;
 import history.query.QueryException;
+import history.query.QueryPlan;
 import history.query.RelationResolver;
 import monosat.Graph;
 import monosat.Lit;
@@ -38,6 +39,7 @@ class SERSolverAR<KeyType, ValueType> {
 
     private final List<Transaction<KeyType, ValueType>> txns;
     private final Map<Transaction<KeyType, ValueType>, Integer> txnIndex;
+    private final KnownOrder knownOrder;
     // AR is encoded as SAT-selected direct precedence edges in an acyclic graph.
     // We only create literals for transaction pairs that actually appear in the
     // formula; any acyclic partial order has a total extension.
@@ -53,11 +55,16 @@ class SERSolverAR<KeyType, ValueType> {
     // Predicate constraints are refined lazily from concrete SAT models.  This
     // avoids eagerly enumerating the Cartesian product of every key frontier.
     private final List<PredicateCheck<KeyType, ValueType>> predicateChecks = new ArrayList<>();
+    // Writer comparability is key-local and independent of the predicate read.
+    // Initialize each key's writer pairs once, then reuse them across reads.
+    private final Set<KeyType> initializedPredicateWriteOrders = new HashSet<>();
     // Dependency edges are created with their type/key metadata before their
     // guards are encoded into AR. This keeps edge construction separate from
     // constraint encoding and preserves RW/PR_RW as B-side dependencies.
-    private final List<GuardedDependencyEdge<KeyType, ValueType>> dependencyEdgesA = new ArrayList<>();
-    private final List<GuardedDependencyEdge<KeyType, ValueType>> dependencyEdgesB = new ArrayList<>();
+    private final List<GuardedDependencyEdge> dependencyEdgesA = new ArrayList<>();
+    private final List<GuardedDependencyEdge> dependencyEdgesB = new ArrayList<>();
+    private final Map<Lit, Set<SEREdge<KeyType, ValueType>>> dependencyEdgesByGuard =
+            new IdentityHashMap<>();
     private Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>> conflictEdges =
             Collections.emptyList();
     private Collection<SERConstraint<KeyType, ValueType>> conflictConstraints = Collections.emptyList();
@@ -83,6 +90,7 @@ class SERSolverAR<KeyType, ValueType> {
         for (int i = 0; i < txns.size(); i++) {
             txnIndex.put(txns.get(i), i);
         }
+        this.knownOrder = buildKnownOrder();
         this.arGraph = new Graph(solver);
         this.arNodes = createArNodes();
         this.writesByKey = buildWritesByKey(graph);
@@ -149,21 +157,120 @@ class SERSolverAR<KeyType, ValueType> {
     }
 
     /**
-     * Existing precedence edges are mandatory AR edges.  The graph keeps two
-     * known-edge partitions, but both must be respected by the same order.
+     * Existing precedence edges are mandatory AR edges. Only a transitive
+     * reduction is needed in the solver because it has exactly the same
+     * reachability relation as the full known graph.
      */
     private void encodeKnownEdges() {
-        encodeKnownGraphRespectAr(graph.getKnownGraphA());
-        encodeKnownGraphRespectAr(graph.getKnownGraphB());
+        if (knownOrder.cyclic) {
+            solver.assertTrue(Lit.False);
+            return;
+        }
+        for (var edge : knownOrder.reductionEdges) {
+            solver.assertTrue(directArEdge(txns.get(edge[0]), txns.get(edge[1])));
+        }
     }
 
-    private void encodeKnownGraphRespectAr(com.google.common.graph.ValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> known) {
-        for (var ep : known.edges()) {
-            var edges = known.edgeValue(ep).orElse(Collections.emptyList());
-            if (edges.stream().anyMatch(edge -> isEncodedKnownEdge(edge.getType()))) {
-                solver.assertTrue(ar(ep.source(), ep.target()));
+    private KnownOrder buildKnownOrder() {
+        var adjacency = new BitSet[txns.size()];
+        for (int i = 0; i < adjacency.length; i++) {
+            adjacency[i] = new BitSet(adjacency.length);
+        }
+
+        boolean invalid = addKnownOrderEdges(graph.getKnownGraphA(), adjacency);
+        invalid |= addKnownOrderEdges(graph.getKnownGraphB(), adjacency);
+        if (invalid) {
+            return KnownOrder.cyclic(txns.size());
+        }
+
+        var indegree = new int[txns.size()];
+        for (var successors : adjacency) {
+            for (int to = successors.nextSetBit(0); to >= 0; to = successors.nextSetBit(to + 1)) {
+                indegree[to]++;
             }
         }
+
+        var ready = new PriorityQueue<Integer>();
+        for (int i = 0; i < indegree.length; i++) {
+            if (indegree[i] == 0) {
+                ready.add(i);
+            }
+        }
+
+        var topologicalOrder = new int[txns.size()];
+        int count = 0;
+        while (!ready.isEmpty()) {
+            int from = ready.remove();
+            topologicalOrder[count++] = from;
+            for (int to = adjacency[from].nextSetBit(0); to >= 0;
+                    to = adjacency[from].nextSetBit(to + 1)) {
+                if (--indegree[to] == 0) {
+                    ready.add(to);
+                }
+            }
+        }
+        if (count != txns.size()) {
+            return KnownOrder.cyclic(txns.size());
+        }
+
+        var reachable = new BitSet[txns.size()];
+        for (int i = 0; i < reachable.length; i++) {
+            reachable[i] = new BitSet(reachable.length);
+        }
+        for (int pos = topologicalOrder.length - 1; pos >= 0; pos--) {
+            int from = topologicalOrder[pos];
+            for (int to = adjacency[from].nextSetBit(0); to >= 0;
+                    to = adjacency[from].nextSetBit(to + 1)) {
+                reachable[from].set(to);
+                reachable[from].or(reachable[to]);
+            }
+        }
+
+        var topologicalPosition = new int[txns.size()];
+        for (int pos = 0; pos < topologicalOrder.length; pos++) {
+            topologicalPosition[topologicalOrder[pos]] = pos;
+        }
+
+        var reductionEdges = new ArrayList<int[]>();
+        for (int from = 0; from < adjacency.length; from++) {
+            var covered = new BitSet(adjacency.length);
+            for (int pos = topologicalPosition[from] + 1; pos < topologicalOrder.length; pos++) {
+                int to = topologicalOrder[pos];
+                if (!adjacency[from].get(to) || covered.get(to)) {
+                    continue;
+                }
+                reductionEdges.add(new int[] { from, to });
+                covered.set(to);
+                covered.or(reachable[to]);
+            }
+        }
+
+        return new KnownOrder(reachable, reductionEdges, false);
+    }
+
+    private boolean addKnownOrderEdges(
+            com.google.common.graph.ValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> known,
+            BitSet[] adjacency) {
+        boolean invalid = false;
+        for (var ep : known.edges()) {
+            var edges = known.edgeValue(ep).orElse(Collections.emptyList());
+            if (edges.stream().noneMatch(edge -> isEncodedKnownEdge(edge.getType()))) {
+                continue;
+            }
+
+            boolean fromBottom = isBottomTxn(ep.source());
+            boolean toBottom = isBottomTxn(ep.target());
+            if (fromBottom) {
+                invalid |= toBottom;
+                continue;
+            }
+            if (toBottom || ep.source().equals(ep.target())) {
+                invalid = true;
+                continue;
+            }
+            adjacency[txnIndex.get(ep.source())].set(txnIndex.get(ep.target()));
+        }
+        return invalid;
     }
 
     /**
@@ -174,7 +281,6 @@ class SERSolverAR<KeyType, ValueType> {
         for (var c : constraints) {
             var forward = ar(c.getWriteTransaction1(), c.getWriteTransaction2());
             var backward = ar(c.getWriteTransaction2(), c.getWriteTransaction1());
-            solver.assertTrue(Logic.xor(forward, backward));
 
             for (var edge : c.getEdges1()) {
                 addDependencyEdge(edge, forward);
@@ -211,7 +317,26 @@ class SERSolverAR<KeyType, ValueType> {
     }
 
     private void addDependencyEdge(SEREdge<KeyType, ValueType> edge, Lit guard) {
-        var guarded = new GuardedDependencyEdge<>(edge, guard);
+        /*
+         * A false guard is already a tautology. Checking it before resolving
+         * the target AR edge avoids creating unused graph variables for the
+         * many RW alternatives ruled out by pruning.
+         */
+        if (guard == Lit.False) {
+            return;
+        }
+        if (!dependencyEdgesByGuard
+                .computeIfAbsent(guard, ignored -> new HashSet<>())
+                .add(edge)) {
+            return;
+        }
+
+        var target = ar(edge.getFrom(), edge.getTo());
+        if (target == Lit.True || guard == target) {
+            return;
+        }
+
+        var guarded = new GuardedDependencyEdge(guard, target);
         switch (edge.getType()) {
         case SO:
         case WR:
@@ -233,12 +358,17 @@ class SERSolverAR<KeyType, ValueType> {
         for (var guarded : dependencyEdgesB) {
             encodeDependencyEdge(guarded);
         }
+        dependencyEdgesA.clear();
+        dependencyEdgesB.clear();
+        dependencyEdgesByGuard.clear();
     }
 
-    private void encodeDependencyEdge(GuardedDependencyEdge<KeyType, ValueType> guarded) {
-        var edge = guarded.edge;
-        solver.assertTrue(Logic.implies(
-                guarded.guard, ar(edge.getFrom(), edge.getTo())));
+    private void encodeDependencyEdge(GuardedDependencyEdge guarded) {
+        if (guarded.guard == Lit.True) {
+            solver.assertTrue(guarded.target);
+        } else {
+            solver.assertTrue(Logic.implies(guarded.guard, guarded.target));
+        }
     }
 
     private void addKnownPredicateEdge(SEREdge<KeyType, ValueType> edge) {
@@ -279,6 +409,14 @@ class SERSolverAR<KeyType, ValueType> {
                     .filter(entry -> predicate.scope().covers(entry.getKey()))
                     .sorted(Comparator.comparing(entry -> String.valueOf(entry.getKey())))
                     .collect(Collectors.toList());
+
+            if (predicate instanceof QueryPlan
+                    && ((QueryPlan<?, ?>) predicate).isRowLocal()
+                    && encodeRowLocalPredicate(observation, scopedEntries,
+                            resultSourcesByKey)) {
+                continue;
+            }
+
             var frontierEntries = scopedEntries.stream()
                     .filter(entry -> observation.getPredicateReadType(entry.getKey())
                             == KnownGraph.PredicateReadType.EXTERNAL)
@@ -322,11 +460,212 @@ class SERSolverAR<KeyType, ValueType> {
         }
     }
 
+    /**
+     * A single scan/filter without DISTINCT is the bag union of independent
+     * single-row evaluations. Encode each key directly, avoiding a whole-table
+     * lazy snapshot with one frontier per key.
+     */
+    private boolean encodeRowLocalPredicate(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            List<Map.Entry<KeyType, List<KnownGraph.WriteRef<KeyType, ValueType>>>> scopedEntries,
+            Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
+        var predicateRead = observation.getPredicateReadEvent();
+        var relationResolver = relationResolverFor(predicateRead);
+        var expectedInputs = expectedPredicateInputs(predicateRead);
+
+        if (!expectedInputs.keySet().equals(resultSourcesByKey.keySet())
+                || !predicateSnapshotMatches(predicateRead, expectedInputs, relationResolver)) {
+            return false;
+        }
+        for (var source : resultSourcesByKey.entrySet()) {
+            if (!Objects.equals(expectedInputs.get(source.getKey()),
+                    source.getValue().getEvent().getValue())) {
+                return false;
+            }
+        }
+
+        for (var entry : scopedEntries) {
+            var key = entry.getKey();
+            var writes = entry.getValue();
+            var recordedSource = resultSourcesByKey.get(key);
+
+            if (observation.getPredicateReadType(key)
+                    == KnownGraph.PredicateReadType.INTERNAL) {
+                var latestSelf = writes.stream()
+                        .filter(write -> write.getTxn().equals(observation.getTxn())
+                                && write.getIndex() < observation.getEventIndex())
+                        .max(Comparator.comparingInt(KnownGraph.WriteRef::getIndex))
+                        .orElse(recordedSource);
+                if (recordedSource != null) {
+                    if (latestSelf != recordedSource) {
+                        solver.assertTrue(Lit.False);
+                    }
+                } else if (latestSelf != null
+                        && !hasEmptyPredicateContribution(predicateRead, relationResolver,
+                                key, latestSelf.getEvent().getValue())) {
+                    solver.assertTrue(Lit.False);
+                }
+                continue;
+            }
+
+            if (recordedSource != null) {
+                assertRecordedSourceLatest(
+                        observation, key, writes, recordedSource);
+                continue;
+            }
+
+            var badWrites = latestExternalWrites(writes, observation.getTxn()).stream()
+                    .filter(write -> !hasEmptyPredicateContribution(
+                            predicateRead, relationResolver, key,
+                            write.getEvent().getValue()))
+                    .collect(Collectors.toList());
+            if (badWrites.isEmpty()) {
+                continue;
+            }
+
+            var frontier = createKeyFrontier(
+                    observation, key, writes, null, false);
+            var badWriteSet = Collections.newSetFromMap(
+                    new IdentityHashMap<KnownGraph.WriteRef<KeyType, ValueType>, Boolean>());
+            badWriteSet.addAll(badWrites);
+            for (var badWrite : badWrites) {
+                var badCandidate = candidateFor(frontier, badWrite);
+                if (badCandidate == null) {
+                    continue;
+                }
+                var blockingClause = new ArrayList<Lit>();
+                blockingClause.add(Logic.not(badCandidate.visible));
+                for (var goodCandidate : frontier.candidates) {
+                    if (badWriteSet.contains(goodCandidate.write)) {
+                        continue;
+                    }
+                    var laterVisible = and(goodCandidate.visible,
+                            beforeWrite(badWrite, goodCandidate.write));
+                    if (laterVisible != Lit.False && !laterVisible.isConstFalse()) {
+                        blockingClause.add(laterVisible);
+                    }
+                }
+                if (blockingClause.isEmpty()) {
+                    solver.addClause(Lit.False);
+                } else {
+                    solver.assertOr(blockingClause);
+                }
+            }
+        }
+
+        for (var resultKey : resultSourcesByKey.keySet()) {
+            if (!predicateRead.getPredicate().scope().covers(resultKey)
+                    || !writesByKey.containsKey(resultKey)) {
+                solver.assertTrue(Lit.False);
+            }
+        }
+        return true;
+    }
+
+    private Map<KeyType, ValueType> expectedPredicateInputs(
+            Event<KeyType, ValueType> predicateRead) {
+        var recorded = predicateRead.getRecordedPredicateResult();
+        if (recorded != null) {
+            return recorded.inputs();
+        }
+
+        var expected = new LinkedHashMap<KeyType, ValueType>();
+        for (var result : predicateRead.getPredResults()) {
+            if (expected.putIfAbsent(result.getKey(), result.getValue()) != null) {
+                return Collections.emptyMap();
+            }
+        }
+        return expected;
+    }
+
+    private boolean hasEmptyPredicateContribution(
+            Event<KeyType, ValueType> predicateRead,
+            RelationResolver<KeyType> relationResolver,
+            KeyType key,
+            ValueType value) {
+        final QueryEvaluation<KeyType, ValueType> evaluation;
+        try {
+            evaluation = predicateRead.getPredicate().evaluate(
+                    new MapVisibleState<>(Map.of(key, value), relationResolver));
+        } catch (QueryException exception) {
+            return false;
+        }
+
+        if (predicateRead.getRecordedPredicateResult() == null) {
+            return evaluation.inputs().isEmpty();
+        }
+        return evaluation.inputs().isEmpty() && evaluation.values().isEmpty();
+    }
+
+    private List<KnownGraph.WriteRef<KeyType, ValueType>> latestExternalWrites(
+            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
+            Transaction<KeyType, ValueType> reader) {
+        var latestByWriter = new LinkedHashMap<Transaction<KeyType, ValueType>,
+                KnownGraph.WriteRef<KeyType, ValueType>>();
+        for (var write : writes) {
+            latestByWriter.put(write.getTxn(), write);
+        }
+        latestByWriter.remove(reader);
+        return new ArrayList<>(latestByWriter.values());
+    }
+
+    private void assertRecordedSourceLatest(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            KeyType key,
+            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
+            KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
+        var latestSelf = writes.stream()
+                .filter(write -> write.getTxn().equals(observation.getTxn())
+                        && write.getIndex() < observation.getEventIndex())
+                .max(Comparator.comparingInt(KnownGraph.WriteRef::getIndex))
+                .orElse(null);
+        if (latestSelf != null) {
+            if (latestSelf != recordedSource) {
+                solver.assertTrue(Lit.False);
+            }
+            return;
+        }
+
+        var candidates = latestExternalWrites(writes, observation.getTxn());
+        if (candidates.stream().noneMatch(write -> write == recordedSource)) {
+            solver.assertTrue(Lit.False);
+            return;
+        }
+        if (ar(recordedSource.getTxn(), observation.getTxn()) == Lit.False) {
+            solver.assertTrue(Lit.False);
+            return;
+        }
+
+        var sourceEdge = new SEREdge<KeyType, ValueType>(
+                recordedSource.getTxn(), observation.getTxn(),
+                EdgeType.PR_WR, key);
+        addKnownPredicateEdge(sourceEdge);
+        addDependencyEdge(sourceEdge, Lit.True);
+        for (var other : candidates) {
+            if (other == recordedSource) {
+                continue;
+            }
+            addDependencyEdge(
+                    new SEREdge<>(observation.getTxn(), other.getTxn(),
+                            EdgeType.PR_RW, key),
+                    beforeWrite(recordedSource, other));
+        }
+    }
+
     private KeyFrontier<KeyType, ValueType> createKeyFrontier(
             KnownGraph.PredicateObservation<KeyType, ValueType> observation,
             KeyType key,
             List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
             KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
+        return createKeyFrontier(observation, key, writes, recordedSource, true);
+    }
+
+    private KeyFrontier<KeyType, ValueType> createKeyFrontier(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            KeyType key,
+            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
+            KnownGraph.WriteRef<KeyType, ValueType> recordedSource,
+            boolean initializeAllWriterPairs) {
         var latestSelf = writes.stream()
                 .filter(write -> write.getTxn().equals(observation.getTxn())
                         && write.getIndex() < observation.getEventIndex())
@@ -347,25 +686,27 @@ class SERSolverAR<KeyType, ValueType> {
         var latestByWriter = new LinkedHashMap<Transaction<KeyType, ValueType>,
                 KnownGraph.WriteRef<KeyType, ValueType>>();
         for (var write : writes) {
-            if (!write.getTxn().equals(observation.getTxn())) {
-                latestByWriter.put(write.getTxn(), write);
+            latestByWriter.put(write.getTxn(), write);
+        }
+
+        // The latest candidate is selected from a strict total order. Writer
+        // comparability depends only on the key's complete writer set, so
+        // repeated predicate reads can reuse the same primitive AR literals.
+        if (initializeAllWriterPairs && initializedPredicateWriteOrders.add(key)) {
+            var comparableWrites = new ArrayList<>(latestByWriter.values());
+            for (int i = 0; i < comparableWrites.size(); i++) {
+                for (int j = i + 1; j < comparableWrites.size(); j++) {
+                    beforeWrite(comparableWrites.get(i), comparableWrites.get(j));
+                }
             }
         }
 
+        latestByWriter.remove(observation.getTxn());
         var candidates = latestByWriter.values().stream()
                 .map(write -> new FrontierCandidate<>(write,
                         ar(write.getTxn(), observation.getTxn())))
+                .filter(candidate -> candidate.visible != Lit.False)
                 .collect(Collectors.toList());
-
-        // The latest candidate is selected from a strict total order.  Create
-        // only the primitive pairwise AR literals here; materializing every
-        // candidate's compound latest-visible guard would be quadratic per
-        // predicate observation and consume most of the solver memory.
-        for (int i = 0; i < candidates.size(); i++) {
-            for (int j = i + 1; j < candidates.size(); j++) {
-                beforeWrite(candidates.get(i).write, candidates.get(j).write);
-            }
-        }
 
         var frontier = new KeyFrontier<KeyType, ValueType>(
                 key, observation.getTxn(), candidates, recordedSource);
@@ -418,7 +759,7 @@ class SERSolverAR<KeyType, ValueType> {
             if (blockingClause.isEmpty()) {
                 solver.addClause(Lit.False);
             } else {
-                solver.addClause(blockingClause);
+                solver.assertOr(blockingClause);
             }
             refined = true;
         }
@@ -607,13 +948,13 @@ class SERSolverAR<KeyType, ValueType> {
         }
     }
 
-    private static final class GuardedDependencyEdge<KeyType, ValueType> {
-        private final SEREdge<KeyType, ValueType> edge;
+    private static final class GuardedDependencyEdge {
         private final Lit guard;
+        private final Lit target;
 
-        private GuardedDependencyEdge(SEREdge<KeyType, ValueType> edge, Lit guard) {
-            this.edge = edge;
+        private GuardedDependencyEdge(Lit guard, Lit target) {
             this.guard = guard;
+            this.target = target;
         }
     }
 
@@ -738,6 +1079,17 @@ class SERSolverAR<KeyType, ValueType> {
             return Lit.False;
         }
 
+        if (!knownOrder.cyclic) {
+            int fromIndex = txnIndex.get(from);
+            int toIndex = txnIndex.get(to);
+            if (knownOrder.reachable[fromIndex].get(toIndex)) {
+                return Lit.True;
+            }
+            if (knownOrder.reachable[toIndex].get(fromIndex)) {
+                return Lit.False;
+            }
+        }
+
         ensureComparable(from, to);
         return directArEdge(from, to);
     }
@@ -765,6 +1117,26 @@ class SERSolverAR<KeyType, ValueType> {
         return txn.getId() == -1L
                 && txn.getSession() != null
                 && txn.getSession().getId() == -1L;
+    }
+
+    private static final class KnownOrder {
+        private final BitSet[] reachable;
+        private final List<int[]> reductionEdges;
+        private final boolean cyclic;
+
+        private KnownOrder(BitSet[] reachable, List<int[]> reductionEdges, boolean cyclic) {
+            this.reachable = reachable;
+            this.reductionEdges = reductionEdges;
+            this.cyclic = cyclic;
+        }
+
+        private static KnownOrder cyclic(int size) {
+            var reachable = new BitSet[size];
+            for (int i = 0; i < size; i++) {
+                reachable[i] = new BitSet(size);
+            }
+            return new KnownOrder(reachable, Collections.emptyList(), true);
+        }
     }
 
     /**

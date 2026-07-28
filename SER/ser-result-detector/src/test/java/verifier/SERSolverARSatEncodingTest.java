@@ -6,11 +6,14 @@ import graph.KnownGraph;
 import history.Event;
 import history.History;
 import history.Transaction;
+import monosat.Lit;
+import monosat.Solver;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.commons.lang3.tuple.Triple;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -79,6 +82,22 @@ class SERSolverARSatEncodingTest {
         var session = history.addSession(1L);
         history.addTransaction(session, 1L);
         return history;
+    }
+
+    @Test
+    void monoSatAssertOrAcceptsClauseLargerThanDefaultJniBuffer() {
+        try (var solver = new Solver()) {
+            var clause = new ArrayList<Lit>();
+            var allFalse = new ArrayList<Lit>();
+            for (int index = 0; index < 4097; index++) {
+                var literal = new Lit(solver);
+                clause.add(literal);
+                allFalse.add(literal.not());
+            }
+
+            solver.assertOr(clause);
+            assertFalse(solver.solve(allFalse));
+        }
     }
 
     @Test

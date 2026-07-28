@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class HistoryOnlyCatalogTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final Path HISTORIES_ROOT = Path.of("..", "PolySIHistories");
+    private static final Path HISTORIES_ROOT = Path.of("..", "..", "predicateHistories");
 
     @Test
     void historyOnlyDeepMulticycleCasesHaveCatalogManifestAndCycleDesignCoverage() throws Exception {

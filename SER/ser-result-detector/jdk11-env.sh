@@ -5,7 +5,7 @@
 #   source ./jdk11-env.sh
 #   ./gradlew compileJava
 #
-# If your distro uses a different path, set JAVA_HOME manually after sourcing, or edit the line below.
+# If your distro uses a different path, edit the line below.
 
-export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-11-openjdk-amd64}"
+export JAVA_HOME="/usr/lib/jvm/java-11-openjdk-amd64"
 export PATH="$JAVA_HOME/bin:$PATH"

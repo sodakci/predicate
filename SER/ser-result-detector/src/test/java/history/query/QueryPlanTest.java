@@ -111,6 +111,40 @@ class QueryPlanTest {
     }
 
     @Test
+    void evaluatesLargeObjectProjectionWithoutOrderingRows() {
+        var rows = new LinkedHashMap<String, JsonNode>();
+        for (int key = 0; key < 1000; key++) {
+            rows.put("kv:" + key, json(Integer.toString(key)));
+        }
+        var plan = parse("{"
+                + "\"from\":{\"relation\":\"kv\"},"
+                + "\"select\":{\"columns\":[\"k\",\"value\"],\"distinct\":false}}");
+
+        var evaluation = plan.evaluate(new MapVisibleState<>(rows, RELATIONS));
+
+        assertEquals(1000, evaluation.valueMultiset().size());
+        assertEquals(1, evaluation.valueMultiset().get(
+                value("{\"k\":\"402\",\"value\":402}")));
+    }
+
+    @Test
+    void classifiesOnlyIndependentNonDistinctScansAsRowLocal() {
+        var rowLocal = parse("{"
+                + "\"from\":{\"relation\":\"kv\"},"
+                + "\"where\":[\"value % 4 = 3\"],"
+                + "\"select\":{\"columns\":[\"k\",\"value\"],\"distinct\":false}}");
+        var distinct = parse("{"
+                + "\"from\":{\"relation\":\"kv\"},"
+                + "\"where\":[\"value % 4 = 3\"],"
+                + "\"select\":{\"columns\":[\"k\",\"value\"],\"distinct\":true}}");
+        var join = parse(sharedProjectionQuery(false));
+
+        assertTrue(rowLocal.isRowLocal());
+        assertFalse(distinct.isRowLocal());
+        assertFalse(join.isRowLocal());
+    }
+
+    @Test
     void rejectsUnsupportedJoinTypeAndUnknownAlias() {
         assertThrows(QueryException.class, () -> parse("{"
                 + "\"from\":{\"relation\":\"purchases\",\"alias\":\"p\"},"

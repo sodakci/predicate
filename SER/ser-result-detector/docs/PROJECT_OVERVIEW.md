@@ -46,7 +46,7 @@ PRHIST history
   -> ACCEPT / REJECT
 ```
 
-项目核心思想是：不要先枚举所有可能串行顺序，而是把“事务 A 是否在事务 B 之前”编码成 SAT literal。MonoSAT 负责维护被选择的 arbitration graph 必须无环；如果公式可满足，就说明有一个可扩展成串行顺序的偏序。
+项目核心思想是：不要先枚举所有可能串行顺序，而是把公式实际需要判断的“事务 A 是否在事务 B 之前”编码成 SAT literal。MonoSAT 负责维护被选择的 arbitration graph 必须无环；如果公式可满足，就说明有一个可扩展成串行顺序的偏序。
 
 ## 输入模型
 
@@ -134,17 +134,28 @@ txn     = -1
 }
 ```
 
-当前 `PredicateHistoryLoader` 支持一条 `where` 条件，条件作用于编码后的 `value`：
+当前 `PredicateHistoryLoader` 把结构化 `query` 编译为 `QueryPlan`：
 
 ```text
-TRUE
-value = n
-value % m = r
-value > n
-value < n
+from
+    一个必填 relation，可带 alias。
+
+joins
+    零个或多个 INNER JOIN，每个 join 带 on 条件。
+
+where
+    可选条件数组，数组元素按 AND 连接。
+
+select.columns
+    一个或多个字段路径或带 AS 的表达式。
+
+select.distinct
+    可选布尔值，默认 false。
 ```
 
-`result.inputs` 是本次谓词读实际观察到的版本集合。检测器用这些 `(key,value)` 找到对应 source write，并在 SAT 中约束其他 key 的 frontier 为什么没有进入结果。
+表达式支持字段路径、整数/字符串/布尔/null 字面量、`=`、`>`、`<`、`%`、`AND` 和括号。单表 KV 的 `value < 10` 等条件是该结构化查询的简单子集；多关系对象值可以使用 `alias.value.field` 访问。
+
+`result.inputs` 是本次谓词读结果实际依赖的可见版本集合。检测器用这些 `(key,value)` 找到对应 source write；`result.values` 保存投影后的业务结果，并按多重集匹配。结构化结果只做相等性比较，`<`、`>` 只接受可排序的标量。
 
 ## 核心概念
 
@@ -176,7 +187,7 @@ T1 --WW(x)--> T2
 T2 --WW(x)--> T1
 ```
 
-这些 choice 会被编码成 SAT XOR。选择某个方向后，还会激活对应的 RW implications。
+当这个事务对首次进入公式时，`ensureComparable` 会用互斥的两个 AR 方向保证二选一。选择某个方向后，还会激活对应的 RW implications；如果已知序已经确定方向，则直接使用常量，不再创建选择变量。
 
 ### Read-Write
 
@@ -213,6 +224,13 @@ PR_RW(S, U, x)
 ```
 
 当前实现不会把所有 PR_WR / PR_RW 预先物化成固定边再求解，而是在 SAT 中直接编码谓词可见性。`--compare-derived-predicate-edges` 只用于诊断对比。
+
+谓词 observation 还按 key 区分：
+
+- `EXTERNAL`：需要在 AR 中选择事务外部的 latest-visible frontier。
+- `INTERNAL`：由同事务先前谓词读或当前谓词读之前的本地写决定，按内部一致性/本地版本路径处理，不新建外部 PR_WR/PR_RW frontier。
+
+对于单表 `Scan/Filter`、`distinct=false` 且投影表达式也只依赖单行的 `QueryPlan`，结果是各行贡献的 bag union，求解器会使用 row-local 快路径逐 key 编码。`JOIN`、`DISTINCT` 和自定义非逐行 AST 继续使用完整快照求值。
 
 ## 核心流程
 
@@ -360,6 +378,12 @@ pruning 的目标是提前处理明显被迫的 WW choice。如果某个 choice 
 
 pruning 不改变可满足性：它只提交那些反方向已经不可能成立的 choice。
 
+当前环检查不会为每个候选分支复制完整事务可达矩阵：
+
+- SER 常见的同目标 WW/RW 分支直接在基础传递闭包上逐边检查。
+- 混合目标分支只构造候选边端点的局部闭包图，同时保留经非端点事务形成环的判断。
+- 每轮是否继续按当前剩余约束数判断。
+
 ### 7. SAT/AR 编码
 
 文件：
@@ -371,17 +395,22 @@ src/main/java/verifier/SERSolverAR.java
 `SERSolverAR` 把可串行化问题编码成 SAT：
 
 - `ar(T1,T2)` literal 表示 `T1` 在 arbitration order 中早于 `T2`。
-- 已知 SO/WR 边必须满足对应 AR。
-- 每个未定 WW choice 用 XOR 表示二选一。
+- 已知 SO/WR/依赖序先计算传递闭包；已确定的 AR 方向直接常量化，MonoSAT 只接收传递约简边。
+- 每个公式可见的未定事务对通过 `ensureComparable` 保证两个 AR 方向恰选其一。
 - 普通 RW 由 WR 和 WW 顺序推出。
-- 谓词读通过 frontier 和 result matching 约束。
+- row-local 谓词逐 key 编码 recorded source 和未返回行约束。
+- JOIN、DISTINCT 等通用谓词根据具体 SAT 模型构造完整可见快照；结果不匹配时加入该快照的 no-good 子句并继续求解。
 - MonoSAT graph acyclicity 保证被选择的 AR 边无环。
 
 实现细节：
 
 - AR graph 节点对应真实事务，不包含 bottom init transaction。
 - AR literal 是按需创建的，不为所有事务对一次性生成。
+- 已知序能推出的方向返回 `true/false` 常量，不创建 MonoSAT edge。
 - 对公式中需要比较的事务对，`ensureComparable` 会保证方向可比较。
+- 同一个 key 的 writer pair 比较只初始化一次，可被多个谓词读复用。
+- 条件依赖按 guard/edge 去重，恒假 guard、恒真 target 和重复 implication 不进入最终公式。
+- 大型动态谓词阻断子句通过 `assertOr` 提交，避免固定 JNI clause 缓冲边界。
 - 无环偏序可以扩展成严格全序，因此只要 SAT 可满足，就存在合法串行解释。
 
 ### 8. MonoSAT 集成
@@ -490,7 +519,7 @@ src/test/java/BlackBoxSERAuditTest.java
 src/test/java/verifier/
 ```
 
-覆盖 loader、基础 verifier、SAT encoding、谓词集成、小历史 differential 检查和 CLI 行为。
+覆盖 loader、基础 verifier、SAT encoding、谓词集成、row-local 与 JOIN/DISTINCT fallback、剪枝可达性、小历史 differential 检查和 CLI 行为。
 
 ## 正确性直觉
 
@@ -501,7 +530,7 @@ src/test/java/verifier/
 1. 所有 SO/WR 已知依赖都被放进 AR。
 2. 每个相关 WW choice 都选择了一个方向。
 3. 普通点读的 RW 约束保证读到的是最新可见版本。
-4. 谓词读的 frontier 约束保证结果集合与每个 key 的最新可见写一致。
+4. 外部谓词 key 的 frontier、内部谓词版本规则以及完整查询结果匹配共同保证记录结果与可见状态一致。
 5. MonoSAT 保证选中的 AR graph 无环。
 
 任何有限无环偏序都能扩展成严格全序，所以存在一个串行顺序解释该历史。
@@ -529,15 +558,17 @@ coalescing 把同一事务对上的重复 choices 合并，因为严格事务级
 当前 detector 的稳定路径是：
 
 ```text
-compact PRHIST + KV value predicates + MonoSAT AR solver
+compact PRHIST + structured QueryPlan predicates + MonoSAT AR solver
 ```
 
 已明确的边界：
 
 - Java loader 当前只接受 `query/result` 形态的 predicate read。
-- `where` 当前只支持一条作用于 `value` 的简单条件。
+- query 支持单表扫描、多个 INNER JOIN、AND 条件、字段投影和 DISTINCT；不支持其他 JOIN 类型或任意 SQL 语法。
+- value 不接受 null、数组和非整数数字；结果投影可以是结构化 JSON，但结构化值只支持相等性。
 - 当前紧凑格式依赖 `(key,value)` 写版本唯一性。
-- TPC-C 多表 SQL-shaped predicate 需要 loader 和谓词求值扩展后才能被完整验证。
+- `write_id/source_write_id/source_txn/source_op_index` provenance 字段会被 loader 拒绝。
+- TPC-C 多表 SQL-shaped predicate 必须先转换为当前结构化 query，才能被完整验证。
 - abort/retry attempt 不进入 `history.prhist.jsonl`；它们应保留在 raw trace 或 manifest 中。
 
 ## 新人阅读路径

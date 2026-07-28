@@ -10,7 +10,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /** Immutable, structurally comparable value used by the query evaluator. */
-public final class QueryValue implements Comparable<QueryValue> {
+public final class QueryValue {
     private final JsonNode value;
 
     private QueryValue(JsonNode value) {
@@ -104,7 +104,7 @@ public final class QueryValue implements Comparable<QueryValue> {
         return new QueryValue(current);
     }
 
-    @Override
+    /** Compares scalar values for query ordering; structured values support equality only. */
     public int compareTo(QueryValue other) {
         Objects.requireNonNull(other, "other");
         if (isIntegralNumber() && other.isIntegralNumber()) {

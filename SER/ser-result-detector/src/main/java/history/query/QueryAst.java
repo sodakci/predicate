@@ -353,6 +353,37 @@ public final class QueryAst {
         return result;
     }
 
+    static boolean isRowLocal(RelationalNode<?, ?> node) {
+        if (node instanceof ScanNode) {
+            return true;
+        }
+        if (node instanceof FilterNode) {
+            var filter = (FilterNode<?, ?>) node;
+            return isRowLocal(filter.input) && isRowLocal(filter.predicate);
+        }
+        return false;
+    }
+
+    static boolean isRowLocal(Expression<?, ?> expression) {
+        if (expression instanceof LiteralExpression
+                || expression instanceof FieldExpression) {
+            return true;
+        }
+        if (expression instanceof ComparisonExpression) {
+            var comparison = (ComparisonExpression<?, ?>) expression;
+            return isRowLocal(comparison.left) && isRowLocal(comparison.right);
+        }
+        if (expression instanceof ModuloExpression) {
+            var modulo = (ModuloExpression<?, ?>) expression;
+            return isRowLocal(modulo.left) && isRowLocal(modulo.right);
+        }
+        if (expression instanceof AndExpression) {
+            var conjunction = (AndExpression<?, ?>) expression;
+            return conjunction.expressions.stream().allMatch(QueryAst::isRowLocal);
+        }
+        return false;
+    }
+
     private static String requireName(String value, String label) {
         if (value == null || value.isBlank()) {
             throw new QueryException(label + " must not be blank");

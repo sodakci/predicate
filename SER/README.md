@@ -137,17 +137,28 @@ hist-00000/
 }
 ```
 
-当前 loader 支持的 KV 谓词为：
+当前 loader 接受结构化 `query`：
 
 ```text
-TRUE
-value = n
-value % m = r
-value > n
-value < n
+from
+    必填，指定一个 relation，可选 alias。
+
+joins
+    可选，支持一个或多个 INNER JOIN；每个 join 使用 on 条件。
+
+where
+    可选，数组中的条件按 AND 连接。
+
+select.columns
+    必填，支持字段路径和 AS 别名。
+
+select.distinct
+    可选布尔值，默认 false。
 ```
 
-注意：当前 `PredicateHistoryLoader` 只接受紧凑 `query/result` 形态。带 `predicate/results` 字段、source provenance 字段或 TPC-C 多表 SQL predicate 的历史，需要先确认 detector 已扩展对应 parser 与谓词求值逻辑。
+条件和投影表达式支持字段路径、整数/字符串/布尔/null 字面量、`=`、`>`、`<`、`%`、`AND` 和括号。单表 KV 的 `TRUE`、`value = n`、`value % m = r`、`value > n`、`value < n` 继续受支持；对象 `value` 可以通过 `relation.value.field` 访问。`result.values` 按多重集比较，`result.inputs` 必须列出结果实际依赖的可见 `(key,value)` 版本。对象和数组结果支持相等性比较，但 `<`、`>` 只适用于可排序的标量值。
+
+注意：`PredicateHistoryLoader` 只接受紧凑 `query/result` 形态，并拒绝 `write_id`、`source_write_id`、`source_txn`、`source_op_index` 等 source provenance 字段。带 `predicate/results` 字段或直接保存 SQL 文本的历史不属于当前输入格式。
 
 ## 运行单个历史
 
@@ -204,13 +215,20 @@ java -Djava.library.path=build/monosat -Xmx8g \
     打印 SAT 后端标识和额外统计信息。
 ```
 
+当前实现会自动使用以下等价编码，无需额外命令行开关：
+
+- 对已知 SO/WR/依赖序计算传递闭包，并只向 MonoSAT 写入传递约简边；已由已知序确定的 AR 方向直接作为常量。
+- AR 比较只为公式实际涉及的事务对创建；无环偏序最终可扩展为串行全序。
+- 单表 `Scan/Filter`、`distinct=false` 且投影为逐行表达式的查询走 row-local 逐 key 编码。
+- `JOIN`、`DISTINCT` 和其他非逐行查询继续走完整快照求值，并按 SAT 模型惰性加入不匹配快照的阻断子句。
+
 示例：
 
 ```bash
 java -Djava.library.path=build/monosat -Xmx12g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
   audit --compare-derived-predicate-edges --solver-stats \
-  ../../PolySIHistories/kvpredicate/kvpredicate_serializable_20260706/hist-00000
+  ../../predicateHistories/kvpredicate/kvpredicate_serializable_20260706/hist-00000
 ```
 
 ## 查看统计和 dump
@@ -238,7 +256,7 @@ java -Djava.library.path=build/monosat -Xmx8g \
 
 ```bash
 cd SER/ser-result-detector
-tools/audit-prhist.sh ../../PolySIHistories/kvpredicate
+tools/audit-prhist.sh ../../predicateHistories/kvpredicate
 ```
 
 常用环境变量：
@@ -265,7 +283,7 @@ SER_RESULT_DETECTOR_OUTPUT_DIR
 ```bash
 SER_RESULT_DETECTOR_HEAP=12g \
 SER_RESULT_DETECTOR_OUTPUT_DIR=/tmp/ser-kv-audit \
-tools/audit-prhist.sh ../../PolySIHistories/kvpredicate
+tools/audit-prhist.sh ../../predicateHistories/kvpredicate
 ```
 
 脚本最后会输出汇总：
@@ -319,8 +337,51 @@ machine.json
 `History_Generator` 默认把新 case 写到仓库根目录：
 
 ```text
-PolySIHistories/<workload>/<case>/hist-00000
+predicateHistories/<workload>/<case>/hist-00000
 ```
+
+### 生成 KV 参数化历史
+
+KV 历史生成参数如下：
+
+| 实验参数 | 运行变量 | 可选值 |
+| --- | --- | --- |
+| sessions | `TERMINALS` | `5 10 20 40 80` |
+| txns/session | `TXNS_PER_SESSION` | `50 100 200 500` |
+| ops/txn | `MIN_TXN_LENGTH`、`MAX_TXN_LENGTH` | `5 10 20 40`，两者设置为相同值 |
+| predicate read ratio | `PREDICATE_READ_RATIO` | `20 50 80 95` |
+| rows/table | `KEY_COUNT` | `1000 10000 100000 1000000` |
+| distribution | `KEY_DIST` | `uniform zipfian hotspot` |
+
+例如生成 5 sessions、每 session 50 个事务、每事务 5 个操作、20% 谓词读、1000 行、uniform 的真实 PostgreSQL 历史：
+
+```bash
+cd /home/lc/Desktop/predicate/History_Generator
+source .tools/java23.env
+
+PGPASSFILE=kv/.runtime/pgpass \
+BUILD=true \
+LOAD=true \
+CASE_NAME=kv_ser_s5_t50_o5_pr20_rows1000_uniform_$(date +%Y%m%d_%H%M%S) \
+ISOLATION=TRANSACTION_SERIALIZABLE \
+KV_PREDICATE_ANOMALY=none \
+TERMINALS=5 \
+TXNS_PER_SESSION=50 \
+MIN_TXN_LENGTH=5 \
+MAX_TXN_LENGTH=5 \
+PREDICATE_READ_RATIO=20 \
+KEY_COUNT=1000 \
+KEY_DIST=uniform \
+KEY_DIST_BASE=0.99 \
+MAX_WRITES_PER_KEY=2147483647 \
+TIME_SECONDS=60 \
+RATE=unlimited \
+./kv/run_kvpredicate_history_case.sh
+```
+
+`PREDICATE_READ_RATIO` 表示谓词读占全部操作的概率；剩余操作中点读和写各约一半。例如设置为 `20` 时，三类操作约为 20% 谓词读、40% 点读、40% 写。旧的 `READ_RATIO` 已被替换，不再用于该生成命令。
+
+完整 3840 组参数矩阵循环见 [History_Generator 使用手册](../History_Generator/README.md#kv-参数矩阵配置命令)。
 
 KV predicate case 可以直接交给当前 SER detector：
 
@@ -328,10 +389,10 @@ KV predicate case 可以直接交给当前 SER detector：
 cd SER/ser-result-detector
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit ../../PolySIHistories/kvpredicate/<case>/hist-00000
+  audit ../../predicateHistories/kvpredicate/<case>/hist-00000
 ```
 
-TPC-C generator 当前能采集、导出和审计 raw evidence，但 StockLevel 会输出多表 SQL-shaped predicate；在当前 SER loader 只支持 KV `value` 谓词的情况下，不应把 TPC-C StockLevel 历史当作已被当前 detector 完整支持的输入。
+TPC-C generator 当前能采集、导出和审计 raw evidence，但 StockLevel 会输出多表 SQL-shaped predicate。当前 SER loader 支持的是结构化 `query` 对象而不是 SQL 文本，因此不应把该 StockLevel 历史当作已被 detector 完整支持的输入。
 
 ## 常见问题
 
@@ -371,7 +432,7 @@ source ./jdk11-env.sh
 
 ### 大历史内存不足
 
-增大 heap：
+当前 detector 已对大型谓词历史启用传递约简、按需 AR、依赖去重和 row-local 逐 key 编码。若仍然内存不足，再增大 heap：
 
 ```bash
 java -Djava.library.path=build/monosat -Xmx32g \

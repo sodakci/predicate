@@ -84,6 +84,18 @@ public final class QueryPlan<KeyType, ValueType>
         return columns;
     }
 
+    /**
+     * Whether this plan is a bag union of independent single-row evaluations.
+     * Joins, DISTINCT, and custom AST nodes deliberately fall back to the
+     * general whole-snapshot evaluator.
+     */
+    public boolean isRowLocal() {
+        return !distinct
+                && QueryAst.isRowLocal(root)
+                && columns.stream()
+                        .allMatch(column -> QueryAst.isRowLocal(column.expression()));
+    }
+
     private ArrayList<ProjectedRow<KeyType, ValueType>> distinct(
             List<ProjectedRow<KeyType, ValueType>> rows) {
         var byValue = new LinkedHashMap<QueryValue, ProjectedRow<KeyType, ValueType>>();
