@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<parameters>
+    <type>POSTGRES</type>
+    <driver>org.postgresql.Driver</driver>
+    <url>jdbc:postgresql://localhost:5432/benchbase?sslmode=disable&amp;ApplicationName=multikv&amp;reWriteBatchedInserts=true</url>
+    <username>admin</username>
+    <password>password</password>
+    <reconnectOnConnectionFailure>true</reconnectOnConnectionFailure>
+    <isolation>TRANSACTION_REPEATABLE_READ</isolation>
+    <batchsize>128</batchsize>
+
+    <scalefactor>1</scalefactor>
+    <keyDist>exponential</keyDist>
+    <keyDistBase>2.0</keyDistBase>
+    <minTxnLength>1</minTxnLength>
+    <maxTxnLength>4</maxTxnLength>
+    <multiKvAnomaly>none</multiKvAnomaly>
+    <multiKvAnomalyDelayMs>250</multiKvAnomalyDelayMs>
+
+    <terminals>2</terminals>
+    <works>
+        <work>
+            <time>30</time>
+            <rate>unlimited</rate>
+            <weights>100</weights>
+        </work>
+    </works>
+    <transactiontypes>
+        <transactiontype><name>Txn</name></transactiontype>
+    </transactiontypes>
+</parameters>

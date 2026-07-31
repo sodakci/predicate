@@ -3,13 +3,14 @@
 本目录用于运行改造后的 BenchBase workload，在真实 PostgreSQL 上采集事务历史，并生成：
 
 ```text
-PolySIHistories/<workload>/<case>/hist-00000
+predicateHistories/<workload>/<case>/hist-00000
 ```
 
-当前支持两个 workload：
+当前支持三个 workload：
 
-- `kvpredicate`：KV 谓词读 workload，可直接生成当前 SER detector 支持的紧凑 PRHIST。
-- `tpcc`：真实 TPC-C 多表 workload，生成真实 PostgreSQL raw evidence 和 PRHIST case；StockLevel 使用关系谓词证据，当前 SER loader 仍需扩展后才能完整验证。
+- `kvpredicate`：单表 KV 谓词读 workload，生成结构化单表查询 PRHIST。
+- `multikv`：`users/items/orders` 多表 workload，生成带 INNER JOIN、投影和对象行值的结构化查询 PRHIST，可由当前 SER/SI detector 验证。
+- `tpcc`：真实 TPC-C 多表 workload，生成真实 PostgreSQL raw evidence 和 PRHIST case；StockLevel 当前仍输出 SQL 文本，需转换为结构化 `query` 后才能完整验证。
 
 改造细节分别见：
 
@@ -18,6 +19,8 @@ kv/README.md
 tpcc/README.md
 ```
 
+`multikv` 的运行方式集中记录在本文档的“运行 MultiKV”一节。
+
 ## 目录
 
 ```text
@@ -25,6 +28,7 @@ History_Generator/
   README.md
   benchbase/                    BenchBase 源码和改造后的 workload
   kv/                           KV predicate 运行、trace、转换、审计
+  multikv/                      多表 KV/JOIN 运行、trace、转换、审计
   tpcc/                         TPC-C 运行、trace、转换、审计
   .tools/java23.env             本地 Java 23 环境
 ```
@@ -37,6 +41,7 @@ hist-00000/
   history.prhist.jsonl
   manifest.json
   raw_kvpredicate_trace.jsonl   # KV case
+  raw_multikv_trace.jsonl       # MultiKV case
   raw_tpcc_trace.jsonl          # TPC-C case
 ```
 
@@ -84,6 +89,7 @@ PostgreSQL 密码建议放在 workload 自己的 `.runtime/pgpass`：
 
 ```text
 kv/.runtime/pgpass
+multikv/.runtime/pgpass
 tpcc/.runtime/pgpass
 ```
 
@@ -91,6 +97,7 @@ tpcc/.runtime/pgpass
 
 ```bash
 chmod 600 kv/.runtime/pgpass
+chmod 600 multikv/.runtime/pgpass
 chmod 600 tpcc/.runtime/pgpass
 ```
 
@@ -118,7 +125,7 @@ benchbase/target/benchbase-postgres/benchbase-postgres/benchbase.jar
 
 `benchbase/.m2/` 是 Maven 本地依赖缓存，`benchbase/target/` 是构建产物。它们不需要从 Git 恢复，执行上面的 `./mvnw ... package` 后会重新生成；首次构建需要联网下载依赖。
 
-KV 一键脚本默认会自动构建；TPC-C 脚本需要显式设置 `BENCHBASE_JAR`。
+KV 和 MultiKV 一键脚本默认会自动构建；TPC-C 脚本需要显式设置 `BENCHBASE_JAR`。
 
 ## 运行 KV Predicate
 
@@ -129,6 +136,7 @@ cd History_Generator
 PGPASSFILE=kv/.runtime/pgpass \
 CASE_NAME=kvpredicate_serializable_20260706 \
 ISOLATION=TRANSACTION_SERIALIZABLE \
+KV_PREDICATE_ANOMALY=none \
 KEY_COUNT=10 \
 MIN_TXN_LENGTH=1 \
 MAX_TXN_LENGTH=4 \
@@ -143,7 +151,7 @@ PREDICATE_GROUP_COUNT=4 \
 输出：
 
 ```text
-../PolySIHistories/kvpredicate/kvpredicate_serializable_20260706/hist-00000
+../predicateHistories/kvpredicate/kvpredicate_serializable_20260706/hist-00000
 ```
 
 常用参数：
@@ -174,10 +182,22 @@ KEY_COUNT
     初始 key 数量。
 
 KEY_DIST
-    uniform、exponential 或 zipf。
+    uniform、zipf/zipfian、hotspot 或兼容旧配置的 exponential。
+
+KEY_DIST_BASE
+    Zipfian 指数；参数矩阵示例使用 0.99。
 
 MIN_TXN_LENGTH / MAX_TXN_LENGTH
     每个事务的 logical operation 数量范围。
+
+TXNS_PER_SESSION
+    每个 session 必须提交的事务数；运行结束后脚本会严格校验。
+
+PREDICATE_READ_RATIO
+    0 到 100 的谓词读操作百分比；剩余操作中点读与写各占约一半。
+
+MAX_WRITES_PER_KEY
+    单个 key 轮换前的写次数；要求表行数固定时设置为 2147483647。
 
 PREDICATE_GROUP_COUNT
     value % m = r 谓词中的 m。
@@ -186,23 +206,26 @@ TERMINALS
     BenchBase worker 数。
 
 TIME_SECONDS
-    执行时长。
+    BenchBase 执行时长，也是达到 TXNS_PER_SESSION 的超时窗口。
 
 RATE
     目标速率，数字或 unlimited。
 
 KV_PREDICATE_ANOMALY
-    none 或 write-skew。
+    none、write-skew 或 lost-update。
 
 KV_PREDICATE_ANOMALY_DELAY_MS
-    write-skew 模式中 barrier 后的等待时间。
+    write-skew/lost-update 模式中的并发交错等待时间。
+
+EXPECTED_VERDICT
+    可选；写入 manifest 的预期检测结果，例如 lost-update 使用 REJECT。
 ```
 
 本地格式审计：
 
 ```bash
 python3 kv/audit_kvpredicate_prhist.py \
-  ../PolySIHistories/kvpredicate/<case>/hist-00000
+  ../predicateHistories/kvpredicate/<case>/hist-00000
 ```
 
 SER detector 审计：
@@ -212,8 +235,102 @@ cd ../SER/ser-result-detector
 ./gradlew jar
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit ../../PolySIHistories/kvpredicate/<case>/hist-00000
+  audit ../../predicateHistories/kvpredicate/<case>/hist-00000
 ```
+
+## KV 参数矩阵配置命令
+
+请求参数与运行变量的对应关系：
+
+| 实验参数 | 运行变量 | 可选值 |
+| --- | --- | --- |
+| sessions | `TERMINALS` | `5 10 20 40 80` |
+| txns/session | `TXNS_PER_SESSION` | `50 100 200 500` |
+| ops/txn | `MIN_TXN_LENGTH`、`MAX_TXN_LENGTH` | `5 10 20 40`，两者设置为相同值 |
+| predicate read ratio | `PREDICATE_READ_RATIO` | `20 50 80 95` |
+| rows/table | `KEY_COUNT` | `1000 10000 100000 1000000` |
+| distribution | `KEY_DIST` | `uniform zipfian hotspot` |
+
+运行单组配置，例如 5 sessions、每 session 50 个事务、每事务 5 个操作、20% 谓词读、1000 行、uniform：
+
+```bash
+cd /home/lc/Desktop/predicate/History_Generator
+source .tools/java23.env
+
+PGPASSFILE=kv/.runtime/pgpass \
+BUILD=true \
+LOAD=true \
+CASE_NAME=kv_s5_t50_o5_pr20_rows1000_uniform_$(date +%Y%m%d_%H%M%S) \
+ISOLATION=TRANSACTION_SERIALIZABLE \
+KV_PREDICATE_ANOMALY=none \
+TERMINALS=5 \
+TXNS_PER_SESSION=50 \
+MIN_TXN_LENGTH=5 \
+MAX_TXN_LENGTH=5 \
+PREDICATE_READ_RATIO=20 \
+KEY_COUNT=1000 \
+KEY_DIST=uniform \
+KEY_DIST_BASE=0.99 \
+MAX_WRITES_PER_KEY=2147483647 \
+TIME_SECONDS=60 \
+RATE=unlimited \
+./kv/run_kvpredicate_history_case.sh
+```
+
+完整笛卡尔积共 `5 × 4 × 4 × 4 × 4 × 3 = 3840` 个 case，可用以下循环生成：
+
+```bash
+cd /home/lc/Desktop/predicate/History_Generator
+source .tools/java23.env
+set -euo pipefail
+
+sessions_values=(5 10 20 40 80)
+txns_values=(50 100 200 500)
+ops_values=(5 10 20 40)
+predicate_read_ratio_values=(20 50 80 95)
+row_values=(1000 10000 100000 1000000)
+distribution_values=(uniform zipfian hotspot)
+build=true
+
+for sessions in "${sessions_values[@]}"; do
+  for txns in "${txns_values[@]}"; do
+    for ops in "${ops_values[@]}"; do
+      for predicate_read_ratio in "${predicate_read_ratio_values[@]}"; do
+        for rows in "${row_values[@]}"; do
+          for distribution in "${distribution_values[@]}"; do
+            case_name="kv_s${sessions}_t${txns}_o${ops}_pr${predicate_read_ratio}_rows${rows}_${distribution}_$(date +%Y%m%d_%H%M%S)"
+            PGPASSFILE=kv/.runtime/pgpass \
+            BUILD="$build" \
+            LOAD=true \
+            CASE_NAME="$case_name" \
+            ISOLATION=TRANSACTION_SERIALIZABLE \
+            KV_PREDICATE_ANOMALY=none \
+            TERMINALS="$sessions" \
+            TXNS_PER_SESSION="$txns" \
+            MIN_TXN_LENGTH="$ops" \
+            MAX_TXN_LENGTH="$ops" \
+            PREDICATE_READ_RATIO="$predicate_read_ratio" \
+            KEY_COUNT="$rows" \
+            KEY_DIST="$distribution" \
+            KEY_DIST_BASE=0.99 \
+            MAX_WRITES_PER_KEY=2147483647 \
+            TIME_SECONDS="${TIME_SECONDS_PER_CASE:-60}" \
+            RATE=unlimited \
+            ./kv/run_kvpredicate_history_case.sh
+            build=false
+          done
+        done
+      done
+    done
+  done
+done
+```
+
+循环中的第一个 case 使用 `BUILD=true` 构建 BenchBase，后续 case 自动使用 `BUILD=false`。`TXNS_PER_SESSION` 按成功提交计数，abort/retry 不占额度；如果某个 session 未在 `TIME_SECONDS` 内达到目标，脚本会失败并打印各 session 的实际数量。
+
+`PREDICATE_READ_RATIO` 是逐操作概率，例如 `20` 表示全部操作中约 20% 为谓词读；剩余 80% 中点读和写各约一半，因此三类操作约为 20% 谓词读、40% 点读、40% 写。`KEY_DIST` 只控制具有单一 key 的点读和写；谓词读本身没有单一目标 key。`hotspot` 使用 80/20 规则，即约 80% 的点读和写访问前 20% active keys。为了让物理表行数保持为 `KEY_COUNT`，矩阵命令固定使用 `MAX_WRITES_PER_KEY=2147483647`。
+
+严格的 `ops/txn` 只适用于 `KV_PREDICATE_ANOMALY=none`；write-skew 和 lost-update 的两个注入核心事务固定为各自的异常操作结构。100 万行上的全表/范围谓词可能返回大量结果，应根据机器性能增大 `TIME_SECONDS_PER_CASE`。
 
 ## 运行 KV Write-Skew 对照
 
@@ -258,6 +375,106 @@ PREDICATE_GROUP_COUNT=2 \
 
 建议 `TERMINALS=2`。更多 worker 可能在脚本化事务等待时抢先更新 `k0/k1`，导致异常核心事务进入 retry/abort。
 
+## 生成 100 事务 KV Lost-Update 历史
+
+该模式必须使用 `TRANSACTION_READ_COMMITTED`，并要求 `TERMINALS >= 2`、`KEY_COUNT >= 2`。推荐固定使用两个 worker：
+
+```bash
+cd /home/lc/Desktop/predicate/History_Generator
+source .tools/java23.env
+
+PGPASSFILE=kv/.runtime/pgpass \
+BUILD=true \
+LOAD=true \
+CASE_NAME=kvpredicate_read_committed_lost_update_100_$(date +%Y%m%d_%H%M%S) \
+ISOLATION=TRANSACTION_READ_COMMITTED \
+KV_PREDICATE_ANOMALY=lost-update \
+KV_PREDICATE_ANOMALY_DELAY_MS=250 \
+KEY_COUNT=10 \
+MIN_TXN_LENGTH=1 \
+MAX_TXN_LENGTH=4 \
+TERMINALS=2 \
+TIME_SECONDS=1 \
+RATE=98 \
+KEY_DIST=exponential \
+PREDICATE_GROUP_COUNT=4 \
+EXPECTED_VERDICT=REJECT \
+./kv/run_kvpredicate_history_case.sh
+```
+
+首次运行使用 `BUILD=true`；已有最新 BenchBase jar 时可以改为 `BUILD=false`。默认 `KEY_COUNT=10` 时，注入事务复用 `kv:9=9`，两个并发事务都读取 `9`，数据库实际覆盖链为 `9 → 10 → 11`。输出目录为：
+
+```text
+../predicateHistories/kvpredicate/<CASE_NAME>/hist-00000/
+```
+
+目录中包含 `history.prhist.jsonl`、`initial_state.json`、`manifest.json` 和 `raw_kvpredicate_trace.jsonl`。
+
+## 运行 MultiKV
+
+MultiKV 在真实 PostgreSQL 的 `users`、`items` 和 `orders` 表上混合执行点读、写和结构化 INNER JOIN 谓词读。推荐使用一键脚本：
+
+```bash
+cd /home/lc/Desktop/predicate/History_Generator
+source .tools/java23.env
+
+PGPASSFILE=multikv/.runtime/pgpass \
+BUILD=true \
+LOAD=true \
+CASE_NAME=multikv_repeatable_read_write_skew_$(date +%Y%m%d_%H%M%S) \
+ISOLATION=TRANSACTION_REPEATABLE_READ \
+MULTIKV_ANOMALY=write-skew \
+MULTIKV_ANOMALY_DELAY_MS=250 \
+MULTIKV_TRANSACTION_COUNT=100 \
+TERMINALS=2 \
+TIME_SECONDS=5 \
+RATE=100 \
+./multikv/run_multikv_history_case.sh
+```
+
+输出：
+
+```text
+../predicateHistories/multikv/<CASE_NAME>/hist-00000/
+  initial_state.json
+  history.prhist.jsonl
+  manifest.json
+  raw_multikv_trace.jsonl
+```
+
+常用参数：
+
+```text
+MULTIKV_ANOMALY
+    none、write-skew 或 lost-update。
+
+MULTIKV_TRANSACTION_COUNT
+    要求生成的已提交事务总数；大于 0 时脚本会严格校验 trace 和 manifest。
+
+ISOLATION
+    数据库隔离级别；lost-update 模式必须是 TRANSACTION_READ_COMMITTED。
+
+MIN_TXN_LENGTH / MAX_TXN_LENGTH
+    普通事务的 logical operation 数量范围。
+
+KEY_DIST / KEY_DIST_BASE
+    普通点操作使用的 key 分布及分布参数。
+
+TERMINALS / TIME_SECONDS / RATE
+    BenchBase worker 数、运行时限和目标速率。
+```
+
+`write-skew` 和 `lost-update` 至少需要两个事务；`lost-update` 使用专用键 `items:lu0`，两个核心事务读取同一初始版本后写入不同覆盖版本。异常模式的 manifest 会记录 `expected_verdict=REJECT`。
+
+本地格式审计：
+
+```bash
+python3 multikv/audit_multikv_join_history.py \
+  ../predicateHistories/multikv/<case>/hist-00000
+```
+
+生成的结构化 JOIN 历史可以直接交给 SER 或 SI detector 审计。
+
 ## 运行 TPC-C
 
 先构建 BenchBase，然后准备 TPC-C 配置和连接：
@@ -280,7 +497,7 @@ CASE_NAME=tpcc_serializable_20260706 \
 输出：
 
 ```text
-../PolySIHistories/tpcc/tpcc_serializable_20260706/hist-00000
+../predicateHistories/tpcc/tpcc_serializable_20260706/hist-00000
 ```
 
 TPC-C 脚本必需环境变量：
@@ -303,14 +520,14 @@ CASE_NAME
 
 ```bash
 python3 tpcc/audit_tpcc_prhist.py \
-  ../PolySIHistories/tpcc/<case>/hist-00000
+  ../predicateHistories/tpcc/<case>/hist-00000
 ```
 
-注意：TPC-C case 当前主要用于保存真实 PostgreSQL evidence 和关系谓词 PRHIST。当前 SER loader 只支持 KV value 谓词，不能把它对 TPC-C StockLevel 的结果当作完整验证结论。
+注意：TPC-C case 当前主要用于保存真实 PostgreSQL evidence 和关系谓词 PRHIST。SER/SI loader 支持结构化多表 `query`，但 StockLevel 当前输出的是 SQL 文本，因此不能把 detector 对该历史的结果当作完整验证结论。
 
 ## 可选 Oracle
 
-两个 converter 都不会猜测 `ACCEPT/REJECT`。如果你已经外部证明了 expected verdict，可以传：
+各 converter 都不会为普通 case 猜测 `ACCEPT/REJECT`。如果你已经外部证明了 expected verdict，可以传：
 
 ```bash
 export EXPECTED_VERDICT=ACCEPT

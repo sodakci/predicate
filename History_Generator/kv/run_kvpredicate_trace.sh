@@ -51,9 +51,13 @@ psql "$KVPREDICATE_DSN" -v ON_ERROR_STOP=1 -c 'SELECT ser_kvpredicate_trace.snap
 
 run_benchbase -Dser.kvpredicate.trace=true -jar "$BENCHBASE_JAR" -b kvpredicate -c "$KVPREDICATE_CONFIG" --create=false --load=false --execute=true
 
-CASE_DIR="$REPO_ROOT/PolySIHistories/kvpredicate/$CASE_NAME/hist-00000"
+CASE_DIR="$REPO_ROOT/predicateHistories/kvpredicate/$CASE_NAME/hist-00000"
 mkdir -p "$CASE_DIR"
-psql "$KVPREDICATE_DSN" -X -qAt -v ON_ERROR_STOP=1 -f "$KVPREDICATE_DIR/sql/02_export_kvpredicate_trace.sql" > "$CASE_DIR/raw_kvpredicate_trace.jsonl"
+psql "$KVPREDICATE_DSN" -X -qAt -v ON_ERROR_STOP=1 \
+  -f "$KVPREDICATE_DIR/sql/02_export_kvpredicate_trace.sql" \
+  > "$CASE_DIR/raw_kvpredicate_trace.jsonl"
+psql "$KVPREDICATE_DSN" -X -v ON_ERROR_STOP=1 -c \
+  'TRUNCATE TABLE ser_kvpredicate_trace.trace_op, ser_kvpredicate_trace.trace_txn, ser_kvpredicate_trace.trace_abort, ser_kvpredicate_trace.write_version, ser_kvpredicate_trace.initial_version, ser_kvpredicate_trace.row_version;'
 CONVERT_ARGS=(--raw "$CASE_DIR/raw_kvpredicate_trace.jsonl" --case-dir "$CASE_DIR")
 if [[ -n "$EXPECTED_VERDICT" ]]; then
   CONVERT_ARGS+=(--expected-verdict "$EXPECTED_VERDICT")

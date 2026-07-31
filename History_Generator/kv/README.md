@@ -422,7 +422,7 @@ kv/run_kvpredicate_history_case.sh
 最终得到：
 
 ```text
-PolySIHistories/kvpredicate/<case>/hist-00000/
+predicateHistories/kvpredicate/<case>/hist-00000/
   initial_state.json
   history.prhist.jsonl
   manifest.json

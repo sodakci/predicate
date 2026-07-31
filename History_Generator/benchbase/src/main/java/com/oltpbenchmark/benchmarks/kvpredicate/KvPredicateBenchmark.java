@@ -5,7 +5,9 @@ import com.oltpbenchmark.api.BenchmarkModule;
 import com.oltpbenchmark.api.Loader;
 import com.oltpbenchmark.api.Worker;
 import com.oltpbenchmark.benchmarks.kvpredicate.procedures.Txn;
+import java.sql.Connection;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -15,6 +17,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.commons.configuration2.XMLConfiguration;
 
 public final class KvPredicateBenchmark extends BenchmarkModule {
+  private static final String ANOMALY_LOST_UPDATE = "lost-update";
+
   private final int keyCount;
   private final String keyDist;
   private final double keyDistBase;
@@ -23,9 +27,12 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
   private final int maxTxnLength;
   private final int maxWritesPerKey;
   private final int predicateGroupCount;
+  private final int transactionsPerSession;
+  private final double predicateReadRatio;
   private final long mopDelayMillis;
   private final String anomalyMode;
   private final long anomalyDelayMillis;
+  private final double[] zipfCdf;
 
   private final Object generatorLock = new Object();
   private final List<Long> activeKeys = new ArrayList<>();
@@ -35,18 +42,25 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
 
   private final AtomicInteger scriptedAssignments = new AtomicInteger(0);
   private final CyclicBarrier writeSkewBarrier = new CyclicBarrier(2);
+  private final CyclicBarrier lostUpdateBarrier = new CyclicBarrier(2);
 
   public KvPredicateBenchmark(WorkloadConfiguration workConf) {
     super(workConf);
     XMLConfiguration xml = workConf.getXmlConfig();
     this.keyCount = getInt(xml, "keyCount", 10);
-    this.keyDist = getString(xml, "keyDist", "exponential").toLowerCase();
+    String configuredKeyDist = getString(xml, "keyDist", "exponential").toLowerCase();
+    this.keyDist = "zipfian".equals(configuredKeyDist) ? "zipf" : configuredKeyDist;
     this.keyDistBase = getDouble(xml, "keyDistBase", 2.0);
-    this.keyDistScale = keyDistScale(this.keyDistBase, this.keyCount);
+    this.keyDistScale =
+        "exponential".equals(this.keyDist)
+            ? keyDistScale(this.keyDistBase, this.keyCount)
+            : 0.0;
     this.minTxnLength = getInt(xml, "minTxnLength", 1);
     this.maxTxnLength = getInt(xml, "maxTxnLength", 4);
     this.maxWritesPerKey = getInt(xml, "maxWritesPerKey", 256);
     this.predicateGroupCount = getInt(xml, "predicateGroupCount", 4);
+    this.transactionsPerSession = getInt(xml, "transactionsPerSession", 0);
+    this.predicateReadRatio = getDouble(xml, "predicateReadRatio", 100.0 / 3.0);
     this.mopDelayMillis = getLong(xml, "mopDelayMs", 0L);
     this.anomalyMode = getString(xml, "kvPredicateAnomaly", "none").toLowerCase();
     this.anomalyDelayMillis = getLong(xml, "kvPredicateAnomalyDelayMs", 250L);
@@ -60,15 +74,58 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
     if (this.predicateGroupCount <= 0) {
       throw new IllegalArgumentException("predicateGroupCount must be positive");
     }
-    for (int key = 0; key < this.keyCount; key++) {
+    if (!"uniform".equals(this.keyDist)
+        && !"zipf".equals(this.keyDist)
+        && !"hotspot".equals(this.keyDist)
+        && !"exponential".equals(this.keyDist)) {
+      throw new IllegalArgumentException(
+          "keyDist must be uniform, zipf/zipfian, hotspot, or exponential");
+    }
+    if (this.keyDistBase <= 0.0
+        || ("exponential".equals(this.keyDist) && this.keyDistBase <= 1.0)) {
+      throw new IllegalArgumentException(
+          "keyDistBase must be positive, and greater than 1 for exponential");
+    }
+    if (this.transactionsPerSession < 0) {
+      throw new IllegalArgumentException("transactionsPerSession must be non-negative");
+    }
+    if (this.predicateReadRatio < 0.0 || this.predicateReadRatio > 100.0) {
+      throw new IllegalArgumentException("predicateReadRatio must be between 0 and 100");
+    }
+    if (lostUpdateEnabled() && this.keyCount < 2) {
+      throw new IllegalArgumentException("lost-update requires keyCount >= 2");
+    }
+    if (lostUpdateEnabled() && workConf.getTerminals() < 2) {
+      throw new IllegalArgumentException("lost-update requires at least 2 terminals");
+    }
+    if (lostUpdateEnabled()
+        && workConf.getIsolationMode() != Connection.TRANSACTION_READ_COMMITTED) {
+      throw new IllegalArgumentException(
+          "kvPredicateAnomaly=lost-update requires TRANSACTION_READ_COMMITTED");
+    }
+    int ordinaryKeyCount = lostUpdateEnabled() ? this.keyCount - 1 : this.keyCount;
+    for (int key = 0; key < ordinaryKeyCount; key++) {
       this.activeKeys.add((long) key);
     }
     this.nextKey = this.keyCount;
-    this.nextWrite = this.keyCount;
+    this.nextWrite = lostUpdateEnabled() ? this.keyCount + 2L : this.keyCount;
+    this.zipfCdf = "zipf".equals(this.keyDist) ? buildZipfCdf(ordinaryKeyCount) : null;
   }
 
   int getKeyCount() {
     return keyCount;
+  }
+
+  int getTransactionsPerSession() {
+    return transactionsPerSession;
+  }
+
+  boolean lostUpdateEnabled() {
+    return ANOMALY_LOST_UPDATE.equals(anomalyMode);
+  }
+
+  long lostUpdateKey() {
+    return keyCount - 1L;
   }
 
   List<KvPredicateOperation> nextTransaction(int workerId, Random random) {
@@ -76,6 +133,12 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
       int assignment = scriptedAssignments.getAndIncrement();
       if (assignment < 2) {
         return writeSkewTransaction(assignment);
+      }
+    }
+    if (lostUpdateEnabled()) {
+      int assignment = scriptedAssignments.getAndIncrement();
+      if (assignment < 2) {
+        return lostUpdateTransaction(assignment);
       }
     }
     return randomTransaction(random);
@@ -98,21 +161,34 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
     return ops;
   }
 
+  private List<KvPredicateOperation> lostUpdateTransaction(int assignment) {
+    List<KvPredicateOperation> ops = new ArrayList<>();
+    ops.add(KvPredicateOperation.read(lostUpdateKey()));
+    ops.add(
+        KvPredicateOperation.barrier(lostUpdateBarrier, Math.max(5000L, anomalyDelayMillis * 8L)));
+    if (assignment == 1 && anomalyDelayMillis > 0) {
+      ops.add(KvPredicateOperation.sleep(anomalyDelayMillis));
+    }
+    ops.add(
+        KvPredicateOperation.write(
+            lostUpdateKey(), assignment == 0 ? keyCount : keyCount + 1L));
+    return ops;
+  }
+
   private List<KvPredicateOperation> randomTransaction(Random random) {
     synchronized (generatorLock) {
       int length = minTxnLength + random.nextInt(maxTxnLength - minTxnLength + 1);
       List<KvPredicateOperation> ops = new ArrayList<>(length);
       for (int index = 0; index < length; index++) {
-        int choice = random.nextInt(3);
-        if (choice == 0) {
+        if (random.nextDouble() * 100.0 < predicateReadRatio) {
+          ops.add(randomPredicate(random));
+        } else if (random.nextBoolean()) {
           ops.add(KvPredicateOperation.read(chooseKey(random)));
-        } else if (choice == 1) {
+        } else {
           long key = chooseKey(random);
           long value = nextWrite++;
           rotateKey(key);
           ops.add(KvPredicateOperation.write(key, value));
-        } else {
-          ops.add(randomPredicate(random));
         }
       }
       return ops;
@@ -120,6 +196,12 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
   }
 
   private KvPredicateOperation randomPredicate(Random random) {
+    if (lostUpdateEnabled()) {
+      long target = nonNegativeLong(random, keyCount - 1L);
+      return random.nextBoolean()
+          ? KvPredicateOperation.predicateEquals(target)
+          : KvPredicateOperation.predicateLessThan(target);
+    }
     int choice = random.nextInt(5);
     if (choice == 0) {
       return KvPredicateOperation.predicateTrue();
@@ -147,8 +229,10 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
       case "zipf":
         index = zipfIndex(random, size);
         break;
+      case "hotspot":
+        index = hotspotIndex(random, size);
+        break;
       case "exponential":
-      default:
         index =
             (int)
                 Math.floor(
@@ -161,24 +245,41 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
           index = size - 1;
         }
         break;
+      default:
+        throw new IllegalStateException("unsupported key distribution: " + keyDist);
     }
     return activeKeys.get(index);
   }
 
   private int zipfIndex(Random random, int size) {
+    int index = Arrays.binarySearch(zipfCdf, random.nextDouble());
+    if (index < 0) {
+      index = -index - 1;
+    }
+    return Math.min(index, size - 1);
+  }
+
+  private int hotspotIndex(Random random, int size) {
+    int hotSize = Math.max(1, (int) Math.ceil(size * 0.2));
+    if (hotSize >= size || random.nextDouble() < 0.8) {
+      return random.nextInt(hotSize);
+    }
+    return hotSize + random.nextInt(size - hotSize);
+  }
+
+  private double[] buildZipfCdf(int size) {
+    double[] cdf = new double[size];
     double normalizer = 0.0;
     for (int i = 1; i <= size; i++) {
       normalizer += 1.0 / Math.pow(i, keyDistBase);
     }
-    double sample = random.nextDouble() * normalizer;
     double cumulative = 0.0;
     for (int i = 1; i <= size; i++) {
       cumulative += 1.0 / Math.pow(i, keyDistBase);
-      if (sample <= cumulative) {
-        return i - 1;
-      }
+      cdf[i - 1] = cumulative / normalizer;
     }
-    return size - 1;
+    cdf[size - 1] = 1.0;
+    return cdf;
   }
 
   private void rotateKey(long key) {

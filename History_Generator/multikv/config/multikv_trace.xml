@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<!--
+  Copy this file to multikv/.runtime and replace the PostgreSQL connection
+  placeholders. Do not commit a password.
+-->
+<parameters>
+    <type>POSTGRES</type>
+    <driver>org.postgresql.Driver</driver>
+    <url>jdbc:postgresql://127.0.0.1:5432/REPLACE_MULTIKV_DATABASE?sslmode=disable&amp;ApplicationName=benchbase-multikv-ser-trace&amp;reWriteBatchedInserts=true</url>
+    <username>REPLACE_MULTIKV_USER</username>
+    <password>REPLACE_WITH_LOCAL_SECRET</password>
+    <reconnectOnConnectionFailure>true</reconnectOnConnectionFailure>
+    <isolation>TRANSACTION_REPEATABLE_READ</isolation>
+    <batchsize>128</batchsize>
+
+    <keyDist>exponential</keyDist>
+    <keyDistBase>2.0</keyDistBase>
+    <minTxnLength>1</minTxnLength>
+    <maxTxnLength>4</maxTxnLength>
+
+    <multiKvAnomaly>write-skew</multiKvAnomaly>
+    <multiKvAnomalyDelayMs>250</multiKvAnomalyDelayMs>
+    <multiKvTransactionCount>100</multiKvTransactionCount>
+
+    <terminals>2</terminals>
+    <works>
+        <work>
+            <time>5</time>
+            <rate>100</rate>
+            <weights>100</weights>
+        </work>
+    </works>
+    <transactiontypes>
+        <transactiontype><name>Txn</name></transactiontype>
+    </transactiontypes>
+</parameters>

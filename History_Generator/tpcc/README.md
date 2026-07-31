@@ -385,7 +385,7 @@ tpcc/run_tpcc_trace.sh
 最终得到：
 
 ```text
-PolySIHistories/tpcc/<case>/hist-00000/
+predicateHistories/tpcc/<case>/hist-00000/
   initial_state.json
   history.prhist.jsonl
   manifest.json

@@ -29,8 +29,33 @@ fi
 
 BUILD=${BUILD:-true}
 LOAD=${LOAD:-true}
+KV_PREDICATE_ANOMALY=${KV_PREDICATE_ANOMALY:-}
 EXPECTED_VERDICT=${EXPECTED_VERDICT:-}
 SERIAL_ORDER=${SERIAL_ORDER:-}
+ISOLATION=${ISOLATION:-}
+TXNS_PER_SESSION=${TXNS_PER_SESSION:-}
+PREDICATE_READ_RATIO=${PREDICATE_READ_RATIO:-}
+
+case "$KV_PREDICATE_ANOMALY" in
+  ""|none|write-skew|lost-update) ;;
+  *)
+    echo "KV_PREDICATE_ANOMALY must be none, write-skew, or lost-update" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$KV_PREDICATE_ANOMALY" == "lost-update" ]]; then
+  ISOLATION=${ISOLATION:-TRANSACTION_READ_COMMITTED}
+  if [[ "$ISOLATION" != "TRANSACTION_READ_COMMITTED" ]]; then
+    echo "KV_PREDICATE_ANOMALY=lost-update requires ISOLATION=TRANSACTION_READ_COMMITTED" >&2
+    exit 2
+  fi
+fi
+
+if [[ -n "$TXNS_PER_SESSION" && ! "$TXNS_PER_SESSION" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TXNS_PER_SESSION must be a positive integer" >&2
+  exit 2
+fi
 
 if [[ -z "$BASE_CONFIG" ]]; then
   if [[ -f "$KVPREDICATE_DIR/.runtime/kvpredicate_trace.xml" ]]; then
@@ -63,6 +88,10 @@ export DB_PORT
 export DB_NAME
 export DB_USER
 export DB_PASSWORD
+export KV_PREDICATE_ANOMALY
+export ISOLATION
+export TXNS_PER_SESSION
+export PREDICATE_READ_RATIO
 
 python3 - "$BASE_CONFIG" "$KVPREDICATE_CONFIG" <<'PY'
 import os
@@ -100,6 +129,8 @@ overrides = {
     "maxTxnLength": "MAX_TXN_LENGTH",
     "maxWritesPerKey": "MAX_WRITES_PER_KEY",
     "predicateGroupCount": "PREDICATE_GROUP_COUNT",
+    "transactionsPerSession": "TXNS_PER_SESSION",
+    "predicateReadRatio": "PREDICATE_READ_RATIO",
     "mopDelayMs": "MOP_DELAY_MS",
     "kvPredicateAnomaly": "KV_PREDICATE_ANOMALY",
     "kvPredicateAnomalyDelayMs": "KV_PREDICATE_ANOMALY_DELAY_MS",
@@ -153,7 +184,36 @@ fi
 
 "$KVPREDICATE_DIR/run_kvpredicate_trace.sh" "${run_args[@]}"
 
-case_dir="$REPO_ROOT/PolySIHistories/kvpredicate/$CASE_NAME/hist-00000"
+case_dir="$REPO_ROOT/predicateHistories/kvpredicate/$CASE_NAME/hist-00000"
+
+python3 - "$KVPREDICATE_CONFIG" "$case_dir/history.prhist.jsonl" <<'PY'
+import collections
+import json
+import sys
+import xml.etree.ElementTree as ET
+
+config_path, history_path = sys.argv[1], sys.argv[2]
+root = ET.parse(config_path).getroot()
+transactions_per_session = int(root.findtext("transactionsPerSession", "0"))
+if transactions_per_session > 0:
+    terminals = int(root.findtext("terminals"))
+    counts = collections.Counter()
+    with open(history_path, encoding="utf-8") as history_file:
+        for line in history_file:
+            if line.strip():
+                transaction = json.loads(line)
+                counts[int(transaction["session"])] += 1
+    expected = {session: transactions_per_session for session in range(terminals)}
+    if dict(sorted(counts.items())) != expected:
+        raise SystemExit(
+            "transactions/session mismatch: "
+            f"expected={expected}, actual={dict(sorted(counts.items()))}"
+        )
+    print(
+        "transactions/session validated: "
+        f"sessions={terminals}, transactions_per_session={transactions_per_session}"
+    )
+PY
 
 echo "Runtime config: $KVPREDICATE_CONFIG"
 echo "PRHIST case: $case_dir"

@@ -217,8 +217,10 @@ public abstract class Worker<T extends BenchmarkModule> implements Runnable {
       if (preState == State.DONE) {
         if (!seenDone) {
           // This is the first time we have observed that the
-          // test is done notify the global test state, then
-          // continue applying load
+          // test is done. Let workloads with an exact transaction
+          // quota complete missing work before notifying the global
+          // test state.
+          completePendingWork();
           seenDone = true;
           workloadState.signalDone();
           break;
@@ -264,6 +266,10 @@ public abstract class Worker<T extends BenchmarkModule> implements Runnable {
           getTransactionType(pieceOfWork, prePhase, preState, workloadState);
 
       if (!transactionType.equals(TransactionType.INVALID)) {
+        if (!shouldExecuteWork(transactionType)) {
+          workloadState.finishedWork();
+          continue;
+        }
 
         // TODO: Measuring latency when not rate limited is ... a little
         // weird because if you add more simultaneous clients, you will
@@ -403,7 +409,9 @@ public abstract class Worker<T extends BenchmarkModule> implements Runnable {
       int retryCount = 0;
       int maxRetryCount = configuration.getMaxRetries();
 
-      while (retryCount < maxRetryCount && this.workloadState.getGlobalState() != State.DONE) {
+      while (retryCount < maxRetryCount
+          && (this.workloadState.getGlobalState() != State.DONE
+              || shouldExecuteWorkAfterDone(transactionType))) {
 
         TransactionStatus status = TransactionStatus.UNKNOWN;
 
@@ -726,8 +734,8 @@ public abstract class Worker<T extends BenchmarkModule> implements Runnable {
     // ------------------
     // POSTGRES: https://www.postgresql.org/docs/current/errcodes-appendix.html
     // ------------------
-    // Postgres serialization_failure
-    return errorCode == 0 && sqlState.equals("40001");
+    // Postgres serialization_failure or deadlock_detected
+    return errorCode == 0 && (sqlState.equals("40001") || sqlState.equals("40P01"));
   }
 
   /**
@@ -788,6 +796,19 @@ public abstract class Worker<T extends BenchmarkModule> implements Runnable {
    */
   protected void afterTransactionAbort(
       Connection conn, TransactionType txnType, TransactionStatus status) {}
+
+  /** Optional hook for a workload to stop a worker before opening another transaction. */
+  protected boolean shouldExecuteWork(TransactionType txnType) {
+    return true;
+  }
+
+  /** Optional hook for exact-quota workloads to finish missing work after the timed phase. */
+  protected void completePendingWork() {}
+
+  /** Whether a retry may continue after the timed phase has ended. */
+  protected boolean shouldExecuteWorkAfterDone(TransactionType txnType) {
+    return false;
+  }
 
   /** Called at the end of the test to do any clean up that may be required. */
   public void tearDown() {

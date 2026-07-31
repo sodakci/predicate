@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# Generate one real PostgreSQL multikv history case with parameter overrides.
+set -euo pipefail
+
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPO_ROOT=$(cd -- "$ROOT_DIR/.." && pwd)
+MULTIKV_DIR="$ROOT_DIR/multikv"
+BENCHBASE_SRC="$ROOT_DIR/benchbase"
+
+today=$(date +%Y%m%d)
+CASE_NAME=${CASE_NAME:-multikv_repeatable_read_write_skew_${today}}
+BASE_CONFIG=${BASE_CONFIG:-}
+MULTIKV_CONFIG=${MULTIKV_CONFIG:-"$MULTIKV_DIR/.runtime/${CASE_NAME}.xml"}
+BENCHBASE_JAR=${BENCHBASE_JAR:-"$BENCHBASE_SRC/target/benchbase-postgres/benchbase-postgres/benchbase.jar"}
+JAVA_ENV=${JAVA_ENV:-"$ROOT_DIR/.tools/java23.env"}
+REQUESTED_PGPASSFILE=${PGPASSFILE:-}
+
+DB_HOST=${DB_HOST:-127.0.0.1}
+DB_PORT=${DB_PORT:-5432}
+DB_NAME=${DB_NAME:-multikv_trace_benchbase}
+DB_USER=${DB_USER:-multikv_user}
+DB_PASSWORD=${DB_PASSWORD:-}
+MULTIKV_DSN=${MULTIKV_DSN:-postgresql://$DB_USER@$DB_HOST:$DB_PORT/$DB_NAME}
+if [[ -z "$REQUESTED_PGPASSFILE" && -n "$DB_PASSWORD" ]]; then
+  PGPASSFILE="$MULTIKV_DIR/.runtime/${CASE_NAME}.pgpass"
+else
+  PGPASSFILE=${REQUESTED_PGPASSFILE:-"$MULTIKV_DIR/.runtime/pgpass"}
+fi
+
+BUILD=${BUILD:-true}
+LOAD=${LOAD:-true}
+MULTIKV_ANOMALY=${MULTIKV_ANOMALY:-write-skew}
+MULTIKV_TRANSACTION_COUNT=${MULTIKV_TRANSACTION_COUNT:-100}
+EXPECTED_VERDICT=${EXPECTED_VERDICT:-}
+SERIAL_ORDER=${SERIAL_ORDER:-}
+ISOLATION=${ISOLATION:-}
+
+if [[ "$MULTIKV_ANOMALY" == "lost-update" ]]; then
+  ISOLATION=${ISOLATION:-TRANSACTION_READ_COMMITTED}
+  if [[ "$ISOLATION" != "TRANSACTION_READ_COMMITTED" ]]; then
+    echo "MULTIKV_ANOMALY=lost-update requires ISOLATION=TRANSACTION_READ_COMMITTED" >&2
+    exit 2
+  fi
+fi
+
+if [[ -z "$BASE_CONFIG" ]]; then
+  if [[ -f "$MULTIKV_DIR/.runtime/multikv_trace.xml" ]]; then
+    BASE_CONFIG="$MULTIKV_DIR/.runtime/multikv_trace.xml"
+  else
+    BASE_CONFIG="$MULTIKV_DIR/config/multikv_trace.xml"
+  fi
+fi
+
+if [[ -f "$JAVA_ENV" ]]; then
+  # shellcheck disable=SC1090
+  source "$JAVA_ENV"
+fi
+
+if [[ -z "$REQUESTED_PGPASSFILE" && -n "$DB_PASSWORD" ]]; then
+  PGPASSFILE="$MULTIKV_DIR/.runtime/${CASE_NAME}.pgpass"
+else
+  PGPASSFILE=${REQUESTED_PGPASSFILE:-"$MULTIKV_DIR/.runtime/pgpass"}
+fi
+
+mkdir -p "$(dirname -- "$MULTIKV_CONFIG")"
+
+if [[ -n "$DB_PASSWORD" ]]; then
+  printf '%s:%s:%s:%s:%s\n' "$DB_HOST" "$DB_PORT" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" > "$PGPASSFILE"
+  chmod 600 "$PGPASSFILE"
+fi
+
+export DB_HOST
+export DB_PORT
+export DB_NAME
+export DB_USER
+export DB_PASSWORD
+export MULTIKV_ANOMALY
+export MULTIKV_TRANSACTION_COUNT
+export ISOLATION
+
+python3 - "$BASE_CONFIG" "$MULTIKV_CONFIG" <<'PY'
+import os
+import sys
+import xml.etree.ElementTree as ET
+
+base_config, out_config = sys.argv[1], sys.argv[2]
+tree = ET.parse(base_config)
+root = tree.getroot()
+
+
+def ensure(path):
+    element = root
+    for part in path.split("/"):
+        child = element.find(part)
+        if child is None:
+            child = ET.SubElement(element, part)
+        element = child
+    return element
+
+
+def set_text(path, env_name):
+    value = os.environ.get(env_name)
+    if value is not None and value != "":
+        ensure(path).text = value
+
+
+overrides = {
+    "isolation": "ISOLATION",
+    "keyDist": "KEY_DIST",
+    "keyDistBase": "KEY_DIST_BASE",
+    "minTxnLength": "MIN_TXN_LENGTH",
+    "maxTxnLength": "MAX_TXN_LENGTH",
+    "multiKvAnomaly": "MULTIKV_ANOMALY",
+    "multiKvAnomalyDelayMs": "MULTIKV_ANOMALY_DELAY_MS",
+    "multiKvTransactionCount": "MULTIKV_TRANSACTION_COUNT",
+    "terminals": "TERMINALS",
+    "works/work/time": "TIME_SECONDS",
+    "works/work/rate": "RATE",
+}
+for path, env_name in overrides.items():
+    set_text(path, env_name)
+
+if os.environ.get("DB_HOST") or os.environ.get("DB_NAME") or os.environ.get("DB_USER"):
+    host = os.environ.get("DB_HOST", "127.0.0.1")
+    port = os.environ.get("DB_PORT", "5432")
+    name = os.environ.get("DB_NAME", "multikv_trace_benchbase")
+    user = os.environ.get("DB_USER", "multikv_user")
+    ensure("url").text = (
+        f"jdbc:postgresql://{host}:{port}/{name}"
+        "?sslmode=disable&ApplicationName=benchbase-multikv-ser-trace"
+        "&reWriteBatchedInserts=true"
+    )
+    ensure("username").text = user
+    set_text("password", "DB_PASSWORD")
+
+tree.write(out_config, encoding="utf-8", xml_declaration=True)
+PY
+chmod 600 "$MULTIKV_CONFIG"
+
+if [[ "$BUILD" == "true" || ! -f "$BENCHBASE_JAR" ]]; then
+  (
+    cd "$BENCHBASE_SRC"
+    ./mvnw -q -DskipTests -Dfmt.skip=true -Dmaven.gitcommitid.skip=true \
+      -Ddescriptors=src/main/assembly/dir.xml -P postgres package
+    if [[ -f target/benchbase-postgres.zip ]]; then
+      unzip -oq target/benchbase-postgres.zip -d target
+    fi
+  )
+fi
+
+export BENCHBASE_JAR
+export MULTIKV_DSN
+export MULTIKV_CONFIG
+export CASE_NAME
+export PGPASSFILE
+export EXPECTED_VERDICT
+export SERIAL_ORDER
+export MULTIKV_TRANSACTION_COUNT
+
+run_args=()
+if [[ "$LOAD" == "true" ]]; then
+  run_args+=(--load)
+fi
+"$MULTIKV_DIR/run_multikv_trace.sh" "${run_args[@]}"
+
+case_dir="$REPO_ROOT/predicateHistories/multikv/$CASE_NAME/hist-00000"
+echo "Runtime config: $MULTIKV_CONFIG"
+echo "PRHIST case: $case_dir"

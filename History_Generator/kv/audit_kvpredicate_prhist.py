@@ -9,10 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from kvpredicate_trace_to_prhist import ConversionError, load_jsonl, validate_structure
+from kvpredicate_trace_to_prhist import ConversionError, iter_jsonl, validate_structure
 
 
-def load_case(case_dir: Path) -> tuple[list[dict], list[dict], dict]:
+def load_case(case_dir: Path) -> tuple[list[dict], Path, dict]:
     initial_path = case_dir / "initial_state.json"
     history_path = case_dir / "history.prhist.jsonl"
     manifest_path = case_dir / "manifest.json"
@@ -21,28 +21,31 @@ def load_case(case_dir: Path) -> tuple[list[dict], list[dict], dict]:
     initial = json.loads(initial_path.read_text(encoding="utf-8"))
     if not isinstance(initial, list):
         raise ConversionError(f"{initial_path}: expected JSON array")
-    transactions = load_jsonl(history_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
-    return initial, transactions, manifest
+    return initial, history_path, manifest
 
 
 def audit(case_dir: Path) -> dict:
-    initial, transactions, manifest = load_case(case_dir)
-    stats = validate_structure(initial, transactions)
+    initial, history_path, manifest = load_case(case_dir)
+    stats = validate_structure(initial, iter_jsonl(history_path))
     raw_path = case_dir / "raw_kvpredicate_trace.jsonl"
     if raw_path.is_file():
-        raw_rows = load_jsonl(raw_path)
-        raw_txns = [row for row in raw_rows if row.get("record_type") == "txn"]
-        if len(raw_txns) != stats["transactions"]:
+        raw_txn_count = 0
+        raw_initial_count = 0
+        for row in iter_jsonl(raw_path):
+            if row.get("record_type") == "txn":
+                raw_txn_count += 1
+            elif row.get("record_type") == "initial":
+                raw_initial_count += 1
+        if raw_txn_count != stats["transactions"]:
             raise ConversionError(
-                f"raw trace transaction count {len(raw_txns)} != PRHIST transaction count {stats['transactions']}"
+                f"raw trace transaction count {raw_txn_count} != PRHIST transaction count {stats['transactions']}"
             )
-        raw_initial = [row for row in raw_rows if row.get("record_type") == "initial"]
         absent_initial = [row for row in initial if row.get("absent")]
-        if len(raw_initial) + len(absent_initial) != stats["initial_keys"]:
+        if raw_initial_count + len(absent_initial) != stats["initial_keys"]:
             raise ConversionError(
                 "raw trace initial count plus virtual absent versions "
-                f"{len(raw_initial)}+{len(absent_initial)} != PRHIST initial count {stats['initial_keys']}"
+                f"{raw_initial_count}+{len(absent_initial)} != PRHIST initial count {stats['initial_keys']}"
             )
     if manifest and manifest.get("format") not in {"prhist-v2", "prhist-v2-kv-relational-predicate"}:
         raise ConversionError(f"{case_dir}/manifest.json: unexpected format {manifest.get('format')!r}")

@@ -8,6 +8,7 @@
     <plugin name="twitter">com.oltpbenchmark.benchmarks.twitter.TwitterBenchmark</plugin>
     <plugin name="epinions">com.oltpbenchmark.benchmarks.epinions.EpinionsBenchmark</plugin>
     <plugin name="kvpredicate">com.oltpbenchmark.benchmarks.kvpredicate.KvPredicateBenchmark</plugin>
+    <plugin name="multikv">com.oltpbenchmark.benchmarks.multikv.MultiKvBenchmark</plugin>
     <plugin name="seats">com.oltpbenchmark.benchmarks.seats.SEATSBenchmark</plugin>
     <plugin name="auctionmark">com.oltpbenchmark.benchmarks.auctionmark.AuctionMarkBenchmark</plugin>
     <plugin name="chbenchmark">com.oltpbenchmark.benchmarks.chbenchmark.CHBenCHmark</plugin>

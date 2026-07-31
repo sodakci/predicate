@@ -8,7 +8,7 @@ import json
 import shutil
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 ABSENT_BASE = -1_000_000_000_000
 SOURCE_FIELDS = frozenset({"source_write_id", "source_txn", "source_op_index"})
@@ -18,8 +18,7 @@ class ConversionError(ValueError):
     """Raised when evidence cannot honestly be represented as PRHIST."""
 
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
         for lineno, line in enumerate(handle, 1):
             if not line.strip():
@@ -30,8 +29,11 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise ConversionError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
             if not isinstance(row, dict):
                 raise ConversionError(f"{path}:{lineno}: expected JSON object")
-            rows.append(row)
-    return rows
+            yield row
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    return list(iter_jsonl(path))
 
 
 def require_int(value: Any, context: str) -> int:
@@ -118,6 +120,8 @@ def predicate_row(row: dict[str, Any], context: str) -> dict[str, Any]:
         raise ConversionError(f"{context}.predicate: expected object")
     if not isinstance(results, list):
         raise ConversionError(f"{context}.results: expected list")
+    if read_versions is None:
+        read_versions = results
     if not isinstance(read_versions, list):
         raise ConversionError(f"{context}.read_versions: expected list captured at predicate read time")
     values = []
@@ -222,11 +226,26 @@ def validate_structure(initial: Iterable[dict[str, Any]], transactions: Iterable
             raise ConversionError(f"duplicate initial version {version}")
         known_versions[version] = require_text(item.get("key"), f"initial[{index}].key")
 
-    txn_list = list(transactions)
     operation_counts: Counter[str] = Counter()
     seen_txns: set[int] = set()
     last_session_seq: dict[int, int] = {}
-    for row_index, txn in enumerate(txn_list):
+    unresolved_reads: dict[int, tuple[str, str]] = {}
+    transaction_count = 0
+
+    def check_read(reference: dict[str, Any], context: str) -> None:
+        version = require_int(reference.get("value"), f"{context}.value")
+        key = require_text(reference.get("key"), f"{context}.key")
+        expected = known_versions.get(version)
+        if expected is None:
+            previous = unresolved_reads.get(version)
+            if previous is not None and previous[0] != key:
+                raise ConversionError(f"{context}: unresolved version {version} disagrees on key")
+            unresolved_reads.setdefault(version, (key, context))
+        elif key != expected:
+            raise ConversionError(f"{context}: version {version} disagrees on key")
+
+    for row_index, txn in enumerate(transactions):
+        transaction_count += 1
         txn_id = require_int(txn.get("txn"), f"transactions[{row_index}].txn")
         if txn_id in seen_txns:
             raise ConversionError(f"duplicate transaction id {txn_id}")
@@ -246,27 +265,27 @@ def validate_structure(initial: Iterable[dict[str, Any]], transactions: Iterable
                 version = require_int(op.get("value"), f"txn={txn_id}.ops[{op_index}].value")
                 if version in known_versions:
                     raise ConversionError(f"txn={txn_id}.ops[{op_index}]: duplicate version {version}")
-                known_versions[version] = require_text(op.get("key"), f"txn={txn_id}.ops[{op_index}].key")
-
-    def check_read(reference: dict[str, Any], context: str) -> None:
-        version = require_int(reference.get("value"), f"{context}.value")
-        expected = known_versions.get(version)
-        if expected is None:
-            raise ConversionError(f"{context}: unresolved version {version}")
-        if require_text(reference.get("key"), f"{context}.key") != expected:
-            raise ConversionError(f"{context}: version {version} disagrees on key")
-
-    for txn in txn_list:
-        for op_index, op in enumerate(txn["ops"]):
-            context = f"txn={txn['txn']}.ops[{op_index}]"
-            if op["type"] == "r":
-                check_read(op, context)
-            elif op["type"] == "pr":
+                key = require_text(op.get("key"), f"txn={txn_id}.ops[{op_index}].key")
+                unresolved = unresolved_reads.pop(version, None)
+                if unresolved is not None and unresolved[0] != key:
+                    raise ConversionError(f"{unresolved[1]}: version {version} disagrees on key")
+                known_versions[version] = key
+            if op.get("type") == "r":
+                check_read(op, f"txn={txn_id}.ops[{op_index}]")
+            elif op.get("type") == "pr":
                 for read_index, reference in enumerate(op["result"]["inputs"]):
-                    check_read(reference, f"{context}.result.inputs[{read_index}]")
+                    check_read(
+                        reference,
+                        f"txn={txn_id}.ops[{op_index}].result.inputs[{read_index}]",
+                    )
+
+    if unresolved_reads:
+        version, (_, context) = next(iter(unresolved_reads.items()))
+        raise ConversionError(f"{context}: unresolved version {version}")
+
     return {
         "initial_keys": len(initial_list),
-        "transactions": len(txn_list),
+        "transactions": transaction_count,
         "point_reads": operation_counts["r"],
         "predicate_reads": operation_counts["pr"],
         "writes": operation_counts["w"],
@@ -280,37 +299,87 @@ def convert(
     expected_verdict: str | None = None,
     serial_order: list[int] | None = None,
 ) -> dict[str, Any]:
-    rows = load_jsonl(raw_path)
-    raw_initial = [row for row in rows if row.get("record_type") == "initial"]
-    raw_txns = [row for row in rows if row.get("record_type") == "txn"]
-    raw_aborts = [row for row in rows if row.get("record_type") == "abort"]
-    unknown = [row.get("record_type") for row in rows if row.get("record_type") not in {"initial", "txn", "abort"}]
-    if unknown:
-        raise ConversionError(f"unknown raw trace record types: {unknown[:3]!r}")
-    if not raw_initial:
-        raise ConversionError("raw trace has no initial versions; run snapshot_initial_state before execute")
-
     initial: list[dict[str, Any]] = []
-    for index, row in enumerate(raw_initial):
-        reject_source_fields(row, f"raw.initial[{index}]")
-        initial.append({
-            "key": require_text(row.get("key"), f"raw.initial[{index}].key"),
-            "value": require_int(row.get("value"), f"raw.initial[{index}].value"),
-        })
-    initial.extend(collect_absent_initials(raw_txns).values())
-
-    transactions = [convert_transaction(row, f"raw.txn[{index}]") for index, row in enumerate(raw_txns)]
-    transactions.sort(key=lambda row: (row["session"], row["session_seq"], row["txn"]))
-    initial.sort(key=lambda row: row["key"])
-    stats = validate_structure(initial, transactions)
-
     case_dir.mkdir(parents=True, exist_ok=True)
     initial_path = case_dir / "initial_state.json"
     history_path = case_dir / "history.prhist.jsonl"
-    initial_path.write_text(json.dumps(initial, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    with history_path.open("w", encoding="utf-8") as handle:
-        for transaction in transactions:
-            handle.write(json.dumps(transaction, sort_keys=True, separators=(",", ":")) + "\n")
+    history_tmp_path = case_dir / "history.prhist.jsonl.tmp"
+    absent_initials: dict[str, dict[str, Any]] = {}
+    transaction_ids: set[int] = set()
+    initial_count = 0
+    transaction_count = 0
+    abort_count = 0
+    section = 0
+    previous_transaction_order: tuple[int, int, int] | None = None
+    try:
+        with history_tmp_path.open("w", encoding="utf-8") as history_handle:
+            for row in iter_jsonl(raw_path):
+                record_type = row.get("record_type")
+                if record_type == "initial":
+                    if section > 0:
+                        raise ConversionError("raw trace initial rows must precede transactions")
+                    context = f"raw.initial[{initial_count}]"
+                    reject_source_fields(row, context)
+                    initial.append({
+                        "key": require_text(row.get("key"), f"{context}.key"),
+                        "value": require_int(row.get("value"), f"{context}.value"),
+                    })
+                    initial_count += 1
+                elif record_type == "txn":
+                    if not initial:
+                        raise ConversionError(
+                            "raw trace has no initial versions; run snapshot_initial_state before execute"
+                        )
+                    if section > 1:
+                        raise ConversionError("raw trace transactions must precede abort rows")
+                    section = 1
+                    transaction = convert_transaction(row, f"raw.txn[{transaction_count}]")
+                    transaction_order = (
+                        transaction["session"],
+                        transaction["session_seq"],
+                        transaction["txn"],
+                    )
+                    if (
+                        previous_transaction_order is not None
+                        and transaction_order < previous_transaction_order
+                    ):
+                        raise ConversionError("raw trace transactions are not in session order")
+                    previous_transaction_order = transaction_order
+                    transaction_ids.add(transaction["txn"])
+                    raw_ops = row.get("ops")
+                    if isinstance(raw_ops, list):
+                        for op_index, op in enumerate(raw_ops):
+                            if not isinstance(op, dict) or op.get("type") != "r":
+                                continue
+                            absent = absent_initial_from_read(
+                                op, f"raw.txn[{transaction_count}].ops[{op_index}]"
+                            )
+                            if absent is not None:
+                                absent_initials.setdefault(absent["key"], absent)
+                    history_handle.write(
+                        json.dumps(transaction, sort_keys=True, separators=(",", ":")) + "\n"
+                    )
+                    transaction_count += 1
+                elif record_type == "abort":
+                    section = 2
+                    abort_count += 1
+                else:
+                    raise ConversionError(f"unknown raw trace record type: {record_type!r}")
+
+        if not initial:
+            raise ConversionError(
+                "raw trace has no initial versions; run snapshot_initial_state before execute"
+            )
+        initial.extend(absent_initials.values())
+        initial.sort(key=lambda row: row["key"])
+        stats = validate_structure(initial, iter_jsonl(history_tmp_path))
+        initial_path.write_text(
+            json.dumps(initial, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        history_tmp_path.replace(history_path)
+    except Exception:
+        history_tmp_path.unlink(missing_ok=True)
+        raise
 
     raw_destination = case_dir / "raw_kvpredicate_trace.jsonl"
     if raw_path.resolve() != raw_destination.resolve():
@@ -328,7 +397,7 @@ def convert(
         },
         "predicate_mapping": "Predicate reads emit SQL-shaped kv predicates: TRUE, value equality, value modulo, value greater-than, and value less-than.",
         "version_mapping": "kv.value is globally unique and is used as both business value and PRHIST version id.",
-        "captured_aborted_attempts": len(raw_aborts),
+        "captured_aborted_attempts": abort_count,
         **stats,
     }
     if expected_verdict is not None:
@@ -336,7 +405,6 @@ def convert(
         if expected_verdict.upper() == "ACCEPT":
             if serial_order is None:
                 raise ConversionError("ACCEPT manifest requires an externally verified --serial-order; it is never inferred")
-            transaction_ids = {transaction["txn"] for transaction in transactions}
             if set(serial_order) != transaction_ids or len(serial_order) != len(transaction_ids):
                 raise ConversionError("--serial-order must contain every generated transaction exactly once")
             manifest["serial_order"] = serial_order

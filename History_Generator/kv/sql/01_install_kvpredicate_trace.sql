@@ -103,6 +103,10 @@ ALTER TABLE ser_kvpredicate_trace.trace_op
 
 CREATE INDEX IF NOT EXISTS kvpredicate_trace_op_xid_index
     ON ser_kvpredicate_trace.trace_op (xid, op_index);
+CREATE INDEX IF NOT EXISTS kvpredicate_trace_txn_session_index
+    ON ser_kvpredicate_trace.trace_txn (session_id, session_seq, xid);
+CREATE INDEX IF NOT EXISTS kvpredicate_trace_abort_session_index
+    ON ser_kvpredicate_trace.trace_abort (session_id, session_seq, xid);
 CREATE INDEX IF NOT EXISTS kvpredicate_row_version_semantic_index
     ON ser_kvpredicate_trace.row_version (semantic);
 
@@ -371,12 +375,10 @@ BEGIN
        OR (p_kind = 'lt' AND semantic < p_target);
 
     INSERT INTO ser_kvpredicate_trace.trace_op
-        (xid, op_index, op_type, predicate, results, read_versions, sql_text,
-         parameters, raw_result)
+        (xid, op_index, op_type, predicate, results, sql_text, parameters)
     VALUES
-        (v_xid, v_op_index, 'pr', v_predicate, v_results, v_results,
-         p_sql_text, COALESCE(p_parameters, '[]'::jsonb),
-         jsonb_build_object('returned_rows', COALESCE(p_returned, '[]'::jsonb)));
+        (v_xid, v_op_index, 'pr', v_predicate, v_results,
+         p_sql_text, COALESCE(p_parameters, '[]'::jsonb));
     UPDATE ser_kvpredicate_trace.trace_txn SET last_op_ts = clock_timestamp() WHERE xid = v_xid;
 END;
 $$;
@@ -386,12 +388,13 @@ RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    DELETE FROM ser_kvpredicate_trace.trace_op;
-    DELETE FROM ser_kvpredicate_trace.trace_txn;
-    DELETE FROM ser_kvpredicate_trace.trace_abort;
-    DELETE FROM ser_kvpredicate_trace.write_version;
-    DELETE FROM ser_kvpredicate_trace.initial_version;
-    DELETE FROM ser_kvpredicate_trace.row_version;
+    TRUNCATE TABLE
+        ser_kvpredicate_trace.trace_op,
+        ser_kvpredicate_trace.trace_txn,
+        ser_kvpredicate_trace.trace_abort,
+        ser_kvpredicate_trace.write_version,
+        ser_kvpredicate_trace.initial_version,
+        ser_kvpredicate_trace.row_version;
 
     WITH kv_rows AS (
         SELECT to_jsonb(t) AS row_data FROM public.kv AS t
