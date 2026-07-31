@@ -136,17 +136,28 @@ txn     = -1
 }
 ```
 
-当前 `PredicateHistoryLoader` 支持一条 `where` 条件，条件作用于编码后的 `value`：
+当前 `PredicateHistoryLoader` 把结构化 `query` 编译为 `QueryPlan`：
 
 ```text
-TRUE
-value = n
-value % m = r
-value > n
-value < n
+from
+    一个必填 relation，可带 alias。
+
+joins
+    零个或多个 INNER JOIN，每个 join 带 on 条件。
+
+where
+    可选条件数组，数组元素按 AND 连接。
+
+select.columns
+    一个或多个字段路径或带 AS 的表达式。
+
+select.distinct
+    可选布尔值，默认 false。
 ```
 
-`result.inputs` 是本次谓词读实际观察到的版本集合。检测器用这些 `(key,value)` 找到对应 source write，并在 SAT 中约束每个 key 的快照 frontier 为什么进入或没有进入谓词结果。
+表达式支持字段路径、整数/字符串/布尔/null 字面量、`=`、`>`、`<`、`%`、`AND` 和括号。单表 KV 条件是该结构化查询的简单子集；多关系对象值可以使用 `alias.value.field` 访问。
+
+`result.inputs` 是查询结果实际依赖的可见版本集合，检测器用这些 `(key,value)` 找到 source write；`result.values` 保存投影后的业务结果并按多重集匹配。结构化值支持相等性，`<`、`>` 只接受可排序的标量。
 
 ## 核心概念
 
@@ -217,6 +228,13 @@ PR_RW(S, U, x)
 ```
 
 当前主求解路径不会把所有 PR_WR / PR_RW 预先物化成固定边再求解，而是在 `SISolverInduced` 中直接编码 predicate frontier。`--compare-derived-predicate-edges` 只用于诊断对比。
+
+谓词 observation 还按 key 区分：
+
+- `EXTERNAL`：需要在事务快照中选择外部 latest-visible frontier。
+- `INTERNAL`：由当前谓词事件之前的同事务本地写或已有内部观察决定；固定内部值直接进入查询快照，不再创建外部 frontier。
+
+求解器按 SAT 模型选择各 key 的 frontier，构造完整可见快照并执行 `QueryPlan`。如果 JOIN、投影、重复行、遗漏行或 `DISTINCT` 结果不匹配，便加入阻断当前 frontier 组合的子句后继续求解。结果匹配时，再为会改变完整查询结果的后续写编码 `PR_RW`；固定 recorded-source frontier 同样先比较 source 写与后续写的规范化谓词结果，仅在结果发生变化时施加对应可见性约束。
 
 ### Dependency Graph
 
@@ -322,6 +340,12 @@ History
 
 `PREDICATE_READ` 不绑定单个 key，而是保存一个谓词求值函数和本次观察到的结果版本集合。
 
+结构化查询的 AST、表达式解析、关系解析、值规范化和结果求值位于：
+
+```text
+src/main/java/history/query/
+```
+
 ### 4. 构造 KnownGraph
 
 文件：
@@ -349,9 +373,6 @@ knownGraphA
 knownGraphB
     放 RW、PR_RW 等 anti-dependency 边。
 
-writesById
-    通过 write_id 查写来源。
-
 writesByKeyValue
     通过 (key,value) 查写来源。
 
@@ -362,7 +383,7 @@ predicateObservations
     每个谓词读及其结果版本来源。
 ```
 
-当前紧凑 PRHIST 主要走 `(key,value)` 唯一解析路径；`write_id/source_write_id` 相关字段保留给更显式的格式扩展。
+当前 SI 生产路径统一使用 `(key,value)` 唯一解析，并拒绝 `write_id/source_write_id` 等 provenance 字段；`Utils` 与 `KnownGraph` 均不再保留按 ID 解析的兼容分支。
 
 ### 5. 生成 SI 约束
 
@@ -376,7 +397,7 @@ src/main/java/verifier/SIEdge.java
 
 主要步骤：
 
-1. `Utils.verifyInternalConsistency(history)` 检查内部一致性。
+1. `Utils.verifyInternalConsistency(history)` 检查内部一致性：相同谓词读在没有新本地写时逐 key 继承；存在本地写时由读前最后一次本地写决定；无本地依据的外部 key 留给 VIS/frontier 求解。
 2. 创建 `KnownGraph`。
 3. `generateConstraintsSI` 生成未定 WW choice 和对应 RW implications。
 4. `Pruning.pruneConstraints` 尝试把会立即造成 induced cycle 的分支剪掉。
@@ -434,31 +455,35 @@ inducedGraph
 
 1. `encodeKnownEdges`：把已知 SO/WR 和 pruning 后固定的 WW/RW 边放入图中。
 2. `encodeWwChoices`：为剩余每个 WW choice 创建 SAT literal，并注册该 key 上的写写顺序。
-3. `encodePredicateConstraints`：为每个谓词读编码 per-key frontier 约束。
+3. `encodePredicateConstraints`：为每个谓词读建立受查询 scope 限定的 per-key frontier 候选。
 4. `encodeInducedComposition`：把 `dep ; anti-dep` 组合成 induced edge。
 5. `solver.assertTrue(inducedGraph.acyclic())`：要求 induced graph 无环。
-6. `solver.solve()`：返回 ACCEPT/REJECT。
+6. `solver.solve()`：读取当前 SAT 模型并构造 latest-visible 快照。
+7. 查询结果不匹配时加入阻断子句并继续求解；匹配时补充该快照对应的谓词依赖。
+8. 没有新的 refinement 后返回 ACCEPT；公式不可满足时返回 REJECT。
 
 ### 8. 谓词约束
 
-谓词约束分两类处理：
+每个谓词读先按 query scope 收集相关 key，再区分：
 
 ```text
-key 出现在 result.inputs 中
-    result 中的 source write 必须是该 key 的 snapshot frontier。
+EXTERNAL 且出现在 result.inputs 中
+    记录的 source write 必须是该 key 的 snapshot frontier。
 
-key 没有出现在 result.inputs 中
-    要么没有可见写，要么最新可见写不满足谓词。
+EXTERNAL 且没有出现在 result.inputs 中
+    由 SAT 模型选择 latest-visible frontier 或无可见写。
+
+INTERNAL
+    使用谓词事件之前的最新本地写或已解析内部 source。
 ```
 
-对于 result 中的 key，solver 会保证：
+选出所有 frontier 后，solver 会：
 
-- source write 的行确实满足 predicate。
-- source write 对 reader 可见。
-- source write 后面的同 key 写如果可见，会导致矛盾。
-- 可能改变谓词结果的后续写会生成受 guard 控制的 PR_RW anti-dependency。
-
-对于 result 外的 key，solver 会在“没有可见写”和“某个不满足 predicate 的最新可见写”之间选择一个可满足 frontier，并排除满足 predicate 的 frontier。
+- 将 frontier 与内部固定版本合成为完整 snapshot。
+- 用 relation resolver 执行 QueryPlan，并将 `result.values` 按多重集比较。
+- 拒绝错误 JOIN、投影、重复结果、遗漏结果和错误 `DISTINCT`。
+- 对会改变完整查询结果的后续写生成受 snapshot guard 控制的 `PR_RW`。
+- 在新增谓词 anti-dependency 时同步补入相关 `dependency ; anti-dependency` induced edge。
 
 ## 关键文件
 
@@ -544,7 +569,7 @@ src/test/java/BlackBoxSIAuditTest.java
 src/test/java/verifier/
 ```
 
-覆盖 loader、基础 verifier、SI 判定、谓词集成、小历史 differential 检查和 CLI 行为。
+覆盖 loader、QueryPlan、基础 verifier、SI 判定、单表谓词、关系 JOIN/投影/`DISTINCT`、遗漏行、结果多重集、小历史 differential 检查和 CLI 行为。
 
 ## 正确性直觉
 
@@ -555,7 +580,7 @@ src/test/java/verifier/
 1. 所有 SO/WR 已知依赖都被放进 dependency graph。
 2. 每个相关 WW choice 都选择了一个方向。
 3. 普通点读的 RW 约束保证读到的是该快照中对应 key 的最新可见版本。
-4. 谓词读的 frontier 约束保证结果集合与每个 key 的快照最新可见写一致。
+4. 谓词读的 frontier 约束与完整 QueryPlan 求值保证输入版本、投影结果和结果多重集一致。
 5. induced graph 包含 dependency edges 以及 `dependency ; anti-dependency` 组合边。
 6. MonoSAT 保证 induced graph 无环。
 
@@ -584,15 +609,16 @@ coalescing 把同一事务对上的重复 choices 合并，因为事务级先后
 当前 detector 的稳定路径是：
 
 ```text
-compact PRHIST + KV value predicates + MonoSAT induced SI solver
+compact PRHIST + structured QueryPlan predicates + MonoSAT induced SI solver
 ```
 
 已明确的边界：
 
 - Java loader 当前只接受 `query/result` 形态的 predicate read。
-- `where` 当前只支持一条作用于 `value` 的简单条件。
+- 支持单表查询和一个或多个 INNER JOIN、表达式、投影、`DISTINCT` 与结果多重集；不接受任意 SQL 文本。
 - 当前紧凑格式依赖 `(key,value)` 写版本唯一性。
-- TPC-C 多表 SQL-shaped predicate 需要 loader 和谓词求值扩展后才能被完整验证。
+- value 不接受 null、数组和非整数数字；结果投影可以是结构化 JSON，但结构化值只支持相等性。
+- TPC-C 多表 SQL-shaped predicate 必须先转换为当前结构化 query，才能被完整验证。
 - abort/retry attempt 不进入 `history.prhist.jsonl`；它们应保留在 raw trace 或 manifest 中。
 - `--compare-derived-predicate-edges` 是诊断路径，主求解不依赖其物化边。
 

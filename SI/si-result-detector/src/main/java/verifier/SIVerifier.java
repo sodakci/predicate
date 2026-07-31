@@ -8,6 +8,8 @@ import history.Event;
 import history.History;
 import history.HistoryLoader;
 import history.Transaction;
+import history.query.MapVisibleState;
+import history.query.QueryException;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -1188,7 +1190,25 @@ public class SIVerifier<KeyType, ValueType> {
             KnownGraph.WriteRef<KeyType, ValueType> writeRef,
             Event<KeyType, ValueType> predicateReadEvent) {
         var ev = writeRef.getEvent();
-        return predicateReadEvent.getPredicate()
-                .test(ev.getKey(), ev.getValue());
+        var predicate = predicateReadEvent.getPredicate();
+        var relations = predicate.scope().relations();
+        try {
+            var evaluation = predicate.evaluate(new MapVisibleState<>(
+                    Map.of(ev.getKey(), ev.getValue()), key -> {
+                        var canonical = String.valueOf(key);
+                        var separator = canonical.indexOf(':');
+                        if (separator > 0) {
+                            return canonical.substring(0, separator);
+                        }
+                        if (relations.size() == 1) {
+                            return relations.iterator().next();
+                        }
+                        throw new QueryException(
+                                "cannot resolve relation for key " + key);
+                    }));
+            return evaluation.inputs().containsKey(ev.getKey());
+        } catch (QueryException exception) {
+            return false;
+        }
     }
 }

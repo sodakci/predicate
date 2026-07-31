@@ -7,6 +7,12 @@ import history.Event;
 import history.History;
 import history.HistoryLoader;
 import history.Transaction;
+import history.query.PredicateEvaluator;
+import history.query.QueryEvaluation;
+import history.query.QueryScope;
+import history.query.QueryValue;
+import history.query.ValueAdapter;
+import history.query.VisibleState;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.commons.lang3.tuple.Triple;
 import org.junit.jupiter.api.Test;
@@ -36,7 +42,7 @@ public class SIDetectabilityTest {
             Set<Long> sessions,
             Map<Long, List<Long>> sessionToTxns,
             Map<Long, List<Triple<Event.EventType, String, Integer>>> normalEvents,
-            Map<Long, Pair<Event.PredEval<String, Integer>, List<Event.PredResult<String, Integer>>>> predicateReads) {
+            Map<Long, Pair<PredicateFixtures.RowPredicate<String, Integer>, List<Event.PredResult<String, Integer>>>> predicateReads) {
         var h = new History<>(sessions, sessionToTxns, normalEvents);
         for (var entry : predicateReads.entrySet()) {
             var txn = h.getTransaction(entry.getKey());
@@ -49,6 +55,21 @@ public class SIDetectabilityTest {
 
     private static boolean verifySer(History<String, Integer> h) {
         return new SIVerifier<>(() -> h).audit();
+    }
+
+    private static final class SemanticVersion {
+        private final int semantic;
+        private final int physical;
+
+        private SemanticVersion(int semantic, int physical) {
+            this.semantic = semantic;
+            this.physical = physical;
+        }
+
+        @Override
+        public String toString() {
+            return semantic + "@" + physical;
+        }
     }
 
     private static boolean hasKnownAEdgeOfType(KnownGraph<String, Integer> graph,
@@ -166,7 +187,7 @@ public class SIDetectabilityTest {
                         1L, List.of(Triple.of(PREDICATE_READ, "x", 10)),
                         2L, List.of(Triple.of(WRITE, "x", 3))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10))))
         );
         var graph = new KnownGraph<>(h);
@@ -193,7 +214,7 @@ public class SIDetectabilityTest {
                         2L, List.of(Triple.of(WRITE, "x", 20)),
                         3L, List.of(Triple.of(PREDICATE_READ, "x", 20))),
                 Map.of(3L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 20))))
         );
         var graph = new KnownGraph<>(h);
@@ -223,7 +244,7 @@ public class SIDetectabilityTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
                         1L, List.of(Triple.of(PREDICATE_READ, "x", 10))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10))))
         );
         var graph = new KnownGraph<>(h);
@@ -247,7 +268,7 @@ public class SIDetectabilityTest {
                         1L, List.of(Triple.of(WRITE, "x", 20),
                                 Triple.of(PREDICATE_READ, "x", 20))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 20))))
         );
         var graph = new KnownGraph<>(h);
@@ -276,7 +297,7 @@ public class SIDetectabilityTest {
                                 Triple.of(PREDICATE_READ, "x", 20)),
                         2L, List.of(Triple.of(WRITE, "x", 3))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 20))))
         );
         var graph = new KnownGraph<>(h);
@@ -303,7 +324,7 @@ public class SIDetectabilityTest {
                         1L, List.of(Triple.of(PREDICATE_READ, "x", 10),
                                 Triple.of(WRITE, "x", 20))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10))))
         );
         var graph = new KnownGraph<>(h);
@@ -317,6 +338,63 @@ public class SIDetectabilityTest {
         assertFalse(graph.getKnownGraphB()
                         .hasEdgeConnecting(h.getTransaction(1L), h.getTransaction(1L)),
                 "PR_RW(T2→T2) 自环不应存在");
+    }
+
+    @Test
+    void si_prRw_unchangedCanonicalPredicateResultDoesNotOverConstrainVisibility() {
+        var history = new History<String, SemanticVersion>();
+        var source = history.addTransaction(history.addSession(1L), 1L);
+        var later = history.addTransaction(history.addSession(2L), 2L);
+        var reader = history.addTransaction(history.addSession(3L), 3L);
+
+        var sourceValue = new SemanticVersion(10, 1);
+        var laterValue = new SemanticVersion(10, 2);
+        var sourceMarker = new SemanticVersion(1, 1);
+        var laterMarker = new SemanticVersion(1, 2);
+        history.addEvent(source, WRITE, "x", sourceValue);
+        history.addEvent(source, WRITE, "source_marker", sourceMarker);
+        history.addEvent(later, READ, "source_marker", sourceMarker);
+        history.addEvent(later, WRITE, "x", laterValue);
+        history.addEvent(later, WRITE, "later_marker", laterMarker);
+        history.addEvent(reader, READ, "later_marker", laterMarker);
+
+        PredicateEvaluator<String, SemanticVersion> predicate =
+                new PredicateEvaluator<>() {
+                    @Override
+                    public QueryScope<String> scope() {
+                        return QueryScope.forRelations(
+                                Set.of("kv"), ignored -> "kv");
+                    }
+
+                    @Override
+                    public QueryEvaluation<String, SemanticVersion> evaluate(
+                            VisibleState<String, SemanticVersion> state) {
+                        var inputs = new LinkedHashMap<String, SemanticVersion>();
+                        for (var row : state.rows()) {
+                            if ("x".equals(row.key())
+                                    && row.value().semantic > 5) {
+                                inputs.put(row.key(), row.value());
+                            }
+                        }
+                        ValueAdapter<SemanticVersion> adapter =
+                                ValueAdapter.of(value ->
+                                        QueryValue.integer(value.semantic));
+                        return new QueryEvaluation<>(
+                                List.of(), inputs, adapter);
+                    }
+
+                    @Override
+                    public Object identity() {
+                        return "semantic-x";
+                    }
+                };
+        history.addPredicateReadEvent(reader, predicate,
+                List.of(new Event.PredResult<>("x", sourceValue)));
+        history.getTransactions().forEach(transaction ->
+                transaction.setStatus(Transaction.TransactionStatus.COMMIT));
+
+        assertTrue(new SIVerifier<>(() -> history).audit(),
+                "后续写与 recorded source 的规范化谓词结果相同时，不应产生多余 PR_RW 可见性约束");
     }
 
     // ================================================================
@@ -371,7 +449,7 @@ public class SIDetectabilityTest {
                         1L, List.of(Triple.of(WRITE, "dep_y", 1),
                                 Triple.of(WRITE, "inventory_x", 101))),
                 Map.of(0L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> k.startsWith("inventory_") && v >= 100,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> k.startsWith("inventory_") && v >= 100,
                         List.of()))
         );
         assertFalse(verifySer(h), "可见匹配写被 predicate 空结果漏掉时应 REJECT");
@@ -418,7 +496,7 @@ public class SIDetectabilityTest {
                 Map.of(0L, List.of(0L, 1L)),
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 3))))  // x=3 不满足 v>5
         );
 
@@ -434,7 +512,7 @@ public class SIDetectabilityTest {
                 Map.of(0L, List.of(0L, 1L)),
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 10))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(
                                 new Event.PredResult<>("x", 10),
                                 new Event.PredResult<>("x", 10))))
@@ -457,13 +535,157 @@ public class SIDetectabilityTest {
                 Map.of(0L, List.of(0L)),
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 3))),  // x=3 不满足 v>5
                 Map.of(0L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of()))  // 空结果：没有值满足 v>5
         );
 
         // 空 predicate 结果，没有值满足谓词，内部一致性检查应通过
         assertTrue(verifier.Utils.verifyInternalConsistency(h),
                 "空 predicate 结果，没有值满足谓词，内部一致性检查应通过");
+    }
+
+    @Test
+    void internalConsistency_repeatedPredicateWithoutLocalWriteMustInherit() {
+        var h = new History<String, Integer>();
+        var initSession = h.addSession(-1L);
+        var initTxn = h.addTransaction(initSession, -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var txn = h.addTransaction(h.addSession(0L), 1L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
+        h.addPredicateReadEvent(txn, predicate, List.of());
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var graph = new KnownGraph<>(h);
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(1).getPredicateReadType("x"));
+        assertFalse(verifier.Utils.verifyInternalConsistency(h),
+                "相同谓词读之间没有本地写时，后一次结果必须继承前一次结果");
+    }
+
+    @Test
+    void internalConsistency_repeatedPredicateCannotReplaceInheritedValue() {
+        var h = new History<String, Integer>();
+        var initTxn = h.addTransaction(h.addSession(-1L), -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var writer = h.addTransaction(h.addSession(1L), 2L);
+        h.addWriteEvent(writer, "x", 20, 101L);
+        writer.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var reader = h.addTransaction(h.addSession(2L), 3L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(reader, predicate,
+                List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
+        h.addPredicateReadEvent(reader, predicate,
+                List.of(new Event.PredResult<>("x", 20, 101L, 2L, 0)));
+        reader.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertFalse(verifier.Utils.verifyInternalConsistency(h),
+                "当前谓词结果不能覆盖无中间写时继承的 x=10");
+    }
+
+    @Test
+    void internalConsistency_emptyFInheritsIdenticalPredicateResult() {
+        var h = new History<String, Integer>();
+        var initTxn = h.addTransaction(h.addSession(-1L), -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var txn = h.addTransaction(h.addSession(0L), 1L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        var result = new Event.PredResult<>("x", 10, 100L, -1L, 0);
+        h.addPredicateReadEvent(txn, predicate, List.of(result));
+        h.addPredicateReadEvent(txn, predicate, List.of(result));
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertTrue(verifier.Utils.verifyInternalConsistency(h),
+                "没有新本地写时，后一次相同谓词读应继承相同结果");
+    }
+
+    @Test
+    void internalConsistency_nonEmptyFUsesLastLocalWrite() {
+        var h = new History<String, Integer>();
+        var initTxn = h.addTransaction(h.addSession(-1L), -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var txn = h.addTransaction(h.addSession(0L), 1L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
+        h.addWriteEvent(txn, "x", 20, 101L);
+        h.addWriteEvent(txn, "x", 3, 102L);
+        h.addPredicateReadEvent(txn, predicate, List.of());
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertTrue(verifier.Utils.verifyInternalConsistency(h),
+                "存在新本地写时，应由最后一次本地写 x=3 决定空结果");
+    }
+
+    @Test
+    void internalConsistency_nonEmptyGUsesLastLocalWrite() {
+        var h = new History<String, Integer>();
+        var txn = h.addTransaction(h.addSession(0L), 1L);
+        h.addWriteEvent(txn, "x", 3, 100L);
+        h.addWriteEvent(txn, "x", 20, 101L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 20, 101L, 1L, 1)));
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertTrue(verifier.Utils.verifyInternalConsistency(h),
+                "首次谓词读前有本地写时，应由最后一次本地写 x=20 决定结果");
+    }
+
+    @Test
+    void internalConsistency_interveningLastLocalWriteDeterminesPredicateResult() {
+        var h = new History<String, Integer>();
+        var initTxn = h.addTransaction(h.addSession(-1L), -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var txn = h.addTransaction(h.addSession(0L), 1L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
+        h.addWriteEvent(txn, "x", 3, 101L);
+        h.addWriteEvent(txn, "x", 20, 102L);
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 20, 102L, 1L, 2)));
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertTrue(verifier.Utils.verifyInternalConsistency(h),
+                "相同谓词读之间存在本地写时，应由最后一次本地写决定结果");
+    }
+
+    @Test
+    void internalConsistency_firstPredicateAfterLocalWriteUsesThatWrite() {
+        var h = new History<String, Integer>();
+        var txn = h.addTransaction(h.addSession(0L), 1L);
+        h.addWriteEvent(txn, "x", 20, 100L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate, List.of());
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var graph = new KnownGraph<>(h);
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
+        assertFalse(verifier.Utils.verifyInternalConsistency(h),
+                "首次谓词读前的最后一次本地写仍必须决定结果");
     }
 
     // ================================================================
@@ -484,7 +706,7 @@ public class SIDetectabilityTest {
                 Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
                         1L, List.of(Triple.of(WRITE, "y", 1))),
                 Map.of(1L, Pair.of(
-                        (Event.PredEval<String, Integer>) (k, v) -> v > 5,
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
                         List.of(new Event.PredResult<>("x", 10))))
         );
 

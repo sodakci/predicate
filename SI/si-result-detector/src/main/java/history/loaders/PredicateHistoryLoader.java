@@ -6,15 +6,20 @@ import history.Event;
 import history.History;
 import history.InvalidHistoryError;
 import history.Transaction;
+import history.query.PredicateEvaluator;
+import history.query.QueryException;
+import history.query.QueryValue;
+import history.query.RecordedQueryResult;
+import history.query.RelationResolver;
+import history.query.StructuredQueryParser;
+import history.query.ValueAdapter;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.function.BiPredicate;
-import java.util.regex.Pattern;
-import lombok.Data;
 import lombok.EqualsAndHashCode;
 import lombok.SneakyThrows;
 
@@ -25,18 +30,16 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
     private static final long INIT_TXN_ID = -1L;
     private static final List<String> SOURCE_METADATA_FIELDS =
             List.of("write_id", "source_write_id", "source_txn", "source_op_index");
-    private static final Pattern VALUE_EQ = Pattern.compile("^value\\s*=\\s*(-?\\d+)$",
-            Pattern.CASE_INSENSITIVE);
-    private static final Pattern VALUE_MOD = Pattern.compile("^value\\s*%\\s*(-?\\d+)\\s*=\\s*(-?\\d+)$",
-            Pattern.CASE_INSENSITIVE);
-    private static final Pattern VALUE_GT = Pattern.compile("^value\\s*>\\s*(-?\\d+)$",
-            Pattern.CASE_INSENSITIVE);
-    private static final Pattern VALUE_LT = Pattern.compile("^value\\s*<\\s*(-?\\d+)$",
-            Pattern.CASE_INSENSITIVE);
 
     private final File historyFile;
     private final File initialStateFile;
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ValueAdapter<PredicateValue> valueAdapter =
+            ValueAdapter.of(PredicateValue::queryValue);
+    private final RelationResolver<String> relationResolver =
+            RelationResolver.canonicalStringKeys();
+    private final StructuredQueryParser<String, PredicateValue> queryParser =
+            new StructuredQueryParser<>(valueAdapter, relationResolver);
 
     public PredicateHistoryLoader(Path path) {
         var file = path.toFile();
@@ -131,96 +134,72 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
             if (opNode.has("predicate") || opNode.has("results") || !opNode.has("query")) {
                 throw new InvalidHistoryError();
             }
+            var parsedResult = parseQueryPredicateResult(requiredObject(opNode, "result"));
             history.addPredicateReadEvent(transaction,
                     parseQueryPredicate(requiredObject(opNode, "query")),
-                    parseQueryPredicateResults(requiredObject(opNode, "result")));
+                    parsedResult.inputs,
+                    parsedResult.recorded);
             break;
         default:
             throw new InvalidHistoryError();
         }
     }
 
-    private List<Event.PredResult<String, PredicateValue>> parseQueryPredicateResults(
+    private ParsedQueryResult parseQueryPredicateResult(
             JsonNode resultNode) {
         var inputs = requiredArray(resultNode, "inputs");
         var results = new ArrayList<Event.PredResult<String, PredicateValue>>();
+        var recordedInputs = new LinkedHashMap<String, PredicateValue>();
         for (var inputNode : inputs) {
             var key = requiredText(inputNode, "key");
             var value = parseValue(inputNode);
-            results.add(new Event.PredResult<>(key, value));
-        }
-        return results;
-    }
-
-    private Event.PredEval<String, PredicateValue> parseQueryPredicate(JsonNode queryNode) {
-        var where = requiredArray(queryNode, "where");
-        if (where.size() != 1 || !where.get(0).isTextual()) {
-            throw new InvalidHistoryError();
-        }
-
-        var clause = where.get(0).asText().trim();
-        if ("TRUE".equalsIgnoreCase(clause)) {
-            return parsedPredicate("TRUE", (key, value) -> key != null && value != null);
-        }
-
-        var eq = VALUE_EQ.matcher(clause);
-        if (eq.matches()) {
-            var target = parseLongLiteral(eq.group(1));
-            return parsedPredicate("VALUE_EQ:" + target, (key, value) -> key != null
-                    && value != null
-                    && value.getEncoded() == target);
-        }
-
-        var mod = VALUE_MOD.matcher(clause);
-        if (mod.matches()) {
-            var modulus = parseLongLiteral(mod.group(1));
-            var target = parseLongLiteral(mod.group(2));
-            if (modulus == 0) {
+            if (recordedInputs.putIfAbsent(key, value) != null) {
                 throw new InvalidHistoryError();
             }
-            return parsedPredicate("VALUE_MOD:" + modulus + ":" + target, (key, value) -> key != null
-                    && value != null
-                    && Math.floorMod(value.getEncoded(), modulus) == target);
+            results.add(new Event.PredResult<>(key, value));
         }
 
-        var gt = VALUE_GT.matcher(clause);
-        if (gt.matches()) {
-            var target = parseLongLiteral(gt.group(1));
-            return parsedPredicate("VALUE_GT:" + target, (key, value) -> key != null
-                    && value != null
-                    && value.getEncoded() > target);
+        var valuesNode = requiredArray(resultNode, "values");
+        var values = new ArrayList<QueryValue>();
+        for (var valueNode : valuesNode) {
+            values.add(parseQueryValue(valueNode));
         }
-
-        var lt = VALUE_LT.matcher(clause);
-        if (lt.matches()) {
-            var target = parseLongLiteral(lt.group(1));
-            return parsedPredicate("VALUE_LT:" + target, (key, value) -> key != null
-                    && value != null
-                    && value.getEncoded() < target);
-        }
-
-        throw new InvalidHistoryError();
+        var recorded = new RecordedQueryResult<>(recordedInputs, values, valueAdapter);
+        return new ParsedQueryResult(results, recorded);
     }
 
-    private Event.PredEval<String, PredicateValue> parsedPredicate(
-            String identity,
-            BiPredicate<String, PredicateValue> evaluator) {
-        return new Event.PredEval<>() {
-            @Override
-            public boolean test(String key, PredicateValue value) {
-                return evaluator.test(key, value);
-            }
-
-            @Override
-            public Object identity() {
-                return identity;
-            }
-        };
+    private PredicateEvaluator<String, PredicateValue> parseQueryPredicate(JsonNode queryNode) {
+        try {
+            return queryParser.parse(queryNode);
+        } catch (QueryException exception) {
+            throw new InvalidHistoryError();
+        }
     }
 
     private PredicateValue parseValue(JsonNode node) {
         rejectSourceMetadata(node);
-        return new PredicateValue(requiredLong(node, "value"));
+        var value = node.get("value");
+        if (value == null || value.isNull() || value.isArray()
+                || value.isNumber() && !value.isIntegralNumber()) {
+            throw new InvalidHistoryError();
+        }
+        try {
+            return new PredicateValue(value);
+        } catch (QueryException exception) {
+            throw new InvalidHistoryError();
+        }
+    }
+
+    private QueryValue parseQueryValue(JsonNode node) {
+        if (node == null || node.isNull()
+                || node.isNumber() && !node.isIntegralNumber()) {
+            throw new InvalidHistoryError();
+        }
+        try {
+            return QueryValue.of(node);
+        } catch (QueryException exception) {
+            throw new InvalidHistoryError();
+        }
     }
 
     private JsonNode requiredObject(JsonNode node, String fieldName) {
@@ -255,14 +234,6 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
         return child.asLong();
     }
 
-    private long parseLongLiteral(String value) {
-        try {
-            return Long.parseLong(value);
-        } catch (NumberFormatException exc) {
-            throw new InvalidHistoryError();
-        }
-    }
-
     private void rejectSourceMetadata(JsonNode node) {
         for (var field : SOURCE_METADATA_FIELDS) {
             if (node.has(field)) {
@@ -271,22 +242,53 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
         }
     }
 
-    @Data
-    @EqualsAndHashCode(of = "encoded")
+    private static final class ParsedQueryResult {
+        private final List<Event.PredResult<String, PredicateValue>> inputs;
+        private final RecordedQueryResult<String, PredicateValue> recorded;
+
+        private ParsedQueryResult(
+                List<Event.PredResult<String, PredicateValue>> inputs,
+                RecordedQueryResult<String, PredicateValue> recorded) {
+            this.inputs = inputs;
+            this.recorded = recorded;
+        }
+    }
+
+    @EqualsAndHashCode(of = "canonical")
     public static class PredicateValue {
-        private final long encoded;
+        private final QueryValue canonical;
 
         public PredicateValue(long encoded) {
-            this.encoded = encoded;
+            this(QueryValue.integer(encoded));
         }
 
         public PredicateValue(long encoded, int ignoredSemantic) {
             this(encoded);
         }
 
+        public PredicateValue(JsonNode value) {
+            this(QueryValue.of(value));
+        }
+
+        private PredicateValue(QueryValue canonical) {
+            this.canonical = canonical;
+        }
+
+        public long getEncoded() {
+            return canonical.asLong();
+        }
+
+        public JsonNode getJsonValue() {
+            return canonical.json();
+        }
+
+        public QueryValue queryValue() {
+            return canonical;
+        }
+
         @Override
         public String toString() {
-            return Long.toString(encoded);
+            return canonical.toString();
         }
     }
 }

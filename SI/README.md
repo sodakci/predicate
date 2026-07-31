@@ -137,17 +137,28 @@ hist-00000/
 }
 ```
 
-当前 loader 支持的 KV 谓词为：
+当前 loader 接受结构化 `query`：
 
 ```text
-TRUE
-value = n
-value % m = r
-value > n
-value < n
+from
+    必填，指定一个 relation，可选 alias。
+
+joins
+    可选，支持一个或多个 INNER JOIN；每个 join 使用 on 条件。
+
+where
+    可选，数组中的条件按 AND 连接。
+
+select.columns
+    必填，支持字段路径和 AS 别名。
+
+select.distinct
+    可选布尔值，默认 false。
 ```
 
-注意：当前 `PredicateHistoryLoader` 只接受紧凑 `query/result` 形态。带 `predicate/results` 字段、source provenance 字段或 TPC-C 多表 SQL predicate 的历史，需要先确认 detector 已扩展对应 parser 与谓词求值逻辑。
+条件和投影表达式支持字段路径、整数/字符串/布尔/null 字面量、`=`、`>`、`<`、`%`、`AND` 和括号。单表 KV 的 `TRUE`、`value = n`、`value % m = r`、`value > n`、`value < n` 继续受支持；对象 `value` 可以通过 `relation.value.field` 访问。`result.values` 按多重集比较，`result.inputs` 必须列出结果实际依赖的可见 `(key,value)` 版本。对象和数组结果支持相等性比较，但 `<`、`>` 只适用于可排序的标量值。
+
+注意：`PredicateHistoryLoader` 只接受紧凑 `query/result` 形态，并拒绝 `write_id`、`source_write_id`、`source_txn`、`source_op_index` 等 source provenance 字段。带 `predicate/results` 字段或直接保存 SQL 文本的历史不属于当前输入格式。
 
 ## 运行单个历史
 
@@ -212,14 +223,26 @@ Mode: SI, pruning forced WW then checking induced SI graph with MonoSAT predicat
     打印 SAT 后端标识和额外统计信息。
 ```
 
+结构化谓词会按 SAT 模型构造 latest-visible 快照并执行完整查询。错误的 JOIN、投影、重复行或遗漏行都会被拒绝；改变查询结果的后续写会生成相应的 `PR_RW` anti-dependency。
+
 示例：
 
 ```bash
 java -Djava.library.path=build/monosat -Xmx12g \
   -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
   audit --compare-derived-predicate-edges --solver-stats \
-  ../../PolySIHistories/kvpredicate/kvpredicate_repeatable_read_write_skew1_20260706/hist-00000
+  ../../predicateHistories/kvpredicate/kvpredicate_repeatable_read_write_skew1_20260706/hist-00000
 ```
+
+当前 SI detector 也可直接审计 `History_Generator` 生成的结构化 MultiKV JOIN 历史：
+
+```bash
+java -Djava.library.path=build/monosat -Xmx12g \
+  -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
+  audit ../../predicateHistories/multikv/<case>/hist-00000
+```
+
+TPC-C StockLevel 当前仍输出 SQL 文本而不是结构化 `query`，因此不属于已完整支持的输入。
 
 ## 查看统计和 dump
 
@@ -246,7 +269,7 @@ java -Djava.library.path=build/monosat -Xmx8g \
 
 ```bash
 cd SI/si-result-detector
-tools/audit-prhist.sh ../../PolySIHistories/kvpredicate
+tools/audit-prhist.sh ../../predicateHistories/kvpredicate
 ```
 
 常用环境变量：
