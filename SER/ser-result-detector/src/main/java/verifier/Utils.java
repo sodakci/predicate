@@ -11,18 +11,17 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
-import com.google.common.collect.Streams;
 import com.google.common.graph.EndpointPair;
 import com.google.common.graph.ValueGraph;
 
 import org.apache.commons.lang3.tuple.Pair;
 import graph.Edge;
 import graph.EdgeType;
-import graph.MatrixGraph;
 import history.Event;
 import history.History;
 import history.Transaction;
@@ -97,7 +96,7 @@ class Utils {
             Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue,
             Map<Pair<Transaction<KeyType, ValueType>, KeyType>, ArrayList<Integer>> txnWrites) {
         var writeEv = resolveUniqueSource(
-                ev.getKey(), ev.getValue(), String.format("%s", ev), writesByKeyValue);
+                ev.getKey(), ev.getValue(), () -> String.format("%s", ev), writesByKeyValue);
         if (writeEv == null) {
             return false;
         }
@@ -164,7 +163,7 @@ class Utils {
 
             var ref = resolveUniqueSource(
                     result.getKey(), result.getValue(),
-                    String.format("%s result (%s,%s)",
+                    () -> String.format("%s result (%s,%s)",
                             ev, result.getKey(), result.getValue()),
                     writesByKeyValue);
             if (ref == null) {
@@ -285,63 +284,19 @@ class Utils {
     private static <KeyType, ValueType> WriteRef<KeyType, ValueType> resolveUniqueSource(
             KeyType key,
             ValueType value,
-            String context,
+            Supplier<String> context,
             Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue) {
         var refs = writesByKeyValue.get(Pair.of(key, value));
         if (refs == null || refs.isEmpty()) {
-            System.err.printf("%s has no corresponding write\n", context);
+            System.err.printf("%s has no corresponding write\n", context.get());
             return null;
         }
         if (refs.size() > 1) {
             System.err.printf("%s has ambiguous source for (%s,%s); compact histories require unique (key,value) writes\n",
-                    context, key, value);
+                    context.get(), key, value);
             return null;
         }
         return refs.get(0);
-    }
-
-    static <KeyType, ValueType> Map<Transaction<KeyType, ValueType>, Integer> getOrderInSession(
-            History<KeyType, ValueType> history) {
-        // @formatter:off
-        return history.getSessions().stream()
-                .flatMap(s -> Streams.zip(
-                    s.getTransactions().stream(),
-                    IntStream.range(0, s.getTransactions().size()).boxed(),
-                    Pair::of))
-                .collect(Collectors.toMap(Pair::getKey, Pair::getValue));
-        // @formatter:on
-    }
-
-    /*
-     * Delete edges in a way that preserves reachability
-     */
-    static <KeyType, ValueType> MatrixGraph<Transaction<KeyType, ValueType>> reduceEdges(
-            MatrixGraph<Transaction<KeyType, ValueType>> graph,
-            Map<Transaction<KeyType, ValueType>, Integer> orderInSession) {
-        System.err.printf("Before: %d edges\n", graph.edges().size());
-        var newGraph = MatrixGraph.ofNodes(graph);
-
-        for (var n : graph.nodes()) {
-            var succ = graph.successors(n);
-            // @formatter:off
-            var firstInSession = succ.stream()
-                .collect(Collectors.toMap(
-                    m -> m.getSession(),
-                    Function.identity(),
-                    (p, q) -> orderInSession.get(p)
-                        < orderInSession.get(q) ? p : q));
-
-            firstInSession.values().forEach(m -> newGraph.putEdge(n, m));
-
-            succ.stream()
-                .filter(m -> m.getSession() == n.getSession()
-                        && orderInSession.get(m) == orderInSession.get(n) + 1)
-                .forEach(m -> newGraph.putEdge(n, m));
-            // @formatter:on
-        }
-
-        System.err.printf("After: %d edges\n", newGraph.edges().size());
-        return newGraph;
     }
 
     static <KeyType, ValueType> String conflictsToDot(Collection<Transaction<KeyType, ValueType>> transactions,

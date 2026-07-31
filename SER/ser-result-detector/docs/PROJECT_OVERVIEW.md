@@ -725,6 +725,121 @@ ar(A,C) -> ar(B,C)
 
 这一直接编码保证即使约束经过 coalescing/pruning，普通读 latest-visible 语义仍完整存在。相同 guard/edge 会去重；guard 恒假时不创建目标 AR literal，guard 恒真时直接断言目标。
 
+#### 7.2.1 依赖边的建立与 SAT 编码
+
+求解器先用带语义的边描述依赖，再把依赖转换成 AR 约束。单条语义边使用：
+
+```text
+SEREdge(from, to, type, key)
+```
+
+其中 `type` 可以是 `SO`、`WR`、`WW`、`RW`、`PR_WR` 或 `PR_RW`。边表达的是：只要这条依赖生效，事务顺序必须满足：
+
+```text
+from <AR to
+```
+
+可能依赖 WW 方向或 frontier 选择的边还带有一个 Boolean guard：
+
+```text
+GuardedDependencyEdge {
+    edge  = SEREdge(from,to,type,key)
+    guard = 该依赖生效的条件
+}
+
+guard -> ar(from,to)
+```
+
+各类边的来源和 guard 如下：
+
+| 边 | 建立依据 | guard | 要求的 AR 方向 |
+|---|---|---|---|
+| `SO(A,B)` | 同一 session 中 `A` 先于 `B` | `true` | `A <AR B` |
+| `WR(A,B,x)` | `B` 的普通读读取 `A` 写出的 `x` | `true` | `A <AR B` |
+| `WW(A,C,x)` | 同 key writer 选择 `A` 在 `C` 前 | `ar(A,C)` | `A <AR C` |
+| `RW(B,C,x)` | `A --WR(x)--> B` 且选择 `A --WW(x)--> C` | `ar(A,C)` | `B <AR C` |
+| `PR_WR(A,B,x)` | `A` 是谓词读 `B` 在 `x` 上的 latest-visible source | 固定 source 时为 `true`；待选 source 时为 `selected(A,B,x)` | `A <AR B` |
+| `PR_RW(B,C,x)` | source `A` 在 `C` 前，且 `C` 的写满足 Δ | 固定 source 时为 `beforeWrite(A,C)`；待选 source 时为 `selected(A,B,x) ∧ beforeWrite(A,C)` | `B <AR C` |
+
+`addDependencyEdge(edge,guard)` 的处理顺序是：
+
+1. `guard=false` 时依赖永不生效，直接丢弃。
+2. 以 `(guard,edge)` 去重，避免同一 implication 重复进入公式。
+3. 计算目标 `target=ar(edge.from,edge.to)`。
+4. 若 `target=true`，或 `guard` 与 `target` 是同一个 literal，则该 implication 是恒真式，不再建立待编码的 `GuardedDependencyEdge`。
+5. 其余依赖保存完整 `SEREdge` 和 guard；`SO/WR/WW/PR_WR` 放入 A-side，`RW/PR_RW` 放入 B-side。
+6. `encodeDependencyEdges()` 统一编码 `guard -> target`，随后清空临时待编码集合。
+
+第 4 步只是一项公式优化。例如只有一个 source 候选时：
+
+```text
+selected(A,B,x) = visible(A,B) = ar(A,B)
+
+PR_WR implication:
+ar(A,B) -> ar(A,B)
+```
+
+省略这个恒真 implication 不改变 SAT 模型和最终 `ACCEPT/REJECT`。但这种边只隐含在 source 的可见条件中，不会产生一个待编码的 `GuardedDependencyEdge`。因此当前显式条件对象是编码期对象，不是求解结束后永久保存的完整依赖图；诊断派生图与主 SAT verdict 也彼此独立。
+
+##### 谓词 source 的选择 guard
+
+对 external key `x`，每个事务只保留它对 `x` 的最后一次写。候选写 `ws` 对 reader `R` 可见的条件为：
+
+```text
+visible(ws,R) = ar(writer(ws),R)
+```
+
+`ws` 被选为 latest-visible source 还要求不存在一个在 `ws` 之后、同时也位于 reader 之前的候选写：
+
+```text
+laterVisible(ws,wu,R)
+    = visible(wu,R) ∧ beforeWrite(ws,wu)
+
+selected(ws,R,x)
+    = visible(ws,R)
+      ∧ ∧wu!=ws ¬laterVisible(ws,wu,R)
+```
+
+这里必须包含 `¬laterVisible`。仅有 `visible(ws,R)` 只能证明 `ws` 在 reader 前，不能证明它是 reader 前的最后版本；若还存在 `ws <AR wu <AR R`，真正 source 应当是 `wu`。
+
+待选 source 的谓词边按同一个 `selected` guard 建立：
+
+```text
+selected(ws,R,x)
+    -> PR_WR(writer(ws),R,x)
+
+selected(ws,R,x)
+∧ beforeWrite(ws,wu)
+∧ Δ(ws,wu)
+    -> PR_RW(R,writer(wu),x)
+```
+
+代码区分两个 writer 集合：
+
+```text
+externalWrites
+    该 key 的完整外部最终写集合；每个 writer transaction 至多一个写。
+
+frontier.candidates
+    可以成为 visible source 的候选；已知位于 reader 之后的写会被过滤。
+```
+
+PR_WR 的 source 只从 `frontier.candidates` 中选择。PR_RW 的 `later` 必须遍历完整 `externalWrites`：即使 `wu` 已知位于 reader 后面、因而不能成为 source，形式上仍要根据 `ws WW wu ∧ Δ` 建立 `R PR_RW wu`。当前 recorded-source 和待选-source 两条路径都使用完整 external writer 集合派生 PR_RW。
+
+##### Row-local 未返回 key
+
+row-local 谓词对未返回的 EXTERNAL key 仍先建立 `KeyFrontier`，选择 latest-visible source 并建立上述 PR_WR/PR_RW。之后才根据单行求值区分：
+
+```text
+存在会产生结果的版本
+    加入阻断条件，禁止这种版本成为最终 frontier，除非其后存在更晚的不匹配可见版本。
+
+所有版本都不产生结果
+    不需要结果阻断条件，但仍保留 frontier 选择和 PR_WR 建模；不能跳过该 key。
+```
+
+INTERNAL key 不建立新的外部 PR_WR；其结果由事务内最后本地写或内部一致性依据决定。
+
 #### 7.3 谓词 key 的 frontier 候选
 
 对谓词读事务 `R` 和 scope 内 key `x`，若 `R` 在谓词事件之前已经本地写 `x`：
@@ -751,7 +866,7 @@ source 后任何会改变结果的同 key writer U
     必须满足 R <AR U                        对应 PR_RW
 ```
 
-这保证 source 是“对查询结果而言最新”的可见版本。若一个后续写在谓词前后都不匹配，它不会改变可观察结果，因此无需强制排在 reader 之后。代码还防御性处理“两个写的 key/value 完全相同”的等价情况，但当前紧凑 PRHIST 要求 `(key,value)` 全局唯一，不会通过 loader 产生这种输入。
+PR_RW 的后续 writer 从完整 external writer 集合中枚举，不只检查仍可能对 reader 可见的 frontier candidates。这保证已知位于 reader 后面的 writer 也具有完整的显式 PR_RW 派生。若一个后续写在谓词前后都不匹配，它不会改变可观察结果，因此无需强制排在 reader 之后。代码还防御性处理“两个写的 key/value 完全相同”的等价情况，但当前紧凑 PRHIST 要求 `(key,value)` 全局唯一，不会通过 loader 产生这种输入。
 
 #### 7.4 Row-local 谓词快路径
 
@@ -768,7 +883,7 @@ distinct = false
 1. `result.inputs` 的 key 集必须等于已解析 tuple source 的 key 集。
 2. 在只包含记录输入的状态上执行查询，投影结果必须与记录结果一致。
 3. 返回的 EXTERNAL key：固定 recorded source，并建立必要 `PR_WR/PR_RW`。
-4. 未返回的 EXTERNAL key：找出单行执行会产生非空贡献的候选写，禁止这些写成为 reader 的 latest-visible frontier。
+4. 未返回的 EXTERNAL key：无论所有版本是否匹配，都先建立 frontier 和 PR_WR/PR_RW；再找出单行执行会产生非空贡献的候选写，禁止这些写成为 reader 的 latest-visible frontier。所有版本均不匹配时不需要结果阻断子句，但不能跳过该 key 的 frontier。
 5. INTERNAL key：必须使用谓词事件之前的最后本地写或已经继承的内部 source；若该行会产生结果却被遗漏，公式直接 UNSAT。
 6. 结果中的 key 若超出 scope 或历史中不存在写版本，公式直接 UNSAT。
 

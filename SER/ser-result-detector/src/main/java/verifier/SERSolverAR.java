@@ -61,8 +61,10 @@ class SERSolverAR<KeyType, ValueType> {
     // Dependency edges are created with their type/key metadata before their
     // guards are encoded into AR. This keeps edge construction separate from
     // constraint encoding and preserves RW/PR_RW as B-side dependencies.
-    private final List<GuardedDependencyEdge> dependencyEdgesA = new ArrayList<>();
-    private final List<GuardedDependencyEdge> dependencyEdgesB = new ArrayList<>();
+    private final List<GuardedDependencyEdge<KeyType, ValueType>> dependencyEdgesA =
+            new ArrayList<>();
+    private final List<GuardedDependencyEdge<KeyType, ValueType>> dependencyEdgesB =
+            new ArrayList<>();
     private final Map<Lit, Set<SEREdge<KeyType, ValueType>>> dependencyEdgesByGuard =
             new IdentityHashMap<>();
     private Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>> conflictEdges =
@@ -336,7 +338,7 @@ class SERSolverAR<KeyType, ValueType> {
             return;
         }
 
-        var guarded = new GuardedDependencyEdge(guard, target);
+        var guarded = new GuardedDependencyEdge<>(edge, guard);
         switch (edge.getType()) {
         case SO:
         case WR:
@@ -363,11 +365,13 @@ class SERSolverAR<KeyType, ValueType> {
         dependencyEdgesByGuard.clear();
     }
 
-    private void encodeDependencyEdge(GuardedDependencyEdge guarded) {
+    private void encodeDependencyEdge(
+            GuardedDependencyEdge<KeyType, ValueType> guarded) {
+        var target = ar(guarded.edge.getFrom(), guarded.edge.getTo());
         if (guarded.guard == Lit.True) {
-            solver.assertTrue(guarded.target);
+            solver.assertTrue(target);
         } else {
-            solver.assertTrue(Logic.implies(guarded.guard, guarded.target));
+            solver.assertTrue(Logic.implies(guarded.guard, target));
         }
     }
 
@@ -519,12 +523,12 @@ class SERSolverAR<KeyType, ValueType> {
                             predicateRead, relationResolver, key,
                             write.getEvent().getValue()))
                     .collect(Collectors.toList());
+            var frontier = createKeyFrontier(
+                    observation, key, writes, null, false);
             if (badWrites.isEmpty()) {
                 continue;
             }
 
-            var frontier = createKeyFrontier(
-                    observation, key, writes, null, false);
             var badWriteSet = Collections.newSetFromMap(
                     new IdentityHashMap<KnownGraph.WriteRef<KeyType, ValueType>, Boolean>());
             badWriteSet.addAll(badWrites);
@@ -706,7 +710,8 @@ class SERSolverAR<KeyType, ValueType> {
         }
 
         latestByWriter.remove(observation.getTxn());
-        var candidates = latestByWriter.values().stream()
+        var externalWrites = new ArrayList<>(latestByWriter.values());
+        var candidates = externalWrites.stream()
                 .map(write -> new FrontierCandidate<>(write,
                         ar(write.getTxn(), observation.getTxn())))
                 .filter(candidate -> candidate.visible != Lit.False)
@@ -716,6 +721,8 @@ class SERSolverAR<KeyType, ValueType> {
                 key, observation.getTxn(), candidates, recordedSource);
 
         if (recordedSource == null) {
+            encodeSelectedPredicateDependencies(
+                    frontier, externalWrites, observation.getPredicateReadEvent());
             return frontier;
         }
 
@@ -725,8 +732,38 @@ class SERSolverAR<KeyType, ValueType> {
             return frontier;
         }
         assertLatestVisible(
-                frontier, source, observation.getPredicateReadEvent());
+                frontier, source, externalWrites,
+                observation.getPredicateReadEvent());
         return frontier;
+    }
+
+    private void encodeSelectedPredicateDependencies(
+            KeyFrontier<KeyType, ValueType> frontier,
+            List<KnownGraph.WriteRef<KeyType, ValueType>> externalWrites,
+            Event<KeyType, ValueType> predicateRead) {
+        for (var source : frontier.candidates) {
+            var selectedGuard = selectionGuard(frontier, source);
+            addDependencyEdge(new SEREdge<>(
+                    source.write.getTxn(),
+                    frontier.reader,
+                    EdgeType.PR_WR,
+                    frontier.key), selectedGuard);
+
+            for (var later : externalWrites) {
+                if (later == source.write
+                        || !writeChangesPredicateResult(
+                                source.write, later, predicateRead)) {
+                    continue;
+                }
+                addDependencyEdge(new SEREdge<>(
+                        frontier.reader,
+                        later.getTxn(),
+                        EdgeType.PR_RW,
+                        frontier.key),
+                        and(selectedGuard,
+                                beforeWrite(source.write, later)));
+            }
+        }
     }
 
     /**
@@ -790,6 +827,21 @@ class SERSolverAR<KeyType, ValueType> {
         return selected;
     }
 
+    private Lit selectionGuard(
+            KeyFrontier<KeyType, ValueType> frontier,
+            FrontierCandidate<KeyType, ValueType> selected) {
+        var guard = selected.visible;
+        for (var other : frontier.candidates) {
+            if (other == selected) {
+                continue;
+            }
+            var laterVisible = and(other.visible,
+                    beforeWrite(selected.write, other.write));
+            guard = and(guard, Logic.not(laterVisible));
+        }
+        return guard;
+    }
+
     private FrontierCandidate<KeyType, ValueType> candidateFor(
             KeyFrontier<KeyType, ValueType> frontier,
             KnownGraph.WriteRef<KeyType, ValueType> write) {
@@ -804,6 +856,7 @@ class SERSolverAR<KeyType, ValueType> {
     /** Forces one recorded source to be the latest visible write for its key. */
     private void assertLatestVisible(KeyFrontier<KeyType, ValueType> frontier,
             FrontierCandidate<KeyType, ValueType> source,
+            List<KnownGraph.WriteRef<KeyType, ValueType>> externalWrites,
             Event<KeyType, ValueType> predicateRead) {
         if (!source.write.getTxn().equals(frontier.reader)) {
             var edge = new SEREdge<KeyType, ValueType>(
@@ -813,18 +866,18 @@ class SERSolverAR<KeyType, ValueType> {
         } else {
             solver.assertTrue(source.visible);
         }
-        for (var other : frontier.candidates) {
-            if (other == source) {
+        for (var other : externalWrites) {
+            if (other == source.write) {
                 continue;
             }
             if (!writeChangesPredicateResult(
-                    source.write, other.write, predicateRead)) {
+                    source.write, other, predicateRead)) {
                 continue;
             }
             addDependencyEdge(
-                    new SEREdge<>(frontier.reader, other.write.getTxn(),
+                    new SEREdge<>(frontier.reader, other.getTxn(),
                             EdgeType.PR_RW, frontier.key),
-                    beforeWrite(source.write, other.write));
+                    beforeWrite(source.write, other));
         }
     }
 
@@ -988,13 +1041,15 @@ class SERSolverAR<KeyType, ValueType> {
         }
     }
 
-    private static final class GuardedDependencyEdge {
+    private static final class GuardedDependencyEdge<KeyType, ValueType> {
+        private final SEREdge<KeyType, ValueType> edge;
         private final Lit guard;
-        private final Lit target;
 
-        private GuardedDependencyEdge(Lit guard, Lit target) {
+        private GuardedDependencyEdge(
+                SEREdge<KeyType, ValueType> edge,
+                Lit guard) {
+            this.edge = edge;
             this.guard = guard;
-            this.target = target;
         }
     }
 
