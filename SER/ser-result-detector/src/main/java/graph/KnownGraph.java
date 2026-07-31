@@ -10,7 +10,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 
 import com.google.common.graph.Graph;
@@ -71,7 +70,6 @@ public class KnownGraph<KeyType, ValueType> {
             .directed().build();
     // Legacy unique (key,value) view retained only for old tests/helpers.
     private final Map<Pair<KeyType, ValueType>, WriteRef<KeyType, ValueType>> writes = new HashMap<>();
-    private final Map<Long, WriteRef<KeyType, ValueType>> writesById = new HashMap<>();
     private final Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue = new HashMap<>();
     private final List<WriteRef<KeyType, ValueType>> allWrites = new ArrayList<>();
     private final Map<Pair<Transaction<KeyType, ValueType>, KeyType>, List<Integer>> txnWrites = new HashMap<>();
@@ -110,9 +108,6 @@ public class KnownGraph<KeyType, ValueType> {
                     continue;
                 }
                 var writeRef = new WriteRef<>(txn, ev, i, ev.getWriteId());
-                if (ev.getWriteId() != null && writesById.put(ev.getWriteId(), writeRef) != null) {
-                    throw new IllegalStateException(String.format("Duplicate write_id %s", ev.getWriteId()));
-                }
                 allWrites.add(writeRef);
                 var keyValue = Pair.of(ev.getKey(), ev.getValue());
                 writes.putIfAbsent(keyValue, writeRef);
@@ -183,36 +178,15 @@ public class KnownGraph<KeyType, ValueType> {
     }
 
     private WriteRef<KeyType, ValueType> resolveReadSource(Event<KeyType, ValueType> read) {
-        if (read.getSourceWriteId() != null) {
-            var source = writesById.get(read.getSourceWriteId());
-            if (source == null) {
-                throw new IllegalStateException(String.format(
-                        "No source write_id %s for read (%s,%s)",
-                        read.getSourceWriteId(), read.getKey(), read.getValue()));
-            }
-            validateSourceMatches("read", read.getSourceWriteId(), read.getKey(), read.getValue(), source);
-            return source;
-        }
-        return resolveLegacySource(read.getKey(), read.getValue(), "read");
+        return resolveUniqueSource(read.getKey(), read.getValue(), "read");
     }
 
     private WriteRef<KeyType, ValueType> resolvePredicateResultSource(
             Event.PredResult<KeyType, ValueType> result) {
-        if (result.getSourceWriteId() != null) {
-            var source = writesById.get(result.getSourceWriteId());
-            if (source == null) {
-                throw new IllegalStateException(String.format(
-                        "No source write_id %s for predicate result (%s,%s)",
-                        result.getSourceWriteId(), result.getKey(), result.getValue()));
-            }
-            validateSourceMatches("predicate result", result.getSourceWriteId(),
-                    result.getKey(), result.getValue(), source);
-            return source;
-        }
-        return resolveLegacySource(result.getKey(), result.getValue(), "predicate result");
+        return resolveUniqueSource(result.getKey(), result.getValue(), "predicate result");
     }
 
-    private WriteRef<KeyType, ValueType> resolveLegacySource(
+    private WriteRef<KeyType, ValueType> resolveUniqueSource(
             KeyType key, ValueType value, String context) {
         var sources = writesByKeyValue.get(Pair.of(key, value));
         if (sources == null || sources.isEmpty()) {
@@ -225,18 +199,6 @@ public class KnownGraph<KeyType, ValueType> {
                     context, key, value));
         }
         return sources.get(0);
-    }
-
-    private void validateSourceMatches(String context, Long sourceWriteId,
-            KeyType key, ValueType value, WriteRef<KeyType, ValueType> source) {
-        if (!Objects.equals(source.getEvent().getKey(), key)
-                || !Objects.equals(source.getEvent().getValue(), value)) {
-            throw new IllegalStateException(String.format(
-                    "%s source_write_id %s points to (%s,%s), expected (%s,%s)",
-                    context, sourceWriteId,
-                    source.getEvent().getKey(), source.getEvent().getValue(),
-                    key, value));
-        }
     }
 
     public void putEdge(Transaction<KeyType, ValueType> u,

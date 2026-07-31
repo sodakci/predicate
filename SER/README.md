@@ -193,6 +193,12 @@ java -Djava.library.path=build/monosat -Xmx8g \
 
 `REJECT` 时程序返回非零退出码；如果在 shell 脚本里批量跑，需要用输出标记判断结果。
 
+### 内部一致性预检
+
+`audit` 会在构造 KnownGraph 和启动 MonoSAT 前调用 `Utils.verifyInternalConsistency`。预检会验证点读和谓词结果的来源写、事务内 read-your-writes、谓词结果 key 的唯一性/查询范围，以及相同谓词读对未被本地写覆盖的结果继承。预检失败时会先在标准错误输出具体原因，然后直接返回 `REJECT`，不会进入 SAT/AR 求解。
+
+完整规则和判断顺序见 `ser-result-detector/docs/PROJECT_OVERVIEW.md` 的“内部一致性预检”一节。
+
 ## 常用 audit 参数
 
 ```text
@@ -390,6 +396,15 @@ cd SER/ser-result-detector
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
   audit ../../predicateHistories/kvpredicate/<case>/hist-00000
+```
+
+MultiKV case 使用当前 SER loader 支持的结构化 INNER JOIN、投影、对象行值和结果多重集格式，也可以直接审计：
+
+```bash
+cd SER/ser-result-detector
+java -Djava.library.path=build/monosat -Xmx8g \
+  -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
+  audit ../../predicateHistories/multikv/<case>/hist-00000
 ```
 
 TPC-C generator 当前能采集、导出和审计 raw evidence，但 StockLevel 会输出多表 SQL-shaped predicate。当前 SER loader 支持的是结构化 `query` 对象而不是 SQL 文本，因此不应把该 StockLevel 历史当作已被 detector 完整支持的输入。

@@ -645,6 +645,10 @@ class SERSolverAR<KeyType, ValueType> {
             if (other == recordedSource) {
                 continue;
             }
+            if (!writeChangesPredicateResult(
+                    recordedSource, other, observation.getPredicateReadEvent())) {
+                continue;
+            }
             addDependencyEdge(
                     new SEREdge<>(observation.getTxn(), other.getTxn(),
                             EdgeType.PR_RW, key),
@@ -720,7 +724,8 @@ class SERSolverAR<KeyType, ValueType> {
             solver.assertTrue(Lit.False);
             return frontier;
         }
-        assertLatestVisible(frontier, source);
+        assertLatestVisible(
+                frontier, source, observation.getPredicateReadEvent());
         return frontier;
     }
 
@@ -798,7 +803,8 @@ class SERSolverAR<KeyType, ValueType> {
 
     /** Forces one recorded source to be the latest visible write for its key. */
     private void assertLatestVisible(KeyFrontier<KeyType, ValueType> frontier,
-            FrontierCandidate<KeyType, ValueType> source) {
+            FrontierCandidate<KeyType, ValueType> source,
+            Event<KeyType, ValueType> predicateRead) {
         if (!source.write.getTxn().equals(frontier.reader)) {
             var edge = new SEREdge<KeyType, ValueType>(
                     source.write.getTxn(), frontier.reader, EdgeType.PR_WR, frontier.key);
@@ -811,10 +817,44 @@ class SERSolverAR<KeyType, ValueType> {
             if (other == source) {
                 continue;
             }
+            if (!writeChangesPredicateResult(
+                    source.write, other.write, predicateRead)) {
+                continue;
+            }
             addDependencyEdge(
                     new SEREdge<>(frontier.reader, other.write.getTxn(),
                             EdgeType.PR_RW, frontier.key),
                     beforeWrite(source.write, other.write));
+        }
+    }
+
+    private boolean writeChangesPredicateResult(
+            KnownGraph.WriteRef<KeyType, ValueType> source,
+            KnownGraph.WriteRef<KeyType, ValueType> later,
+            Event<KeyType, ValueType> predicateRead) {
+        boolean sourceMatches = writeMatchesPredicate(source, predicateRead);
+        boolean laterMatches = writeMatchesPredicate(later, predicateRead);
+
+        if (sourceMatches != laterMatches) {
+            return true;
+        }
+        return sourceMatches
+                && (!Objects.equals(source.getEvent().getKey(), later.getEvent().getKey())
+                || !Objects.equals(source.getEvent().getValue(), later.getEvent().getValue()));
+    }
+
+    private boolean writeMatchesPredicate(
+            KnownGraph.WriteRef<KeyType, ValueType> write,
+            Event<KeyType, ValueType> predicateRead) {
+        var event = write.getEvent();
+        try {
+            var evaluation = predicateRead.getPredicate().evaluate(
+                    new MapVisibleState<>(
+                            Map.of(event.getKey(), event.getValue()),
+                            relationResolverFor(predicateRead)));
+            return evaluation.inputs().containsKey(event.getKey());
+        } catch (QueryException exception) {
+            return false;
         }
     }
 

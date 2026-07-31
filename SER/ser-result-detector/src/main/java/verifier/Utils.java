@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -36,7 +37,6 @@ class Utils {
         private final Transaction<KeyType, ValueType> transaction;
         private final Event<KeyType, ValueType> event;
         private final int index;
-        private final Long writeId;
     }
 
     @lombok.Data
@@ -46,7 +46,6 @@ class Utils {
     }
 
     static <KeyType, ValueType> boolean verifyInternalConsistency(History<KeyType, ValueType> history) {
-        var writesById = new HashMap<Long, WriteRef<KeyType, ValueType>>();
         var writesByKeyValue = new HashMap<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>>();
         var txnWrites = new HashMap<Pair<Transaction<KeyType, ValueType>, KeyType>, ArrayList<Integer>>();
         var getEvents = ((Function<Event.EventType, Stream<Pair<Integer, Event<KeyType, ValueType>>>>) type -> history
@@ -59,10 +58,7 @@ class Utils {
         getEvents.apply(Event.EventType.WRITE).forEach(p -> {
             var i = p.getLeft();
             var ev = p.getRight();
-            var writeRef = new WriteRef<>(ev.getTransaction(), ev, i, ev.getWriteId());
-            if (ev.getWriteId() != null) {
-                writesById.put(ev.getWriteId(), writeRef);
-            }
+            var writeRef = new WriteRef<>(ev.getTransaction(), ev, i);
             writesByKeyValue.computeIfAbsent(Pair.of(ev.getKey(), ev.getValue()), k -> new ArrayList<>()).add(writeRef);
             txnWrites.computeIfAbsent(Pair.of(ev.getTransaction(), ev.getKey()), k -> new ArrayList()).add(i);
         });
@@ -70,7 +66,7 @@ class Utils {
         for (var p : getEvents.apply(Event.EventType.READ).collect(Collectors.toList())) {
             var i = p.getLeft();
             var ev = p.getRight();
-            if (!checkItemRead(ev, i, writesById, writesByKeyValue, txnWrites)) {
+            if (!checkItemRead(ev, i, writesByKeyValue, txnWrites)) {
                 return false;
             }
         }
@@ -86,7 +82,7 @@ class Utils {
                 }
                 var predicate = ev.getPredicate();
                 var identity = predicate == null ? null : predicate.identity();
-                var current = checkPredicateRead(ev, i, writesById, writesByKeyValue,
+                var current = checkPredicateRead(ev, i, writesByKeyValue,
                         txnWrites, previousPredicateReads.get(identity));
                 if (current == null) {
                     return false;
@@ -98,10 +94,10 @@ class Utils {
     }
 
     private static <KeyType, ValueType> boolean checkItemRead(Event<KeyType, ValueType> ev, int i,
-            Map<Long, WriteRef<KeyType, ValueType>> writesById,
             Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue,
             Map<Pair<Transaction<KeyType, ValueType>, KeyType>, ArrayList<Integer>> txnWrites) {
-        var writeEv = resolveReadSource(ev, writesById, writesByKeyValue);
+        var writeEv = resolveUniqueSource(
+                ev.getKey(), ev.getValue(), String.format("%s", ev), writesByKeyValue);
         if (writeEv == null) {
             return false;
         }
@@ -145,7 +141,6 @@ class Utils {
 
     private static <KeyType, ValueType> PredicateReadState<KeyType, ValueType> checkPredicateRead(
             Event<KeyType, ValueType> ev, int pos,
-            Map<Long, WriteRef<KeyType, ValueType>> writesById,
             Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue,
             Map<Pair<Transaction<KeyType, ValueType>, KeyType>, ArrayList<Integer>> txnWrites,
             PredicateReadState<KeyType, ValueType> previous) {
@@ -167,7 +162,11 @@ class Utils {
             }
             resultByKey.put(key, value);
 
-            var ref = resolvePredicateResultSource(ev, result, writesById, writesByKeyValue);
+            var ref = resolveUniqueSource(
+                    result.getKey(), result.getValue(),
+                    String.format("%s result (%s,%s)",
+                            ev, result.getKey(), result.getValue()),
+                    writesByKeyValue);
             if (ref == null) {
                 return null;
             }
@@ -214,41 +213,55 @@ class Utils {
             return null;
         }
 
-        var candidateState = previous == null
-                ? new HashMap<KeyType, ValueType>()
-                : new HashMap<>(previous.getResultByKey());
-        candidateState.putAll(resultByKey);
         int previousIndex = previous == null ? -1 : previous.getEventIndex();
-        for (var entry : txnWrites.entrySet()) {
-            if (entry.getKey().getLeft() != ev.getTransaction()) {
-                continue;
-            }
-            var candidateKey = entry.getKey().getRight();
-            if (!predicate.scope().covers(candidateKey)) {
-                continue;
-            }
-            var latestSelf = latestWriteBefore(entry.getValue(), pos);
-            if (latestSelf > previousIndex) {
-                candidateState.put(candidateKey,
-                        ev.getTransaction().getEvents().get(latestSelf).getValue());
+        var coveredKeys = new HashSet<KeyType>();
+        for (var keyValue : writesByKeyValue.keySet()) {
+            if (predicate.scope().covers(keyValue.getLeft())) {
+                coveredKeys.add(keyValue.getLeft());
             }
         }
 
-        if (!predicateEvaluationMatches(ev, candidateState, resultByKey)) {
-            System.err.printf("%s recorded result disagrees with its known transaction-local snapshot\n", ev);
-            return null;
+        for (var key : coveredKeys) {
+            var selfWrites = txnWrites.get(Pair.of(ev.getTransaction(), key));
+            var latestSelf = latestWriteBefore(selfWrites, pos);
+
+            if (previous != null && latestSelf <= previousIndex) {
+                if (!Objects.equals(resultByKey.get(key), previous.getResultByKey().get(key))
+                        || resultByKey.containsKey(key) != previous.getResultByKey().containsKey(key)) {
+                    System.err.printf("%s does not inherit key %s from its previous identical predicate read\n",
+                            ev, key);
+                    return null;
+                }
+                continue;
+            }
+
+            if (latestSelf < 0) {
+                // No transaction-local basis for this key. Its observation is
+                // external and is left to VIS/AR solving.
+                continue;
+            }
+
+            var latestWrite = ev.getTransaction().getEvents().get(latestSelf);
+            var expectedValue = latestWrite.getValue();
+            var expectedPresent = predicateMatchesRow(ev, key, expectedValue);
+            var actualPresent = resultByKey.containsKey(key);
+            if (expectedPresent != actualPresent
+                    || expectedPresent && !Objects.equals(expectedValue, resultByKey.get(key))) {
+                System.err.printf("%s result for key %s is not determined by latest local write %s\n",
+                        ev, key, latestWrite);
+                return null;
+            }
         }
+
         return new PredicateReadState<>(pos, new HashMap<>(resultByKey));
     }
 
-    private static <KeyType, ValueType> boolean predicateEvaluationMatches(
-            Event<KeyType, ValueType> event,
-            Map<KeyType, ValueType> candidateState,
-            Map<KeyType, ValueType> expectedInputs) {
+    private static <KeyType, ValueType> boolean predicateMatchesRow(
+            Event<KeyType, ValueType> event, KeyType key, ValueType value) {
         var predicate = event.getPredicate();
         var relations = predicate.scope().relations();
-        RelationResolver<KeyType> resolver = key -> {
-            var canonical = String.valueOf(key);
+        RelationResolver<KeyType> resolver = resolvedKey -> {
+            var canonical = String.valueOf(resolvedKey);
             var separator = canonical.indexOf(':');
             if (separator > 0) {
                 return canonical.substring(0, separator);
@@ -260,63 +273,16 @@ class Utils {
         };
 
         try {
-            var evaluation = predicate.evaluate(new MapVisibleState<>(candidateState, resolver));
-            var recorded = event.getRecordedPredicateResult();
-            return recorded == null
-                    ? evaluation.inputs().equals(expectedInputs)
-                    : evaluation.canonicalEquals(recorded);
+            var evaluation = predicate.evaluate(
+                    new MapVisibleState<>(Map.of(key, value), resolver));
+            return evaluation.inputs().containsKey(key)
+                    && Objects.equals(evaluation.inputs().get(key), value);
         } catch (QueryException exception) {
             return false;
         }
     }
 
-    private static <KeyType, ValueType> WriteRef<KeyType, ValueType> resolveReadSource(
-            Event<KeyType, ValueType> ev,
-            Map<Long, WriteRef<KeyType, ValueType>> writesById,
-            Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue) {
-        if (ev.getSourceWriteId() != null) {
-            var ref = writesById.get(ev.getSourceWriteId());
-            if (ref == null) {
-                System.err.printf("%s source_write_id %s has no corresponding write\n",
-                        ev, ev.getSourceWriteId());
-                return null;
-            }
-            if (!sourceMatches(ref, ev.getKey(), ev.getValue())) {
-                System.err.printf("%s source_write_id %s points to (%s,%s)\n",
-                        ev, ev.getSourceWriteId(), ref.getEvent().getKey(), ref.getEvent().getValue());
-                return null;
-            }
-            return ref;
-        }
-        return resolveLegacySource(ev.getKey(), ev.getValue(), String.format("%s", ev), writesByKeyValue);
-    }
-
-    private static <KeyType, ValueType> WriteRef<KeyType, ValueType> resolvePredicateResultSource(
-            Event<KeyType, ValueType> ev,
-            Event.PredResult<KeyType, ValueType> result,
-            Map<Long, WriteRef<KeyType, ValueType>> writesById,
-            Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue) {
-        if (result.getSourceWriteId() != null) {
-            var ref = writesById.get(result.getSourceWriteId());
-            if (ref == null) {
-                System.err.printf("%s result (%s,%s) source_write_id %s has no corresponding write\n",
-                        ev, result.getKey(), result.getValue(), result.getSourceWriteId());
-                return null;
-            }
-            if (!sourceMatches(ref, result.getKey(), result.getValue())) {
-                System.err.printf("%s result (%s,%s) source_write_id %s points to (%s,%s)\n",
-                        ev, result.getKey(), result.getValue(), result.getSourceWriteId(),
-                        ref.getEvent().getKey(), ref.getEvent().getValue());
-                return null;
-            }
-            return ref;
-        }
-        return resolveLegacySource(result.getKey(), result.getValue(),
-                String.format("%s result (%s,%s)", ev, result.getKey(), result.getValue()),
-                writesByKeyValue);
-    }
-
-    private static <KeyType, ValueType> WriteRef<KeyType, ValueType> resolveLegacySource(
+    private static <KeyType, ValueType> WriteRef<KeyType, ValueType> resolveUniqueSource(
             KeyType key,
             ValueType value,
             String context,
@@ -332,12 +298,6 @@ class Utils {
             return null;
         }
         return refs.get(0);
-    }
-
-    private static <KeyType, ValueType> boolean sourceMatches(
-            WriteRef<KeyType, ValueType> ref, KeyType key, ValueType value) {
-        return Objects.equals(ref.getEvent().getKey(), key)
-                && Objects.equals(ref.getEvent().getValue(), value);
     }
 
     static <KeyType, ValueType> Map<Transaction<KeyType, ValueType>, Integer> getOrderInSession(

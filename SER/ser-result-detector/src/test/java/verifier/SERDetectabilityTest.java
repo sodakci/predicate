@@ -470,6 +470,89 @@ public class SERDetectabilityTest {
     }
 
     @Test
+    void internalConsistency_repeatedPredicateCannotReplaceInheritedValue() {
+        var h = new History<String, Integer>();
+        var initSession = h.addSession(-1L);
+        var initTxn = h.addTransaction(initSession, -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var writer = h.addTransaction(h.addSession(1L), 2L);
+        h.addWriteEvent(writer, "x", 20, 101L);
+        writer.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var reader = h.addTransaction(h.addSession(2L), 3L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(reader, predicate,
+                List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
+        h.addPredicateReadEvent(reader, predicate,
+                List.of(new Event.PredResult<>("x", 20, 101L, 2L, 0)));
+        reader.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertFalse(verifier.Utils.verifyInternalConsistency(h),
+                "当前谓词结果不能覆盖无中间写时继承的 x=10");
+    }
+
+    @Test
+    void internalConsistency_emptyFInheritsIdenticalPredicateResult() {
+        var h = new History<String, Integer>();
+        var initSession = h.addSession(-1L);
+        var initTxn = h.addTransaction(initSession, -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var txn = h.addTransaction(h.addSession(0L), 1L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        var result = new Event.PredResult<>("x", 10, 100L, -1L, 0);
+        h.addPredicateReadEvent(txn, predicate, List.of(result));
+        h.addPredicateReadEvent(txn, predicate, List.of(result));
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertTrue(verifier.Utils.verifyInternalConsistency(h),
+                "F 为空时，后一次相同谓词读应允许逐 key 继承相同结果");
+    }
+
+    @Test
+    void internalConsistency_nonEmptyFUsesLastLocalWrite() {
+        var h = new History<String, Integer>();
+        var initSession = h.addSession(-1L);
+        var initTxn = h.addTransaction(initSession, -1L);
+        h.addWriteEvent(initTxn, "x", 10, 100L);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var txn = h.addTransaction(h.addSession(0L), 1L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 10, 100L, -1L, 0)));
+        h.addWriteEvent(txn, "x", 20, 101L);
+        h.addWriteEvent(txn, "x", 3, 102L);
+        h.addPredicateReadEvent(txn, predicate, List.of());
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertTrue(verifier.Utils.verifyInternalConsistency(h),
+                "F 非空时，应由 max_po F 的 x=3 决定当前结果不包含 x");
+    }
+
+    @Test
+    void internalConsistency_nonEmptyGUsesLastLocalWrite() {
+        var h = new History<String, Integer>();
+        var txn = h.addTransaction(h.addSession(0L), 1L);
+        h.addWriteEvent(txn, "x", 3, 100L);
+        h.addWriteEvent(txn, "x", 20, 101L);
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> "x".equals(key) && value > 5;
+        h.addPredicateReadEvent(txn, predicate,
+                List.of(new Event.PredResult<>("x", 20, 101L, 1L, 1)));
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        assertTrue(verifier.Utils.verifyInternalConsistency(h),
+                "首次相同谓词读的 G 非空时，应由 max_po G 的 x=20 决定结果");
+    }
+
+    @Test
     void internalConsistency_interveningLastLocalWriteDeterminesPredicateResult() {
         var h = new History<String, Integer>();
         var initSession = h.addSession(-1L);

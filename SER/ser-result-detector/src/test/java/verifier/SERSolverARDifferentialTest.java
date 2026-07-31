@@ -28,6 +28,7 @@ import org.apache.commons.lang3.tuple.Pair;
 import static history.Event.EventType.READ;
 import static history.Event.EventType.WRITE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -44,8 +45,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *  - SERVerifier with coalescing on/off;
  *  - the production MonoSAT solver path.
  *
- * Important: the oracle is source_write_id-first when source ids are present.
- * Compact PRHIST cases omit source ids and use unique (key,value) as identity.
+ * Production verifier cases use unique (key,value) as write identity.
  */
 class SERSolverARDifferentialTest {
     private static final long INIT_SESSION_ID = -1L;
@@ -67,7 +67,6 @@ class SERSolverARDifferentialTest {
                 ordinaryOldVersionSatisfiedButCurrentDoesNot(),
                 currentVersionSatisfiedButPredicateOmits(),
                 predicateContainsNewVersionOldBottomDoesNotConflict(),
-                sameValueDifferentWriteIdPointRead(),
                 widePredicateMissingOneKey(),
                 selfWriteVisibleInPredicate()
         );
@@ -83,6 +82,14 @@ class SERSolverARDifferentialTest {
                 assertVerifierMatchesOracle(testCase.history, oracle, -10_000 - i, "hand:" + testCase.name);
             }
         }
+    }
+
+    @Test
+    void duplicateKeyValueCannotBeDisambiguatedByResidualSourceId() {
+        var history = sameValueDifferentWriteIdPointRead().history;
+
+        assertFalse(Utils.verifyInternalConsistency(history),
+                "current compact PRHIST semantics require unique (key,value) writes");
     }
 
     @Test
@@ -754,9 +761,7 @@ class SERSolverARDifferentialTest {
             return;
         }
         var key = randomElement(random, candidates);
-        int value = random.nextDouble() < 0.25 && !knownWrites.get(key).isEmpty()
-                ? randomElement(random, knownWrites.get(key)).value
-                : 100 + (int) nextWriteId[0];
+        int value = 100 + (int) nextWriteId[0];
         addWrite(history, txn, key, value, nextWriteId[0]++, txn.getId(), knownWrites);
         localWrittenKeys.add(key);
     }
