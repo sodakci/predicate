@@ -59,8 +59,14 @@ class Audit implements Callable<Integer> {
     @Option(names = { "--solver-timeout-seconds" }, description = "SAT solver timeout in seconds; 0 disables backend timeout")
     private int solverTimeoutSeconds = 600;
 
-    @Option(names = { "--solver-stats" }, description = "print SAT backend and CNF statistics")
+    @Option(names = { "--solver-stats" },
+            description = "print SAT backend and detailed predicate encoding statistics")
     private final Boolean solverStats = false;
+
+    @Option(names = { "--predicate-solving-mode" },
+            description = "predicate solving mode: ${COMPLETION-CANDIDATES}")
+    private SERVerifier.PredicateSolvingMode predicateSolvingMode =
+            SERVerifier.PredicateSolvingMode.CALFE;
 
     @Parameters(description = "history path")
     private Path path;
@@ -83,15 +89,20 @@ class Audit implements Callable<Integer> {
 
         profiler.startTick("ENTIRE_EXPERIMENT");
         var pass = true;
-        var verifier = new SERVerifier<>(loader);
+        var verifier = new SERVerifier<>(loader, solverStats, predicateSolvingMode);
         pass = verifier.audit();
         profiler.endTick("ENTIRE_EXPERIMENT");
 
         for (var p : profiler.getDurations()) {
             System.err.printf("%s: %dms\n", p.getKey(), p.getValue());
         }
+        for (var p : profiler.getCounts()) {
+            System.err.printf("%s: %d\n", p.getKey(), p.getValue());
+        }
         if (solverStats) {
             System.err.println("[solver-stats] backend=monosat");
+            System.err.printf("[solver-stats] predicate-solving-mode=%s%n",
+                    predicateSolvingMode.name().toLowerCase());
         }
         System.err.printf("Max memory: %s\n", Utils.formatMemory(profiler.getMaxMemory()));
 

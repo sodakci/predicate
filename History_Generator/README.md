@@ -214,8 +214,20 @@ RATE
 KV_PREDICATE_ANOMALY
     none、write-skew 或 lost-update。
 
+KV_PREDICATE_ANOMALY_VARIANT
+    write-skew 使用 injected 或 control；control 把右侧写从 k0 改到 k2，因而不形成对应的反向 PR_RW。
+
+KV_PREDICATE_ANOMALY_SEED
+    write-skew 核心事务内谓词/写位置的可复现布局 seed。
+
+KV_PREDICATE_ANOMALY_ISOLATE_BACKGROUND
+    write-skew 默认 true；普通点操作始终避开 k0..k4，true 额外把背景谓词固定为空谓词 value < 0。
+
 KV_PREDICATE_ANOMALY_DELAY_MS
     write-skew/lost-update 模式中的并发交错等待时间。
+
+RANDOM_SEED
+    BenchBase 普通事务随机数 seed。
 
 EXPECTED_VERDICT
     可选；写入 manifest 的预期检测结果，例如 lost-update 使用 REJECT。
@@ -330,7 +342,7 @@ done
 
 `PREDICATE_READ_RATIO` 是逐操作概率，例如 `20` 表示全部操作中约 20% 为谓词读；剩余 80% 中点读和写各约一半，因此三类操作约为 20% 谓词读、40% 点读、40% 写。`KEY_DIST` 只控制具有单一 key 的点读和写；谓词读本身没有单一目标 key。`hotspot` 使用 80/20 规则，即约 80% 的点读和写访问前 20% active keys。为了让物理表行数保持为 `KEY_COUNT`，矩阵命令固定使用 `MAX_WRITES_PER_KEY=2147483647`。
 
-严格的 `ops/txn` 只适用于 `KV_PREDICATE_ANOMALY=none`；write-skew 和 lost-update 的两个注入核心事务固定为各自的异常操作结构。100 万行上的全表/范围谓词可能返回大量结果，应根据机器性能增大 `TIME_SECONDS_PER_CASE`。
+write-skew 的两个核心事务各生成 `MAX_TXN_LENGTH` 个可见操作；lost-update 的两个核心事务仍使用固定异常操作结构。100 万行上的全表/范围谓词可能返回大量结果，应根据机器性能增大 `TIME_SECONDS_PER_CASE`。
 
 ## 运行 KV Write-Skew 对照
 
@@ -342,11 +354,15 @@ PGPASSFILE=kv/.runtime/pgpass \
 CASE_NAME=kvpredicate_repeatable_read_write_skew_20260706 \
 ISOLATION=TRANSACTION_REPEATABLE_READ \
 KV_PREDICATE_ANOMALY=write-skew \
+KV_PREDICATE_ANOMALY_VARIANT=injected \
+KV_PREDICATE_ANOMALY_SEED=17 \
+KV_PREDICATE_ANOMALY_ISOLATE_BACKGROUND=true \
 KV_PREDICATE_ANOMALY_DELAY_MS=1000 \
-KEY_COUNT=2 \
-MIN_TXN_LENGTH=1 \
-MAX_TXN_LENGTH=4 \
+KEY_COUNT=6 \
+MIN_TXN_LENGTH=15 \
+MAX_TXN_LENGTH=15 \
 TERMINALS=2 \
+TXNS_PER_SESSION=1 \
 TIME_SECONDS=5 \
 RATE=2 \
 KEY_DIST=uniform \
@@ -361,11 +377,15 @@ PGPASSFILE=kv/.runtime/pgpass \
 CASE_NAME=kvpredicate_serializable_write_skew_20260706 \
 ISOLATION=TRANSACTION_SERIALIZABLE \
 KV_PREDICATE_ANOMALY=write-skew \
+KV_PREDICATE_ANOMALY_VARIANT=injected \
+KV_PREDICATE_ANOMALY_SEED=17 \
+KV_PREDICATE_ANOMALY_ISOLATE_BACKGROUND=true \
 KV_PREDICATE_ANOMALY_DELAY_MS=1000 \
-KEY_COUNT=2 \
-MIN_TXN_LENGTH=1 \
-MAX_TXN_LENGTH=4 \
+KEY_COUNT=6 \
+MIN_TXN_LENGTH=15 \
+MAX_TXN_LENGTH=15 \
 TERMINALS=2 \
+TXNS_PER_SESSION=1 \
 TIME_SECONDS=5 \
 RATE=2 \
 KEY_DIST=uniform \
@@ -373,7 +393,7 @@ PREDICATE_GROUP_COUNT=2 \
 ./kv/run_kvpredicate_history_case.sh
 ```
 
-建议 `TERMINALS=2`。更多 worker 可能在脚本化事务等待时抢先更新 `k0/k1`，导致异常核心事务进入 retry/abort。
+write-skew 要求 `TERMINALS >= 2`、`KEY_COUNT >= 6` 和 `MAX_TXN_LENGTH >= 2`。默认保留 `k0..k4`：`k0/k1` 构造谓词环，`k2` 是 control 写入点，`k3/k4` 是左右核心事务的填充读键；普通点操作只访问 `k5` 及以后。`injected` 产生 `left -PR_RW(k0)-> right -PR_RW(k1)-> left`，`control` 只保留 `right -PR_RW(k1)-> left`。做最小因果验证时固定 `TERMINALS=2`、`TXNS_PER_SESSION=1`，并分别运行 injected/control；转换后的 manifest 会记录核心事务、实际操作位置、预期边和是否预期成环，但不会自动写入 detector verdict。
 
 ## 生成 100 事务 KV Lost-Update 历史
 

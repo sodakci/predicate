@@ -85,6 +85,9 @@ kv/config/kvpredicate_trace.xml
 <maxTxnLength>4</maxTxnLength>
 <predicateGroupCount>4</predicateGroupCount>
 <kvPredicateAnomaly>none</kvPredicateAnomaly>
+<kvPredicateAnomalyVariant>injected</kvPredicateAnomalyVariant>
+<kvPredicateAnomalySeed>1</kvPredicateAnomalySeed>
+<kvPredicateAnomalyIsolateBackground>true</kvPredicateAnomalyIsolateBackground>
 ```
 
 ### 3. KvPredicateBenchmark.java
@@ -97,7 +100,11 @@ kv/config/kvpredicate_trace.xml
 - 支持 `uniform`、`exponential`、`zipf` key 分布。
 - 支持 `minTxnLength` / `maxTxnLength` 事务长度范围。
 - 维护全局递增写入值，保证每次写产生唯一版本。
-- 在 `kvPredicateAnomaly=write-skew` 时生成两个脚本化并发事务。
+- 在 `kvPredicateAnomaly=write-skew` 时生成两个可复现、可审计的脚本化并发事务。
+
+write-skew 模式保留 `k0..k4`，普通点读/写只从 `k5` 开始选择。左核心事务执行 `predicate(value=0)` 后写 `k1`，右核心事务执行 `predicate(value=1)`；`injected` 右侧写 `k0`，形成两条反向 `PR_RW`，`control` 只把该写改到隔离的 `k2`。`k3/k4` 分别用于左右核心事务的填充点读，使每个核心事务具有 `maxTxnLength` 个可见操作。谓词和写的位置由 `kvPredicateAnomalySeed` 决定，且谓词始终先于写。
+
+`kvPredicateAnomalyIsolateBackground=true` 时，背景谓词固定为结果为空的 `value < 0`，避免背景谓词因核心写而改变结果。该模式要求 `keyCount >= 6`、`maxTxnLength >= 2` 和至少两个 terminals。
 
 ### 4. KvPredicateLoader.java
 
@@ -123,8 +130,9 @@ k2 -> 2
 
 ```text
 executeWork()
-  -> KvPredicateTrace.begin(...)
   -> getBenchmark().nextTransaction(...)
+  -> 为异常核心事务生成 txn_type 标签
+  -> KvPredicateTrace.begin(...)
   -> Txn.run(...)
 ```
 
@@ -367,6 +375,7 @@ kv/kvpredicate_trace_to_prhist.py
 - `initial` 记录写入 `initial_state.json`。
 - committed `txn` 记录写入 `history.prhist.jsonl`。
 - `abort` 记录不进入 history，只统计到 manifest 并保留在 raw trace。
+- 带异常标签的事务会被严格校验，并在 manifest 的 `anomaly_injection` 中记录 variant、seed、核心事务、操作位置、保留键和预期依赖边。
 - 按 `op_index` 排列事务内操作。
 - `w` 转成 `{"type":"w","key":"...","value":...}`。
 - `r` 转成 `{"type":"r","key":"...","value":...}`。

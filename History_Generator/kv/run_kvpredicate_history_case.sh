@@ -30,11 +30,15 @@ fi
 BUILD=${BUILD:-true}
 LOAD=${LOAD:-true}
 KV_PREDICATE_ANOMALY=${KV_PREDICATE_ANOMALY:-}
+KV_PREDICATE_ANOMALY_VARIANT=${KV_PREDICATE_ANOMALY_VARIANT:-injected}
+KV_PREDICATE_ANOMALY_SEED=${KV_PREDICATE_ANOMALY_SEED:-1}
+KV_PREDICATE_ANOMALY_ISOLATE_BACKGROUND=${KV_PREDICATE_ANOMALY_ISOLATE_BACKGROUND:-true}
 EXPECTED_VERDICT=${EXPECTED_VERDICT:-}
 SERIAL_ORDER=${SERIAL_ORDER:-}
 ISOLATION=${ISOLATION:-}
 TXNS_PER_SESSION=${TXNS_PER_SESSION:-}
 PREDICATE_READ_RATIO=${PREDICATE_READ_RATIO:-}
+RANDOM_SEED=${RANDOM_SEED:-}
 
 case "$KV_PREDICATE_ANOMALY" in
   ""|none|write-skew|lost-update) ;;
@@ -43,6 +47,32 @@ case "$KV_PREDICATE_ANOMALY" in
     exit 2
     ;;
 esac
+
+case "$KV_PREDICATE_ANOMALY_VARIANT" in
+  injected|control) ;;
+  *)
+    echo "KV_PREDICATE_ANOMALY_VARIANT must be injected or control" >&2
+    exit 2
+    ;;
+esac
+
+if [[ ! "$KV_PREDICATE_ANOMALY_SEED" =~ ^-?[0-9]+$ ]]; then
+  echo "KV_PREDICATE_ANOMALY_SEED must be an integer" >&2
+  exit 2
+fi
+
+case "$KV_PREDICATE_ANOMALY_ISOLATE_BACKGROUND" in
+  true|false) ;;
+  *)
+    echo "KV_PREDICATE_ANOMALY_ISOLATE_BACKGROUND must be true or false" >&2
+    exit 2
+    ;;
+esac
+
+if [[ -n "$RANDOM_SEED" && ! "$RANDOM_SEED" =~ ^-?[0-9]+$ ]]; then
+  echo "RANDOM_SEED must be an integer" >&2
+  exit 2
+fi
 
 if [[ "$KV_PREDICATE_ANOMALY" == "lost-update" ]]; then
   ISOLATION=${ISOLATION:-TRANSACTION_READ_COMMITTED}
@@ -89,9 +119,13 @@ export DB_NAME
 export DB_USER
 export DB_PASSWORD
 export KV_PREDICATE_ANOMALY
+export KV_PREDICATE_ANOMALY_VARIANT
+export KV_PREDICATE_ANOMALY_SEED
+export KV_PREDICATE_ANOMALY_ISOLATE_BACKGROUND
 export ISOLATION
 export TXNS_PER_SESSION
 export PREDICATE_READ_RATIO
+export RANDOM_SEED
 
 python3 - "$BASE_CONFIG" "$KVPREDICATE_CONFIG" <<'PY'
 import os
@@ -133,7 +167,11 @@ overrides = {
     "predicateReadRatio": "PREDICATE_READ_RATIO",
     "mopDelayMs": "MOP_DELAY_MS",
     "kvPredicateAnomaly": "KV_PREDICATE_ANOMALY",
+    "kvPredicateAnomalyVariant": "KV_PREDICATE_ANOMALY_VARIANT",
+    "kvPredicateAnomalySeed": "KV_PREDICATE_ANOMALY_SEED",
+    "kvPredicateAnomalyIsolateBackground": "KV_PREDICATE_ANOMALY_ISOLATE_BACKGROUND",
     "kvPredicateAnomalyDelayMs": "KV_PREDICATE_ANOMALY_DELAY_MS",
+    "randomSeed": "RANDOM_SEED",
     "terminals": "TERMINALS",
     "works/work/time": "TIME_SECONDS",
     "works/work/rate": "RATE",
@@ -141,6 +179,14 @@ overrides = {
 
 for path, env_name in overrides.items():
     set_text(path, env_name)
+
+if (
+    root.findtext("kvPredicateAnomaly", "none").lower() != "write-skew"
+    and root.findtext("kvPredicateAnomalyVariant", "injected").lower() == "control"
+):
+    raise SystemExit(
+        "KV_PREDICATE_ANOMALY_VARIANT=control requires effective kvPredicateAnomaly=write-skew"
+    )
 
 if os.environ.get("DB_HOST") or os.environ.get("DB_NAME") or os.environ.get("DB_USER"):
     host = os.environ.get("DB_HOST", "127.0.0.1")

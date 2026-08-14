@@ -17,7 +17,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.commons.configuration2.XMLConfiguration;
 
 public final class KvPredicateBenchmark extends BenchmarkModule {
+  private static final String ANOMALY_WRITE_SKEW = "write-skew";
   private static final String ANOMALY_LOST_UPDATE = "lost-update";
+  private static final String ANOMALY_VARIANT_INJECTED = "injected";
+  private static final String ANOMALY_VARIANT_CONTROL = "control";
+  private static final int WRITE_SKEW_RESERVED_KEY_COUNT = 5;
+  private static final long WRITE_SKEW_CONTROL_KEY = 2L;
+  private static final long WRITE_SKEW_LEFT_PADDING_KEY = 3L;
+  private static final long WRITE_SKEW_RIGHT_PADDING_KEY = 4L;
+  private static final String ANOMALY_TRACE_MARKER = "|kvpredicate-anomaly:";
 
   private final int keyCount;
   private final String keyDist;
@@ -31,6 +39,9 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
   private final double predicateReadRatio;
   private final long mopDelayMillis;
   private final String anomalyMode;
+  private final String anomalyVariant;
+  private final long anomalySeed;
+  private final boolean anomalyIsolateBackground;
   private final long anomalyDelayMillis;
   private final double[] zipfCdf;
 
@@ -51,10 +62,6 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
     String configuredKeyDist = getString(xml, "keyDist", "exponential").toLowerCase();
     this.keyDist = "zipfian".equals(configuredKeyDist) ? "zipf" : configuredKeyDist;
     this.keyDistBase = getDouble(xml, "keyDistBase", 2.0);
-    this.keyDistScale =
-        "exponential".equals(this.keyDist)
-            ? keyDistScale(this.keyDistBase, this.keyCount)
-            : 0.0;
     this.minTxnLength = getInt(xml, "minTxnLength", 1);
     this.maxTxnLength = getInt(xml, "maxTxnLength", 4);
     this.maxWritesPerKey = getInt(xml, "maxWritesPerKey", 256);
@@ -63,6 +70,10 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
     this.predicateReadRatio = getDouble(xml, "predicateReadRatio", 100.0 / 3.0);
     this.mopDelayMillis = getLong(xml, "mopDelayMs", 0L);
     this.anomalyMode = getString(xml, "kvPredicateAnomaly", "none").toLowerCase();
+    this.anomalyVariant =
+        getString(xml, "kvPredicateAnomalyVariant", ANOMALY_VARIANT_INJECTED).toLowerCase();
+    this.anomalySeed = getLong(xml, "kvPredicateAnomalySeed", 1L);
+    this.anomalyIsolateBackground = getBoolean(xml, "kvPredicateAnomalyIsolateBackground", true);
     this.anomalyDelayMillis = getLong(xml, "kvPredicateAnomalyDelayMs", 250L);
 
     if (this.keyCount <= 0) {
@@ -92,6 +103,19 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
     if (this.predicateReadRatio < 0.0 || this.predicateReadRatio > 100.0) {
       throw new IllegalArgumentException("predicateReadRatio must be between 0 and 100");
     }
+    if (!ANOMALY_VARIANT_INJECTED.equals(this.anomalyVariant)
+        && !ANOMALY_VARIANT_CONTROL.equals(this.anomalyVariant)) {
+      throw new IllegalArgumentException("kvPredicateAnomalyVariant must be injected or control");
+    }
+    if (writeSkewEnabled() && this.keyCount < WRITE_SKEW_RESERVED_KEY_COUNT + 1) {
+      throw new IllegalArgumentException("write-skew requires keyCount >= 6");
+    }
+    if (writeSkewEnabled() && this.maxTxnLength < 2) {
+      throw new IllegalArgumentException("write-skew requires maxTxnLength >= 2");
+    }
+    if (writeSkewEnabled() && workConf.getTerminals() < 2) {
+      throw new IllegalArgumentException("write-skew requires at least 2 terminals");
+    }
     if (lostUpdateEnabled() && this.keyCount < 2) {
       throw new IllegalArgumentException("lost-update requires keyCount >= 2");
     }
@@ -103,12 +127,16 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
       throw new IllegalArgumentException(
           "kvPredicateAnomaly=lost-update requires TRANSACTION_READ_COMMITTED");
     }
-    int ordinaryKeyCount = lostUpdateEnabled() ? this.keyCount - 1 : this.keyCount;
-    for (int key = 0; key < ordinaryKeyCount; key++) {
+    int ordinaryKeyStart = writeSkewEnabled() ? WRITE_SKEW_RESERVED_KEY_COUNT : 0;
+    int ordinaryKeyEnd = lostUpdateEnabled() ? this.keyCount - 1 : this.keyCount;
+    for (int key = ordinaryKeyStart; key < ordinaryKeyEnd; key++) {
       this.activeKeys.add((long) key);
     }
+    int ordinaryKeyCount = ordinaryKeyEnd - ordinaryKeyStart;
     this.nextKey = this.keyCount;
     this.nextWrite = lostUpdateEnabled() ? this.keyCount + 2L : this.keyCount;
+    this.keyDistScale =
+        "exponential".equals(this.keyDist) ? keyDistScale(this.keyDistBase, ordinaryKeyCount) : 0.0;
     this.zipfCdf = "zipf".equals(this.keyDist) ? buildZipfCdf(ordinaryKeyCount) : null;
   }
 
@@ -124,12 +152,16 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
     return ANOMALY_LOST_UPDATE.equals(anomalyMode);
   }
 
+  boolean writeSkewEnabled() {
+    return ANOMALY_WRITE_SKEW.equals(anomalyMode);
+  }
+
   long lostUpdateKey() {
     return keyCount - 1L;
   }
 
   List<KvPredicateOperation> nextTransaction(int workerId, Random random) {
-    if ("write-skew".equals(anomalyMode) && workConf.getTerminals() >= 2) {
+    if (writeSkewEnabled()) {
       int assignment = scriptedAssignments.getAndIncrement();
       if (assignment < 2) {
         return writeSkewTransaction(assignment);
@@ -147,18 +179,80 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
   private List<KvPredicateOperation> writeSkewTransaction(int assignment) {
     long writeValue;
     synchronized (generatorLock) {
-      long writeKey = assignment == 0 ? 1 : 0;
       writeValue = nextWrite++;
-      rotateKey(writeKey);
     }
-    List<KvPredicateOperation> ops = new ArrayList<>();
-    ops.add(KvPredicateOperation.predicateEquals(assignment == 0 ? 0 : 1));
-    ops.add(KvPredicateOperation.barrier(writeSkewBarrier, Math.max(5000L, anomalyDelayMillis * 8L)));
-    if (anomalyDelayMillis > 0) {
-      ops.add(KvPredicateOperation.sleep(anomalyDelayMillis));
+    Random layout = new Random(anomalySeed + 0x9E3779B97F4A7C15L * (assignment + 1L));
+    int predicatePosition = layout.nextInt(maxTxnLength - 1);
+    int writePosition =
+        predicatePosition + 1 + layout.nextInt(maxTxnLength - predicatePosition - 1);
+    long predicateValue = assignment == 0 ? 0L : 1L;
+    long paddingKey = assignment == 0 ? WRITE_SKEW_LEFT_PADDING_KEY : WRITE_SKEW_RIGHT_PADDING_KEY;
+    long writeKey;
+    if (assignment == 0) {
+      writeKey = 1L;
+    } else if (ANOMALY_VARIANT_CONTROL.equals(anomalyVariant)) {
+      writeKey = WRITE_SKEW_CONTROL_KEY;
+    } else {
+      writeKey = 0L;
     }
-    ops.add(KvPredicateOperation.write(assignment == 0 ? 1 : 0, writeValue));
+
+    List<KvPredicateOperation> ops = new ArrayList<>(maxTxnLength + 2);
+    for (int position = 0; position < maxTxnLength; position++) {
+      if (position == predicatePosition) {
+        ops.add(KvPredicateOperation.predicateEquals(predicateValue));
+        ops.add(
+            KvPredicateOperation.barrier(
+                writeSkewBarrier, Math.max(5000L, anomalyDelayMillis * 8L)));
+        if (anomalyDelayMillis > 0) {
+          ops.add(KvPredicateOperation.sleep(anomalyDelayMillis));
+        }
+      } else if (position == writePosition) {
+        ops.add(KvPredicateOperation.write(writeKey, writeValue));
+      } else {
+        ops.add(KvPredicateOperation.read(paddingKey));
+      }
+    }
     return ops;
+  }
+
+  String traceTransactionType(
+      String defaultTransactionType, List<KvPredicateOperation> operations) {
+    if (!writeSkewEnabled()) {
+      return defaultTransactionType;
+    }
+    Long predicateTarget = null;
+    boolean containsWriteSkewBarrier = false;
+    for (KvPredicateOperation operation : operations) {
+      if (operation.kind == KvPredicateOperation.Kind.BARRIER
+          && operation.barrier == writeSkewBarrier) {
+        containsWriteSkewBarrier = true;
+      } else if (operation.kind == KvPredicateOperation.Kind.PREDICATE
+          && operation.predicateKind == KvPredicateOperation.PredicateKind.EQUALS) {
+        predicateTarget = operation.target;
+      }
+    }
+    if (!containsWriteSkewBarrier || predicateTarget == null) {
+      return defaultTransactionType;
+    }
+    String role;
+    if (predicateTarget == 0L) {
+      role = "left";
+    } else if (predicateTarget == 1L) {
+      role = "right";
+    } else {
+      return defaultTransactionType;
+    }
+    return defaultTransactionType
+        + ANOMALY_TRACE_MARKER
+        + ANOMALY_WRITE_SKEW
+        + ":"
+        + anomalyVariant
+        + ":"
+        + role
+        + ":"
+        + anomalySeed
+        + ":"
+        + anomalyIsolateBackground;
   }
 
   private List<KvPredicateOperation> lostUpdateTransaction(int assignment) {
@@ -196,6 +290,9 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
   }
 
   private KvPredicateOperation randomPredicate(Random random) {
+    if (writeSkewEnabled() && anomalyIsolateBackground) {
+      return KvPredicateOperation.predicateLessThan(0L);
+    }
     if (lostUpdateEnabled()) {
       long target = nonNegativeLong(random, keyCount - 1L);
       return random.nextBoolean()
@@ -324,6 +421,10 @@ public final class KvPredicateBenchmark extends BenchmarkModule {
 
   private static String getString(XMLConfiguration xml, String key, String defaultValue) {
     return xml != null && xml.containsKey(key) ? xml.getString(key) : defaultValue;
+  }
+
+  private static boolean getBoolean(XMLConfiguration xml, String key, boolean defaultValue) {
+    return xml != null && xml.containsKey(key) ? xml.getBoolean(key) : defaultValue;
   }
 
   @Override

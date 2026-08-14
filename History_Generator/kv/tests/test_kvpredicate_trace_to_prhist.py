@@ -10,6 +10,105 @@ from kvpredicate_trace_to_prhist import ConversionError, convert
 
 
 class KvPredicateTraceToPrhistTest(unittest.TestCase):
+    def test_conversion_records_injected_write_skew_metadata(self):
+        rows = [
+            {
+                "record_type": "initial",
+                "key": f"kv:{key}",
+                "value": key,
+                "semantic": key,
+                "row": {"k": f"k{key}", "value": key},
+            }
+            for key in range(5)
+        ]
+        rows.extend(
+            [
+                {
+                    "record_type": "txn",
+                    "txn": 10,
+                    "session": 0,
+                    "session_seq": 1,
+                    "txn_type": (
+                        "Txn|kvpredicate-anomaly:write-skew:injected:left:17:true"
+                    ),
+                    "status": "commit",
+                    "ops": [
+                        {
+                            "op_index": 0,
+                            "type": "pr",
+                            "predicate": {"kind": "eq", "value": 0},
+                            "results": [
+                                {"key": "kv:0", "key_id": 0, "value": 0, "semantic": 0}
+                            ],
+                            "read_versions": [
+                                {"key": "kv:0", "key_id": 0, "value": 0, "semantic": 0}
+                            ],
+                        },
+                        {
+                            "op_index": 1,
+                            "type": "w",
+                            "key": "kv:1",
+                            "value": 5,
+                            "semantic": 5,
+                        },
+                    ],
+                },
+                {
+                    "record_type": "txn",
+                    "txn": 11,
+                    "session": 1,
+                    "session_seq": 1,
+                    "txn_type": (
+                        "Txn|kvpredicate-anomaly:write-skew:injected:right:17:true"
+                    ),
+                    "status": "commit",
+                    "ops": [
+                        {
+                            "op_index": 0,
+                            "type": "pr",
+                            "predicate": {"kind": "eq", "value": 1},
+                            "results": [
+                                {"key": "kv:1", "key_id": 1, "value": 1, "semantic": 1}
+                            ],
+                            "read_versions": [
+                                {"key": "kv:1", "key_id": 1, "value": 1, "semantic": 1}
+                            ],
+                        },
+                        {
+                            "op_index": 1,
+                            "type": "w",
+                            "key": "kv:0",
+                            "value": 6,
+                            "semantic": 6,
+                        },
+                    ],
+                },
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "raw.jsonl"
+            raw.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            manifest = convert(raw, root / "case" / "hist-00000")
+
+            anomaly = manifest["anomaly_injection"]
+            self.assertEqual(anomaly["mode"], "write-skew")
+            self.assertEqual(anomaly["variant"], "injected")
+            self.assertEqual(anomaly["layout_seed"], 17)
+            self.assertTrue(anomaly["background_predicates_isolated"])
+            self.assertTrue(anomaly["expected_cycle"])
+            self.assertEqual(
+                [(edge["from_txn"], edge["to_txn"], edge["key"])
+                 for edge in anomaly["expected_dependency_edges"]],
+                [(10, 11, "kv:0"), (11, 10, "kv:1")],
+            )
+            self.assertEqual(
+                [(txn["role"], txn["txn"], txn["write_key"])
+                 for txn in anomaly["core_transactions"]],
+                [("left", 10, "kv:1"), ("right", 11, "kv:0")],
+            )
+
     def test_conversion_preserves_kv_predicate_workload(self):
         rows = [
             {

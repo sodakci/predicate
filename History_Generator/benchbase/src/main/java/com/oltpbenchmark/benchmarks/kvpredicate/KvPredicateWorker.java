@@ -33,11 +33,6 @@ public final class KvPredicateWorker extends Worker<KvPredicateBenchmark> {
   @Override
   protected TransactionStatus executeWork(Connection conn, TransactionType nextTrans)
       throws UserAbortException, SQLException {
-    activeTraceSessionSequence = ++traceSessionSequence;
-    activeTraceTransactionType = nextTrans.getName();
-    activeTraceXid =
-        KvPredicateTrace.begin(conn, getId(), activeTraceSessionSequence, activeTraceTransactionType);
-
     List<KvPredicateOperation> operations;
     if (pendingRetryOperations.isEmpty()) {
       operations = getBenchmark().nextTransaction(getId(), rng());
@@ -46,6 +41,18 @@ public final class KvPredicateWorker extends Worker<KvPredicateBenchmark> {
       pendingRetryOperations = List.of();
     }
     activeOperations = operations;
+    activeTraceSessionSequence = ++traceSessionSequence;
+    activeTraceTransactionType =
+        getBenchmark().traceTransactionType(nextTrans.getName(), operations);
+    try {
+      activeTraceXid =
+          KvPredicateTrace.begin(
+              conn, getId(), activeTraceSessionSequence, activeTraceTransactionType);
+    } catch (SQLException ex) {
+      pendingRetryOperations = activeOperations;
+      activeOperations = List.of();
+      throw ex;
+    }
     this.procTxn.run(conn, operations);
     return TransactionStatus.SUCCESS;
   }

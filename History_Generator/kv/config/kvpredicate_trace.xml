@@ -25,6 +25,9 @@
 
     <!-- Set to write-skew to run the two-transaction anomaly core first. -->
     <kvPredicateAnomaly>none</kvPredicateAnomaly>
+    <kvPredicateAnomalyVariant>injected</kvPredicateAnomalyVariant>
+    <kvPredicateAnomalySeed>1</kvPredicateAnomalySeed>
+    <kvPredicateAnomalyIsolateBackground>true</kvPredicateAnomalyIsolateBackground>
     <kvPredicateAnomalyDelayMs>250</kvPredicateAnomalyDelayMs>
 
     <terminals>4</terminals>

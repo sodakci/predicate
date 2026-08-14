@@ -10,15 +10,19 @@ import history.query.MapVisibleState;
 import history.query.QueryEvaluation;
 import history.query.QueryException;
 import history.query.QueryPlan;
+import history.query.QueryScope;
 import history.query.RelationResolver;
+import history.query.RowContribution;
 import monosat.Graph;
 import monosat.Lit;
 import monosat.Logic;
 import monosat.Solver;
 import com.google.common.graph.EndpointPair;
 import org.apache.commons.lang3.tuple.Pair;
+import util.Profiler;
 
 import java.util.*;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 /**
@@ -31,11 +35,19 @@ import java.util.stream.Collectors;
  * RW edges, and predicate-read visibility constraints on top of that order.</p>
  */
 class SERSolverAR<KeyType, ValueType> {
+    private static final int COMPACT_MATCH_UNAVAILABLE = -1;
+    private static final int COMPACT_MATCH_INVALID = 0;
+    private static final int COMPACT_MATCH_FALSE = 1;
+    private static final int COMPACT_MATCH_TRUE = 2;
+    private static final int MAX_GENERAL_ROW_CONTRIBUTIONS = 32_768;
+
     private final History<KeyType, ValueType> history;
     private final KnownGraph<KeyType, ValueType> graph;
     private final Collection<SERConstraint<KeyType, ValueType>> constraints;
     private final Solver solver = new Solver();
     private final boolean collectConflicts;
+    private final boolean collectPredicateMetrics;
+    private final SERVerifier.PredicateSolvingMode predicateSolvingMode;
 
     private final List<Transaction<KeyType, ValueType>> txns;
     private final Map<Transaction<KeyType, ValueType>, Integer> txnIndex;
@@ -52,9 +64,39 @@ class SERSolverAR<KeyType, ValueType> {
     // Per-key write lists provide the local write order candidates used by WW/RW
     // and predicate-read encodings.
     private final Map<KeyType, List<KnownGraph.WriteRef<KeyType, ValueType>>> writesByKey;
+    // Sort the complete key universe once. Each index retains the original
+    // write order and precomputes the last write of every writer transaction.
+    private final List<KeyWriteIndex<KeyType, ValueType>> sortedKeyWriteIndexes;
+    // Only scopes with an explicit stable value key participate in this cache.
+    private final Map<Object, List<KeyWriteIndex<KeyType, ValueType>>> scopedWritesCache =
+            new HashMap<>();
+    // Row contribution caches are intentionally solver-local. Compact k/value
+    // plans use three BitSets; general row-local projections use a bounded LRU.
+    private final IdentityHashMap<KnownGraph.WriteRef<KeyType, ValueType>, Integer> writeRefIds =
+            new IdentityHashMap<>();
+    private final IdentityHashMap<QueryPlan<KeyType, ValueType>, CompactRowMatchCache>
+            compactRowMatchCaches = new IdentityHashMap<>();
+    private final IdentityHashMap<QueryPlan<KeyType, ValueType>, Integer>
+            rowContributionPlanIds = new IdentityHashMap<>();
+    private final IdentityHashMap<Event<KeyType, ValueType>, QueryPlan<KeyType, ValueType>>
+            rowLocalQueryPlans = new IdentityHashMap<>();
+    private int nextRowContributionPlanId;
+    private final LinkedHashMap<Long, CachedRowContribution<KeyType>> generalRowContributions =
+            new LinkedHashMap<Long, CachedRowContribution<KeyType>>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(
+                        Map.Entry<Long, CachedRowContribution<KeyType>> eldest) {
+                    return size() > MAX_GENERAL_ROW_CONTRIBUTIONS;
+                }
+            };
+    private final PredicateEncodingMetrics predicateEncodingMetrics =
+            new PredicateEncodingMetrics();
+    private boolean collectingPredicateMetrics;
     // Predicate constraints are refined lazily from concrete SAT models.  This
     // avoids eagerly enumerating the Cartesian product of every key frontier.
     private final List<PredicateCheck<KeyType, ValueType>> predicateChecks = new ArrayList<>();
+    private final List<RowLocalPredicateCheck<KeyType, ValueType>> rowLocalPredicateChecks =
+            new ArrayList<>();
     // Writer comparability is key-local and independent of the predicate read.
     // Initialize each key's writer pairs once, then reuse them across reads.
     private final Set<KeyType> initializedPredicateWriteOrders = new HashSet<>();
@@ -74,34 +116,71 @@ class SERSolverAR<KeyType, ValueType> {
     SERSolverAR(History<KeyType, ValueType> history,
                 KnownGraph<KeyType, ValueType> graph,
                 Collection<SERConstraint<KeyType, ValueType>> constraints) {
-        this(history, graph, constraints, true);
+        this(history, graph, constraints, true, false,
+                SERVerifier.PredicateSolvingMode.CALFE);
     }
 
     private SERSolverAR(History<KeyType, ValueType> history,
                         KnownGraph<KeyType, ValueType> graph,
                         Collection<SERConstraint<KeyType, ValueType>> constraints,
                         boolean collectConflicts) {
-        this.history = history;
-        this.graph = graph;
-        this.constraints = constraints;
-        this.collectConflicts = collectConflicts;
-        this.txns = history.getTransactions().stream()
-                .filter(txn -> !isBottomTxn(txn))
-                .collect(Collectors.toList());
-        this.txnIndex = new HashMap<>();
-        for (int i = 0; i < txns.size(); i++) {
-            txnIndex.put(txns.get(i), i);
+        this(history, graph, constraints, collectConflicts, false,
+                SERVerifier.PredicateSolvingMode.CALFE);
+    }
+
+    SERSolverAR(History<KeyType, ValueType> history,
+                KnownGraph<KeyType, ValueType> graph,
+                Collection<SERConstraint<KeyType, ValueType>> constraints,
+                boolean collectConflicts,
+                boolean collectPredicateMetrics) {
+        this(history, graph, constraints, collectConflicts, collectPredicateMetrics,
+                SERVerifier.PredicateSolvingMode.CALFE);
+    }
+
+    SERSolverAR(History<KeyType, ValueType> history,
+                KnownGraph<KeyType, ValueType> graph,
+                Collection<SERConstraint<KeyType, ValueType>> constraints,
+                boolean collectConflicts,
+                boolean collectPredicateMetrics,
+                SERVerifier.PredicateSolvingMode predicateSolvingMode) {
+        var profiler = Profiler.getInstance();
+        profiler.startTick("SER_AR_ENCODE_SETUP");
+        try {
+            this.history = history;
+            this.graph = graph;
+            this.constraints = constraints;
+            this.collectConflicts = collectConflicts;
+            this.collectPredicateMetrics = collectPredicateMetrics;
+            this.predicateSolvingMode = Objects.requireNonNull(
+                    predicateSolvingMode, "predicateSolvingMode");
+            this.txns = history.getTransactions().stream()
+                    .filter(txn -> !isBottomTxn(txn))
+                    .collect(Collectors.toList());
+            this.txnIndex = new HashMap<>();
+            for (int i = 0; i < txns.size(); i++) {
+                txnIndex.put(txns.get(i), i);
+            }
+            this.knownOrder = buildKnownOrder();
+            this.arGraph = new Graph(solver);
+            this.arNodes = createArNodes();
+            this.writesByKey = buildWritesByKey(graph);
+            for (int writeRefId = 0;
+                    writeRefId < graph.getAllWrites().size(); writeRefId++) {
+                writeRefIds.put(graph.getAllWrites().get(writeRefId), writeRefId);
+            }
+            this.sortedKeyWriteIndexes = buildKeyWriteIndexes(writesByKey);
+        } finally {
+            profiler.endTick("SER_AR_ENCODE_SETUP");
         }
-        this.knownOrder = buildKnownOrder();
-        this.arGraph = new Graph(solver);
-        this.arNodes = createArNodes();
-        this.writesByKey = buildWritesByKey(graph);
-        encodeKnownEdges();
-        encodeRemainingWwChoices();
-        encodeRwFromWrAndWw();
-        encodePredicateConstraints();
-        encodeDependencyEdges();
-        encodeStrictTotalOrder();
+        profileVoid(profiler, "SER_AR_ENCODE_KNOWN_EDGES", this::encodeKnownEdges);
+        profileVoid(profiler, "SER_AR_ENCODE_WW", this::encodeRemainingWwChoices);
+        profileVoid(profiler, "SER_AR_ENCODE_RW", this::encodeRwFromWrAndWw);
+        profileVoid(profiler, "SER_AR_ENCODE_PREDICATE", this::encodePredicateConstraints);
+        if (predicateSolvingMode == SERVerifier.PredicateSolvingMode.CALFE) {
+            profileVoid(profiler, "SER_CALFE_PREDECLARE_AR", this::predeclareRowLocalArPairs);
+        }
+        profileVoid(profiler, "SER_AR_ENCODE_DEPENDENCIES", this::encodeDependencyEdges);
+        profileVoid(profiler, "SER_AR_ENCODE_TOTAL_ORDER", this::encodeStrictTotalOrder);
     }
 
     /**
@@ -109,8 +188,10 @@ class SERSolverAR<KeyType, ValueType> {
      * a reduced explanation; recursive satisfiability checks disable that work.
      */
     boolean solve() {
-        while (solver.solve()) {
-            if (refinePredicateConstraints()) {
+        var profiler = Profiler.getInstance();
+        while (profileBoolean(profiler, "SER_MONOSAT_SOLVE", solver::solve)) {
+            if (profileBoolean(profiler, "SER_AR_PREDICATE_REFINEMENT",
+                    this::refinePredicateConstraints)) {
                 continue;
             }
             conflictEdges = Collections.emptyList();
@@ -124,8 +205,27 @@ class SERSolverAR<KeyType, ValueType> {
             return false;
         }
 
-        extractConflicts();
+        profileVoid(profiler, "SER_AR_CONFLICT_EXTRACTION", this::extractConflicts);
         return false;
+    }
+
+    private static void profileVoid(Profiler profiler, String tag, Runnable action) {
+        profiler.startTick(tag);
+        try {
+            action.run();
+        } finally {
+            profiler.endTick(tag);
+        }
+    }
+
+    private static boolean profileBoolean(
+            Profiler profiler, String tag, BooleanSupplier action) {
+        profiler.startTick(tag);
+        try {
+            return action.getAsBoolean();
+        } finally {
+            profiler.endTick(tag);
+        }
     }
 
     Pair<Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>, Collection<SERConstraint<KeyType, ValueType>>> getConflicts() {
@@ -319,23 +419,39 @@ class SERSolverAR<KeyType, ValueType> {
     }
 
     private void addDependencyEdge(SEREdge<KeyType, ValueType> edge, Lit guard) {
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.dependencyEdgeAttempts++;
+        }
         /*
          * A false guard is already a tautology. Checking it before resolving
          * the target AR edge avoids creating unused graph variables for the
          * many RW alternatives ruled out by pruning.
          */
         if (guard == Lit.False) {
+            if (collectingPredicateMetrics) {
+                predicateEncodingMetrics.dependencyEdgesSkipped++;
+            }
             return;
         }
         if (!dependencyEdgesByGuard
                 .computeIfAbsent(guard, ignored -> new HashSet<>())
                 .add(edge)) {
+            if (collectingPredicateMetrics) {
+                predicateEncodingMetrics.dependencyEdgeDuplicates++;
+            }
             return;
         }
 
         var target = ar(edge.getFrom(), edge.getTo());
         if (target == Lit.True || guard == target) {
+            if (collectingPredicateMetrics) {
+                predicateEncodingMetrics.dependencyEdgesSkipped++;
+            }
             return;
+        }
+
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.dependencyEdgesQueued++;
         }
 
         var guarded = new GuardedDependencyEdge<>(edge, guard);
@@ -376,12 +492,17 @@ class SERSolverAR<KeyType, ValueType> {
     }
 
     private void addKnownPredicateEdge(SEREdge<KeyType, ValueType> edge) {
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.knownPredicateEdgeAttempts++;
+        }
         var existing = graph.getKnownGraphA()
                 .edgeValue(edge.getFrom(), edge.getTo())
                 .orElse(Collections.emptyList());
         var graphEdge = new Edge<KeyType>(edge.getType(), edge.getKey());
         if (!existing.contains(graphEdge)) {
             graph.putEdge(edge.getFrom(), edge.getTo(), graphEdge);
+        } else if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.knownPredicateEdgeDuplicates++;
         }
     }
 
@@ -394,137 +515,207 @@ class SERSolverAR<KeyType, ValueType> {
      * but unreachable and unnecessary combinations are never enumerated.
      */
     private void encodePredicateConstraints() {
-        for (var observation : graph.getPredicateObservations()) {
-            var predicateRead = observation.getPredicateReadEvent();
-            var predicate = predicateRead.getPredicate();
-            if (predicate == null) {
-                continue;
-            }
-
-            var resultSourcesByKey = new LinkedHashMap<KeyType,
-                    KnownGraph.WriteRef<KeyType, ValueType>>();
-            for (var source : observation.getTupleSources()) {
-                if (resultSourcesByKey.putIfAbsent(source.getKey(), source.getSourceWrite()) != null) {
-                    solver.assertTrue(Lit.False);
+        collectingPredicateMetrics = collectPredicateMetrics;
+        try {
+            for (var observation : graph.getPredicateObservations()) {
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.observations++;
                 }
-            }
-
-            var scopedEntries = writesByKey.entrySet().stream()
-                    .filter(entry -> predicate.scope().covers(entry.getKey()))
-                    .sorted(Comparator.comparing(entry -> String.valueOf(entry.getKey())))
-                    .collect(Collectors.toList());
-
-            if (predicate instanceof QueryPlan
-                    && ((QueryPlan<?, ?>) predicate).isRowLocal()
-                    && encodeRowLocalPredicate(observation, scopedEntries,
-                            resultSourcesByKey)) {
-                continue;
-            }
-
-            var frontierEntries = scopedEntries.stream()
-                    .filter(entry -> observation.getPredicateReadType(entry.getKey())
-                            == KnownGraph.PredicateReadType.EXTERNAL)
-                    .collect(Collectors.toList());
-            if (frontierEntries.isEmpty()) {
-                // Internal predicate keys are checked by the same evaluator in
-                // Utils before solver construction.
-                continue;
-            }
-
-            var frontiers = new ArrayList<KeyFrontier<KeyType, ValueType>>(frontierEntries.size());
-            for (var entry : frontierEntries) {
-                frontiers.add(createKeyFrontier(observation, entry.getKey(), entry.getValue(),
-                        resultSourcesByKey.get(entry.getKey())));
-            }
-
-            for (var resultKey : resultSourcesByKey.keySet()) {
-                if (!predicate.scope().covers(resultKey)) {
-                    solver.assertTrue(Lit.False);
-                }
-            }
-
-            var snapshot = new LinkedHashMap<KeyType, ValueType>();
-            var frontierKeys = frontierEntries.stream().map(Map.Entry::getKey)
-                    .collect(Collectors.toSet());
-            for (var entry : scopedEntries) {
-                if (frontierKeys.contains(entry.getKey())) {
+                var predicateRead = observation.getPredicateReadEvent();
+                var predicate = predicateRead.getPredicate();
+                if (predicate == null) {
+                    if (collectingPredicateMetrics) {
+                        predicateEncodingMetrics.nullPredicates++;
+                    }
                     continue;
                 }
-                var latestSelf = entry.getValue().stream()
-                        .filter(write -> write.getTxn().equals(observation.getTxn())
-                                && write.getIndex() < observation.getEventIndex())
-                        .max(Comparator.comparingInt(KnownGraph.WriteRef::getIndex))
-                        .orElse(resultSourcesByKey.get(entry.getKey()));
-                if (latestSelf != null) {
-                    snapshot.put(entry.getKey(), latestSelf.getEvent().getValue());
+
+                var started = System.nanoTime();
+                var resultSourcesByKey = new LinkedHashMap<KeyType,
+                        KnownGraph.WriteRef<KeyType, ValueType>>();
+                for (var source : observation.getTupleSources()) {
+                    if (collectingPredicateMetrics) {
+                        predicateEncodingMetrics.resultSources++;
+                    }
+                    if (resultSourcesByKey.putIfAbsent(
+                            source.getKey(), source.getSourceWrite()) != null) {
+                        if (collectingPredicateMetrics) {
+                            predicateEncodingMetrics.duplicateResultSources++;
+                        }
+                        solver.assertTrue(Lit.False);
+                    }
                 }
+                predicateEncodingMetrics.sourceIndexNanos += System.nanoTime() - started;
+
+                started = System.nanoTime();
+                var scopedEntries = scopedWrites(predicate.scope());
+                predicateEncodingMetrics.scopeLookupNanos += System.nanoTime() - started;
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.scopedKeys += scopedEntries.size();
+                }
+
+                if (predicate instanceof QueryPlan
+                        && ((QueryPlan<?, ?>) predicate).isRowLocal()) {
+                    if (collectingPredicateMetrics) {
+                        predicateEncodingMetrics.rowLocalAttempts++;
+                    }
+                    var encoded = predicateSolvingMode ==
+                            SERVerifier.PredicateSolvingMode.EAGER
+                            ? encodeRowLocalPredicateEager(
+                                    observation, scopedEntries, resultSourcesByKey)
+                            : registerRowLocalPredicateCheck(
+                                    observation, scopedEntries, resultSourcesByKey);
+                    if (encoded) {
+                        if (collectingPredicateMetrics) {
+                            predicateEncodingMetrics.rowLocalEncoded++;
+                        }
+                        continue;
+                    }
+                    if (collectingPredicateMetrics) {
+                        predicateEncodingMetrics.rowLocalFallbacks++;
+                    }
+                }
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.generalObservations++;
+                }
+
+                started = System.nanoTime();
+                var frontierEntries = scopedEntries.stream()
+                        .filter(entry -> observation.getPredicateReadType(entry.key)
+                                == KnownGraph.PredicateReadType.EXTERNAL)
+                        .collect(Collectors.toList());
+                predicateEncodingMetrics.generalKeyScanNanos +=
+                        System.nanoTime() - started;
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.generalExternalKeys += frontierEntries.size();
+                }
+                if (frontierEntries.isEmpty()) {
+                    // Internal predicate keys are checked by the same evaluator in
+                    // Utils before solver construction.
+                    continue;
+                }
+
+                var frontiers = new ArrayList<KeyFrontier<KeyType, ValueType>>(
+                        frontierEntries.size());
+                for (var entry : frontierEntries) {
+                    frontiers.add(createKeyFrontier(
+                            observation, entry, resultSourcesByKey.get(entry.key)));
+                }
+
+                for (var resultKey : resultSourcesByKey.keySet()) {
+                    if (!predicate.scope().covers(resultKey)) {
+                        solver.assertTrue(Lit.False);
+                    }
+                }
+
+                var snapshot = new LinkedHashMap<KeyType, ValueType>();
+                var frontierKeys = frontierEntries.stream().map(entry -> entry.key)
+                        .collect(Collectors.toSet());
+                for (var entry : scopedEntries) {
+                    if (frontierKeys.contains(entry.key)) {
+                        continue;
+                    }
+                    var latestSelf = entry.latestSelfBefore(
+                            observation.getTxn(), observation.getEventIndex());
+                    if (latestSelf == null) {
+                        latestSelf = resultSourcesByKey.get(entry.key);
+                    }
+                    if (latestSelf != null) {
+                        snapshot.put(entry.key, latestSelf.getEvent().getValue());
+                    }
+                }
+                predicateChecks.add(new PredicateCheck<>(predicateRead, frontiers,
+                        snapshot, relationResolverFor(predicateRead)));
             }
-            predicateChecks.add(new PredicateCheck<>(predicateRead, frontiers,
-                    snapshot, relationResolverFor(predicateRead)));
+        } finally {
+            collectingPredicateMetrics = false;
+            predicateEncodingMetrics.publish(
+                    Profiler.getInstance(), collectPredicateMetrics);
         }
     }
 
-    /**
-     * A single scan/filter without DISTINCT is the bag union of independent
-     * single-row evaluations. Encode each key directly, avoiding a whole-table
-     * lazy snapshot with one frontier per key.
-     */
-    private boolean encodeRowLocalPredicate(
+    private List<KeyWriteIndex<KeyType, ValueType>> scopedWrites(QueryScope<KeyType> scope) {
+        var cacheKey = scope.cacheKey();
+        if (cacheKey.isEmpty()) {
+            return buildScopedWrites(scope);
+        }
+        return scopedWritesCache.computeIfAbsent(cacheKey.get(), ignored -> buildScopedWrites(scope));
+    }
+
+    private List<KeyWriteIndex<KeyType, ValueType>> buildScopedWrites(QueryScope<KeyType> scope) {
+        return sortedKeyWriteIndexes.stream()
+                .filter(entry -> scope.covers(entry.key))
+                .collect(Collectors.toUnmodifiableList());
+    }
+
+    /** Eagerly materializes every row-local reader-key constraint before solve(). */
+    private boolean encodeRowLocalPredicateEager(
             KnownGraph.PredicateObservation<KeyType, ValueType> observation,
-            List<Map.Entry<KeyType, List<KnownGraph.WriteRef<KeyType, ValueType>>>> scopedEntries,
+            List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
             Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
         var predicateRead = observation.getPredicateReadEvent();
         var relationResolver = relationResolverFor(predicateRead);
-        var expectedInputs = expectedPredicateInputs(predicateRead);
-
-        if (!expectedInputs.keySet().equals(resultSourcesByKey.keySet())
-                || !predicateSnapshotMatches(predicateRead, expectedInputs, relationResolver)) {
+        var started = System.nanoTime();
+        var snapshotValid = rowLocalSnapshotValid(
+                predicateRead, relationResolver, resultSourcesByKey);
+        predicateEncodingMetrics.snapshotValidationNanos +=
+                System.nanoTime() - started;
+        if (!snapshotValid) {
             return false;
         }
-        for (var source : resultSourcesByKey.entrySet()) {
-            if (!Objects.equals(expectedInputs.get(source.getKey()),
-                    source.getValue().getEvent().getValue())) {
-                return false;
-            }
-        }
 
+        started = System.nanoTime();
         for (var entry : scopedEntries) {
-            var key = entry.getKey();
-            var writes = entry.getValue();
+            var key = entry.key;
+            var writes = entry.writes;
             var recordedSource = resultSourcesByKey.get(key);
+            if (collectingPredicateMetrics) {
+                predicateEncodingMetrics.rowLocalKeyVisits++;
+            }
 
             if (observation.getPredicateReadType(key)
                     == KnownGraph.PredicateReadType.INTERNAL) {
-                var latestSelf = writes.stream()
-                        .filter(write -> write.getTxn().equals(observation.getTxn())
-                                && write.getIndex() < observation.getEventIndex())
-                        .max(Comparator.comparingInt(KnownGraph.WriteRef::getIndex))
-                        .orElse(recordedSource);
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.internalKeys++;
+                    predicateEncodingMetrics.latestWriterLookups++;
+                    predicateEncodingMetrics.latestWriterInputWrites += writes.size();
+                }
+                var latestSelf = entry.latestSelfBefore(
+                        observation.getTxn(), observation.getEventIndex());
+                if (latestSelf == null) {
+                    latestSelf = recordedSource;
+                }
                 if (recordedSource != null) {
                     if (latestSelf != recordedSource) {
                         solver.assertTrue(Lit.False);
                     }
                 } else if (latestSelf != null
-                        && !hasEmptyPredicateContribution(predicateRead, relationResolver,
-                                key, latestSelf.getEvent().getValue())) {
+                        && !hasEmptyPredicateContribution(
+                                predicateRead, relationResolver, latestSelf)) {
                     solver.assertTrue(Lit.False);
                 }
                 continue;
             }
+            if (collectingPredicateMetrics) {
+                predicateEncodingMetrics.externalKeys++;
+            }
 
             if (recordedSource != null) {
-                assertRecordedSourceLatest(
-                        observation, key, writes, recordedSource);
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.recordedSourceKeys++;
+                }
+                assertRecordedSourceLatest(observation, entry, recordedSource);
                 continue;
             }
 
-            var badWrites = latestExternalWrites(writes, observation.getTxn()).stream()
+            var badWrites = latestExternalWrites(entry, observation.getTxn()).stream()
                     .filter(write -> !hasEmptyPredicateContribution(
-                            predicateRead, relationResolver, key,
-                            write.getEvent().getValue()))
+                            predicateRead, relationResolver, write))
                     .collect(Collectors.toList());
-            var frontier = createKeyFrontier(
-                    observation, key, writes, null, false);
+            if (collectingPredicateMetrics) {
+                predicateEncodingMetrics.badWrites += badWrites.size();
+            }
+            var frontier = createKeyFrontier(observation, entry, null, false);
             if (badWrites.isEmpty()) {
                 continue;
             }
@@ -549,6 +740,11 @@ class SERSolverAR<KeyType, ValueType> {
                         blockingClause.add(laterVisible);
                     }
                 }
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.blockingClauses++;
+                    predicateEncodingMetrics.blockingClauseLiterals +=
+                            Math.max(1, blockingClause.size());
+                }
                 if (blockingClause.isEmpty()) {
                     solver.addClause(Lit.False);
                 } else {
@@ -561,6 +757,216 @@ class SERSolverAR<KeyType, ValueType> {
             if (!predicateRead.getPredicate().scope().covers(resultKey)
                     || !writesByKey.containsKey(resultKey)) {
                 solver.assertTrue(Lit.False);
+            }
+        }
+        predicateEncodingMetrics.rowLocalKeyScanNanos +=
+                System.nanoTime() - started;
+        return true;
+    }
+
+    /** Registers one row-local observation for CALFE model replay. */
+    private boolean registerRowLocalPredicateCheck(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
+            Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
+        var predicateRead = observation.getPredicateReadEvent();
+        var relationResolver = relationResolverFor(predicateRead);
+        var started = System.nanoTime();
+        var snapshotValid = rowLocalSnapshotValid(
+                predicateRead, relationResolver, resultSourcesByKey);
+        predicateEncodingMetrics.snapshotValidationNanos +=
+                System.nanoTime() - started;
+        if (!snapshotValid) {
+            return false;
+        }
+
+        for (var resultKey : resultSourcesByKey.keySet()) {
+            if (!predicateRead.getPredicate().scope().covers(resultKey)
+                    || !writesByKey.containsKey(resultKey)) {
+                solver.assertTrue(Lit.False);
+            }
+        }
+        var recordedSourcesByKeyId = new Object[sortedKeyWriteIndexes.size()];
+        for (var entry : scopedEntries) {
+            recordedSourcesByKeyId[entry.keyId] = resultSourcesByKey.get(entry.key);
+        }
+        rowLocalPredicateChecks.add(new RowLocalPredicateCheck<>(
+                observation, scopedEntries, relationResolver, recordedSourcesByKeyId));
+        return true;
+    }
+
+    /**
+     * MonoSAT graph variables cannot be added after the first solve.  CALFE
+     * therefore allocates only the graph-edge variables that a later
+     * materialized reader-key constraint may reference.  It deliberately does
+     * not assert pair comparability yet: the unchanged ar(...) path adds that
+     * XOR exactly when the corresponding predicate formula is materialized.
+     * This creates no PR_WR/PR_RW edge, frontier guard, or blocking clause.
+     */
+    private void predeclareRowLocalArPairs() {
+        if (rowLocalPredicateChecks.isEmpty()) {
+            return;
+        }
+
+        var requiredPairs = new BitSet[txns.size()];
+        for (int index = 0; index < requiredPairs.length; index++) {
+            requiredPairs[index] = new BitSet(txns.size());
+        }
+        var preparedWriterPairs = new BitSet(sortedKeyWriteIndexes.size());
+        long readerKeyVisits = 0L;
+
+        for (var check : rowLocalPredicateChecks) {
+            var observation = check.observation;
+            var reader = observation.getTxn();
+            for (var entry : check.scopedEntries) {
+                if (observation.getPredicateReadType(entry.key)
+                        != KnownGraph.PredicateReadType.EXTERNAL) {
+                    continue;
+                }
+                readerKeyVisits++;
+
+                for (var write : entry.latestWritesByWriter) {
+                    markRequiredArPair(requiredPairs, reader, write.getTxn());
+                }
+
+                if (!preparedWriterPairs.get(entry.keyId)) {
+                    preparedWriterPairs.set(entry.keyId);
+                    var writes = entry.latestWritesByWriter;
+                    for (int left = 0; left < writes.size(); left++) {
+                        for (int right = left + 1; right < writes.size(); right++) {
+                            markRequiredArPair(requiredPairs,
+                                    writes.get(left).getTxn(),
+                                    writes.get(right).getTxn());
+                        }
+                    }
+                }
+            }
+        }
+
+        long pairCount = 0L;
+        for (int left = 0; left < requiredPairs.length; left++) {
+            for (int right = requiredPairs[left].nextSetBit(left + 1);
+                    right >= 0;
+                    right = requiredPairs[left].nextSetBit(right + 1)) {
+                var leftTxn = txns.get(left);
+                var rightTxn = txns.get(right);
+                directArEdge(leftTxn, rightTxn);
+                directArEdge(rightTxn, leftTxn);
+                pairCount++;
+            }
+        }
+        if (collectPredicateMetrics) {
+            var profiler = Profiler.getInstance();
+            profiler.addCount("SER_CALFE_PREDECLARE_READER_KEYS_COUNT", readerKeyVisits);
+            profiler.addCount("SER_CALFE_PREDECLARE_AR_PAIRS_COUNT", pairCount);
+        }
+    }
+
+    private void markRequiredArPair(
+            BitSet[] requiredPairs,
+            Transaction<KeyType, ValueType> left,
+            Transaction<KeyType, ValueType> right) {
+        if (left == right || left.equals(right)
+                || isBottomTxn(left) || isBottomTxn(right)) {
+            return;
+        }
+        int leftIndex = txnIndex.get(left);
+        int rightIndex = txnIndex.get(right);
+        if (!knownOrder.cyclic
+                && (knownOrder.reachable[leftIndex].get(rightIndex)
+                    || knownOrder.reachable[rightIndex].get(leftIndex))) {
+            return;
+        }
+        if (leftIndex < rightIndex) {
+            requiredPairs[leftIndex].set(rightIndex);
+        } else {
+            requiredPairs[rightIndex].set(leftIndex);
+        }
+    }
+
+    /** Materializes the unchanged eager constraint for one violating reader-key. */
+    private void materializeRowLocalKeyConstraint(
+            RowLocalPredicateCheck<KeyType, ValueType> check,
+            KeyWriteIndex<KeyType, ValueType> entry,
+            KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
+        var observation = check.observation;
+        var predicateRead = observation.getPredicateReadEvent();
+        var key = entry.key;
+
+        if (observation.getPredicateReadType(key)
+                == KnownGraph.PredicateReadType.INTERNAL) {
+            var latestSelf = entry.latestSelfBefore(
+                    observation.getTxn(), observation.getEventIndex());
+            if (latestSelf == null) {
+                latestSelf = recordedSource;
+            }
+            if (recordedSource != null) {
+                if (latestSelf != recordedSource) {
+                    solver.assertTrue(Lit.False);
+                }
+            } else if (latestSelf != null
+                    && !hasEmptyPredicateContribution(
+                            predicateRead, check.relationResolver, latestSelf)) {
+                solver.assertTrue(Lit.False);
+            }
+            return;
+        }
+
+        if (recordedSource != null) {
+            assertRecordedSourceLatest(observation, entry, recordedSource);
+            return;
+        }
+
+        var badWrites = latestExternalWrites(entry, observation.getTxn()).stream()
+                .filter(write -> !hasEmptyPredicateContribution(
+                        predicateRead, check.relationResolver, write))
+                .collect(Collectors.toList());
+        var frontier = createKeyFrontier(observation, entry, null, false);
+        if (badWrites.isEmpty()) {
+            return;
+        }
+
+        var badWriteSet = Collections.newSetFromMap(
+                new IdentityHashMap<KnownGraph.WriteRef<KeyType, ValueType>, Boolean>());
+        badWriteSet.addAll(badWrites);
+        for (var badWrite : badWrites) {
+            var badCandidate = candidateFor(frontier, badWrite);
+            if (badCandidate == null) {
+                continue;
+            }
+            var blockingClause = new ArrayList<Lit>();
+            blockingClause.add(Logic.not(badCandidate.visible));
+            for (var goodCandidate : frontier.candidates) {
+                if (badWriteSet.contains(goodCandidate.write)) {
+                    continue;
+                }
+                var laterVisible = and(goodCandidate.visible,
+                        beforeWrite(badWrite, goodCandidate.write));
+                if (laterVisible != Lit.False && !laterVisible.isConstFalse()) {
+                    blockingClause.add(laterVisible);
+                }
+            }
+            if (blockingClause.isEmpty()) {
+                solver.addClause(Lit.False);
+            } else {
+                solver.assertOr(blockingClause);
+            }
+        }
+    }
+
+    private boolean rowLocalSnapshotValid(
+            Event<KeyType, ValueType> predicateRead,
+            RelationResolver<KeyType> relationResolver,
+            Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
+        var expectedInputs = expectedPredicateInputs(predicateRead);
+        if (!expectedInputs.keySet().equals(resultSourcesByKey.keySet())
+                || !predicateSnapshotMatches(predicateRead, expectedInputs, relationResolver)) {
+            return false;
+        }
+        for (var source : resultSourcesByKey.entrySet()) {
+            if (!Objects.equals(expectedInputs.get(source.getKey()),
+                    source.getValue().getEvent().getValue())) {
+                return false;
             }
         }
         return true;
@@ -585,44 +991,47 @@ class SERSolverAR<KeyType, ValueType> {
     private boolean hasEmptyPredicateContribution(
             Event<KeyType, ValueType> predicateRead,
             RelationResolver<KeyType> relationResolver,
-            KeyType key,
-            ValueType value) {
-        final QueryEvaluation<KeyType, ValueType> evaluation;
-        try {
-            evaluation = predicateRead.getPredicate().evaluate(
-                    new MapVisibleState<>(Map.of(key, value), relationResolver));
-        } catch (QueryException exception) {
+            KnownGraph.WriteRef<KeyType, ValueType> write) {
+        var compactStatus = compactRowMatchStatus(predicateRead, write);
+        if (compactStatus != COMPACT_MATCH_UNAVAILABLE) {
+            return compactStatus == COMPACT_MATCH_FALSE;
+        }
+
+        var evaluated = rowContribution(predicateRead, relationResolver, write);
+        if (!evaluated.valid) {
             return false;
         }
 
         if (predicateRead.getRecordedPredicateResult() == null) {
-            return evaluation.inputs().isEmpty();
+            return evaluated.contribution.inputsEmpty();
         }
-        return evaluation.inputs().isEmpty() && evaluation.values().isEmpty();
+        return evaluated.contribution.inputsEmpty()
+                && evaluated.contribution.valuesEmpty();
     }
 
     private List<KnownGraph.WriteRef<KeyType, ValueType>> latestExternalWrites(
-            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
+            KeyWriteIndex<KeyType, ValueType> writeIndex,
             Transaction<KeyType, ValueType> reader) {
-        var latestByWriter = new LinkedHashMap<Transaction<KeyType, ValueType>,
-                KnownGraph.WriteRef<KeyType, ValueType>>();
-        for (var write : writes) {
-            latestByWriter.put(write.getTxn(), write);
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.latestWriterLookups++;
+            // Keep this logical-work counter comparable with the pre-index
+            // implementation: these are versions whose reduction is now reused.
+            predicateEncodingMetrics.latestWriterInputWrites += writeIndex.writes.size();
         }
-        latestByWriter.remove(reader);
-        return new ArrayList<>(latestByWriter.values());
+        var latestWrites = writeIndex.latestExternalWrites(reader);
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.latestWriterResults += latestWrites.size();
+        }
+        return latestWrites;
     }
 
     private void assertRecordedSourceLatest(
             KnownGraph.PredicateObservation<KeyType, ValueType> observation,
-            KeyType key,
-            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
+            KeyWriteIndex<KeyType, ValueType> writeIndex,
             KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
-        var latestSelf = writes.stream()
-                .filter(write -> write.getTxn().equals(observation.getTxn())
-                        && write.getIndex() < observation.getEventIndex())
-                .max(Comparator.comparingInt(KnownGraph.WriteRef::getIndex))
-                .orElse(null);
+        var key = writeIndex.key;
+        var latestSelf = writeIndex.latestSelfBefore(
+                observation.getTxn(), observation.getEventIndex());
         if (latestSelf != null) {
             if (latestSelf != recordedSource) {
                 solver.assertTrue(Lit.False);
@@ -630,7 +1039,7 @@ class SERSolverAR<KeyType, ValueType> {
             return;
         }
 
-        var candidates = latestExternalWrites(writes, observation.getTxn());
+        var candidates = latestExternalWrites(writeIndex, observation.getTxn());
         if (candidates.stream().noneMatch(write -> write == recordedSource)) {
             solver.assertTrue(Lit.False);
             return;
@@ -662,26 +1071,28 @@ class SERSolverAR<KeyType, ValueType> {
 
     private KeyFrontier<KeyType, ValueType> createKeyFrontier(
             KnownGraph.PredicateObservation<KeyType, ValueType> observation,
-            KeyType key,
-            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
+            KeyWriteIndex<KeyType, ValueType> writeIndex,
             KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
-        return createKeyFrontier(observation, key, writes, recordedSource, true);
+        return createKeyFrontier(observation, writeIndex, recordedSource, true);
     }
 
     private KeyFrontier<KeyType, ValueType> createKeyFrontier(
             KnownGraph.PredicateObservation<KeyType, ValueType> observation,
-            KeyType key,
-            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
+            KeyWriteIndex<KeyType, ValueType> writeIndex,
             KnownGraph.WriteRef<KeyType, ValueType> recordedSource,
             boolean initializeAllWriterPairs) {
-        var latestSelf = writes.stream()
-                .filter(write -> write.getTxn().equals(observation.getTxn())
-                        && write.getIndex() < observation.getEventIndex())
-                .max(Comparator.comparingInt(KnownGraph.WriteRef::getIndex))
-                .orElse(null);
+        var key = writeIndex.key;
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.frontiers++;
+        }
+        var latestSelf = writeIndex.latestSelfBefore(
+                observation.getTxn(), observation.getEventIndex());
         if (latestSelf != null) {
             if (recordedSource != null && recordedSource != latestSelf) {
                 solver.assertTrue(Lit.False);
+            }
+            if (collectingPredicateMetrics) {
+                predicateEncodingMetrics.frontierCandidates++;
             }
             return new KeyFrontier<>(key,
                     observation.getTxn(),
@@ -691,17 +1102,11 @@ class SERSolverAR<KeyType, ValueType> {
         // Only the final write to a key in one transaction can be externally
         // visible.  Earlier writes in the same transaction can never be a
         // latest-visible frontier.
-        var latestByWriter = new LinkedHashMap<Transaction<KeyType, ValueType>,
-                KnownGraph.WriteRef<KeyType, ValueType>>();
-        for (var write : writes) {
-            latestByWriter.put(write.getTxn(), write);
-        }
-
         // The latest candidate is selected from a strict total order. Writer
         // comparability depends only on the key's complete writer set, so
         // repeated predicate reads can reuse the same primitive AR literals.
         if (initializeAllWriterPairs && initializedPredicateWriteOrders.add(key)) {
-            var comparableWrites = new ArrayList<>(latestByWriter.values());
+            var comparableWrites = writeIndex.latestWritesByWriter;
             for (int i = 0; i < comparableWrites.size(); i++) {
                 for (int j = i + 1; j < comparableWrites.size(); j++) {
                     beforeWrite(comparableWrites.get(i), comparableWrites.get(j));
@@ -709,13 +1114,15 @@ class SERSolverAR<KeyType, ValueType> {
             }
         }
 
-        latestByWriter.remove(observation.getTxn());
-        var externalWrites = new ArrayList<>(latestByWriter.values());
+        var externalWrites = writeIndex.latestExternalWrites(observation.getTxn());
         var candidates = externalWrites.stream()
                 .map(write -> new FrontierCandidate<>(write,
                         ar(write.getTxn(), observation.getTxn())))
                 .filter(candidate -> candidate.visible != Lit.False)
                 .collect(Collectors.toList());
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.frontierCandidates += candidates.size();
+        }
 
         var frontier = new KeyFrontier<KeyType, ValueType>(
                 key, observation.getTxn(), candidates, recordedSource);
@@ -771,6 +1178,20 @@ class SERSolverAR<KeyType, ValueType> {
      * direct no-good clause for every mismatching visible snapshot.
      */
     private boolean refinePredicateConstraints() {
+        var refined = refineGeneralPredicateConstraints();
+        if (rowLocalPredicateChecks.isEmpty()) {
+            return refined;
+        }
+
+        var positions = candidateArPositions();
+        var rowLocalRefined = refineRowLocalPredicateConstraints(positions);
+        if (rowLocalRefined) {
+            encodeDependencyEdges();
+        }
+        return refined || rowLocalRefined;
+    }
+
+    private boolean refineGeneralPredicateConstraints() {
         var refined = false;
         for (var check : predicateChecks) {
             var snapshot = new LinkedHashMap<>(check.fixedSnapshot);
@@ -806,6 +1227,185 @@ class SERSolverAR<KeyType, ValueType> {
             refined = true;
         }
         return refined;
+    }
+
+    private boolean refineRowLocalPredicateConstraints(int[] positions) {
+        long started = System.nanoTime();
+        long keyVisits = 0L;
+        long mismatches = 0L;
+        long materialized = 0L;
+        boolean refined = false;
+
+        for (var check : rowLocalPredicateChecks) {
+            for (var entry : check.scopedEntries) {
+                keyVisits++;
+                var recordedSource = check.recordedSource(entry.keyId);
+                if (!rowLocalKeyConstraintViolated(
+                        check, entry, recordedSource, positions)) {
+                    continue;
+                }
+                mismatches++;
+                if (check.materializedKeyIds.get(entry.keyId)) {
+                    throw new IllegalStateException(String.format(
+                            "materialized row-local predicate constraint still violated: txn=%s key=%s",
+                            check.observation.getTxn().getId(), entry.key));
+                }
+                materializeRowLocalKeyConstraint(check, entry, recordedSource);
+                check.materializedKeyIds.set(entry.keyId);
+                materialized++;
+                refined = true;
+            }
+        }
+
+        var profiler = Profiler.getInstance();
+        profiler.addDurationNanos("SER_CALFE_REPLAY", System.nanoTime() - started);
+        if (collectPredicateMetrics) {
+            profiler.addCount("SER_CALFE_REPLAY_ROUNDS_COUNT", 1L);
+            profiler.addCount("SER_CALFE_KEY_VISITS_COUNT", keyVisits);
+            profiler.addCount("SER_CALFE_MISMATCHES_COUNT", mismatches);
+            profiler.addCount("SER_CALFE_MATERIALIZED_KEYS_COUNT", materialized);
+        }
+        return refined;
+    }
+
+    /** Evaluates the unchanged eager reader-key formula in one concrete total AR. */
+    private boolean rowLocalKeyConstraintViolated(
+            RowLocalPredicateCheck<KeyType, ValueType> check,
+            KeyWriteIndex<KeyType, ValueType> entry,
+            KnownGraph.WriteRef<KeyType, ValueType> recordedSource,
+            int[] positions) {
+        var observation = check.observation;
+        var predicateRead = observation.getPredicateReadEvent();
+        var reader = observation.getTxn();
+
+        if (observation.getPredicateReadType(entry.key)
+                == KnownGraph.PredicateReadType.INTERNAL) {
+            var latestSelf = entry.latestSelfBefore(reader, observation.getEventIndex());
+            if (latestSelf == null) {
+                latestSelf = recordedSource;
+            }
+            if (recordedSource != null) {
+                return latestSelf != recordedSource;
+            }
+            return latestSelf != null
+                    && !hasEmptyPredicateContribution(
+                            predicateRead, check.relationResolver, latestSelf);
+        }
+
+        var latestSelf = entry.latestSelfBefore(reader, observation.getEventIndex());
+        if (latestSelf != null) {
+            return recordedSource != null && recordedSource != latestSelf;
+        }
+
+        var candidates = entry.latestExternalWrites(reader);
+        if (recordedSource != null) {
+            if (!containsIdentity(candidates, recordedSource)
+                    || !beforeInCandidate(recordedSource.getTxn(), reader, positions)) {
+                return true;
+            }
+            for (var other : candidates) {
+                if (other == recordedSource
+                        || !writeChangesPredicateResult(
+                                recordedSource, other, predicateRead)) {
+                    continue;
+                }
+                if (beforeInCandidate(recordedSource.getTxn(), other.getTxn(), positions)
+                        && beforeInCandidate(other.getTxn(), reader, positions)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        var latestVisible = latestVisibleWrite(candidates, reader, positions);
+        return latestVisible != null
+                && !hasEmptyPredicateContribution(
+                        predicateRead, check.relationResolver, latestVisible);
+    }
+
+    private KnownGraph.WriteRef<KeyType, ValueType> latestVisibleWrite(
+            List<KnownGraph.WriteRef<KeyType, ValueType>> candidates,
+            Transaction<KeyType, ValueType> reader,
+            int[] positions) {
+        KnownGraph.WriteRef<KeyType, ValueType> latest = null;
+        for (var candidate : candidates) {
+            if (!beforeInCandidate(candidate.getTxn(), reader, positions)) {
+                continue;
+            }
+            if (latest == null
+                    || beforeInCandidate(latest.getTxn(), candidate.getTxn(), positions)) {
+                latest = candidate;
+            }
+        }
+        return latest;
+    }
+
+    private static boolean containsIdentity(List<?> candidates, Object expected) {
+        for (var candidate : candidates) {
+            if (candidate == expected) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean beforeInCandidate(
+            Transaction<KeyType, ValueType> from,
+            Transaction<KeyType, ValueType> to,
+            int[] positions) {
+        if (from == to || from.equals(to)) {
+            return false;
+        }
+        if (isBottomTxn(from)) {
+            return !isBottomTxn(to);
+        }
+        if (isBottomTxn(to)) {
+            return false;
+        }
+        return positions[txnIndex.get(from)] < positions[txnIndex.get(to)];
+    }
+
+    /** Builds one deterministic total extension of the current SAT-selected AR. */
+    private int[] candidateArPositions() {
+        var adjacency = new BitSet[txns.size()];
+        var indegree = new int[txns.size()];
+        for (int index = 0; index < adjacency.length; index++) {
+            adjacency[index] = new BitSet(adjacency.length);
+        }
+        for (var entry : arCache.entrySet()) {
+            if (!modelValue(entry.getValue())) {
+                continue;
+            }
+            int from = txnIndex.get(entry.getKey().getLeft());
+            int to = txnIndex.get(entry.getKey().getRight());
+            if (!adjacency[from].get(to)) {
+                adjacency[from].set(to);
+                indegree[to]++;
+            }
+        }
+
+        var ready = new PriorityQueue<Integer>();
+        for (int index = 0; index < indegree.length; index++) {
+            if (indegree[index] == 0) {
+                ready.add(index);
+            }
+        }
+        var positions = new int[txns.size()];
+        int position = 0;
+        while (!ready.isEmpty()) {
+            int from = ready.remove();
+            positions[from] = position++;
+            for (int to = adjacency[from].nextSetBit(0); to >= 0;
+                    to = adjacency[from].nextSetBit(to + 1)) {
+                if (--indegree[to] == 0) {
+                    ready.add(to);
+                }
+            }
+        }
+        if (position != txns.size()) {
+            throw new IllegalStateException("SAT model contains a cyclic AR");
+        }
+        return positions;
     }
 
     private FrontierCandidate<KeyType, ValueType> selectedCandidate(
@@ -891,24 +1491,131 @@ class SERSolverAR<KeyType, ValueType> {
         if (sourceMatches != laterMatches) {
             return true;
         }
-        return sourceMatches
-                && (!Objects.equals(source.getEvent().getKey(), later.getEvent().getKey())
-                || !Objects.equals(source.getEvent().getValue(), later.getEvent().getValue()));
+        if (!sourceMatches) {
+            return false;
+        }
+
+        var plan = rowLocalQueryPlan(predicateRead);
+        if (plan != null && plan.compactResultProjection() == null) {
+            var resolver = relationResolverFor(predicateRead);
+            var sourceContribution = rowContribution(predicateRead, resolver, source);
+            var laterContribution = rowContribution(predicateRead, resolver, later);
+            if (sourceContribution.valid && laterContribution.valid) {
+                return !sourceContribution.contribution.canonicalEquals(
+                        laterContribution.contribution);
+            }
+        }
+        return !Objects.equals(source.getEvent().getKey(), later.getEvent().getKey())
+                || !Objects.equals(source.getEvent().getValue(), later.getEvent().getValue());
     }
 
     private boolean writeMatchesPredicate(
             KnownGraph.WriteRef<KeyType, ValueType> write,
             Event<KeyType, ValueType> predicateRead) {
+        var compactStatus = compactRowMatchStatus(predicateRead, write);
+        if (compactStatus != COMPACT_MATCH_UNAVAILABLE) {
+            return compactStatus == COMPACT_MATCH_TRUE;
+        }
+
+        var event = write.getEvent();
+        var evaluated = rowContribution(
+                predicateRead, relationResolverFor(predicateRead), write);
+        return evaluated.valid && evaluated.contribution.containsInput(event.getKey());
+    }
+
+    private int compactRowMatchStatus(
+            Event<KeyType, ValueType> predicateRead,
+            KnownGraph.WriteRef<KeyType, ValueType> write) {
+        var plan = rowLocalQueryPlan(predicateRead);
+        if (plan == null || plan.compactResultProjection() == null
+                || plan.compiledRowMatcher().isEmpty()) {
+            return COMPACT_MATCH_UNAVAILABLE;
+        }
+        var writeRefId = writeRefIds.get(write);
+        if (writeRefId == null) {
+            return COMPACT_MATCH_UNAVAILABLE;
+        }
+        var cache = compactRowMatchCaches.computeIfAbsent(
+                plan, ignored -> new CompactRowMatchCache());
+        if (cache.computed.get(writeRefId)) {
+            if (cache.invalid.get(writeRefId)) {
+                return COMPACT_MATCH_INVALID;
+            }
+            return cache.matched.get(writeRefId)
+                    ? COMPACT_MATCH_TRUE : COMPACT_MATCH_FALSE;
+        }
+
+        cache.computed.set(writeRefId);
         var event = write.getEvent();
         try {
-            var evaluation = predicateRead.getPredicate().evaluate(
-                    new MapVisibleState<>(
-                            Map.of(event.getKey(), event.getValue()),
-                            relationResolverFor(predicateRead)));
-            return evaluation.inputs().containsKey(event.getKey());
+            if (plan.compiledRowMatcher().get().test(
+                    event.getKey(), event.getValue())) {
+                cache.matched.set(writeRefId);
+                return COMPACT_MATCH_TRUE;
+            }
+            return COMPACT_MATCH_FALSE;
         } catch (QueryException exception) {
-            return false;
+            cache.invalid.set(writeRefId);
+            return COMPACT_MATCH_INVALID;
         }
+    }
+
+    private CachedRowContribution<KeyType> rowContribution(
+            Event<KeyType, ValueType> predicateRead,
+            RelationResolver<KeyType> relationResolver,
+            KnownGraph.WriteRef<KeyType, ValueType> write) {
+        var plan = rowLocalQueryPlan(predicateRead);
+        var writeRefId = writeRefIds.get(write);
+        if (plan == null || plan.compactResultProjection() != null
+                || writeRefId == null) {
+            return evaluateRowContribution(predicateRead, relationResolver, write, plan);
+        }
+
+        var planId = rowContributionPlanIds.computeIfAbsent(
+                plan, ignored -> nextRowContributionPlanId++);
+        var cacheKey = ((long) planId << 32) | (writeRefId & 0xffffffffL);
+        var cached = generalRowContributions.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+        var evaluated = evaluateRowContribution(predicateRead, relationResolver, write, plan);
+        generalRowContributions.put(cacheKey, evaluated);
+        return evaluated;
+    }
+
+    private CachedRowContribution<KeyType> evaluateRowContribution(
+            Event<KeyType, ValueType> predicateRead,
+            RelationResolver<KeyType> relationResolver,
+            KnownGraph.WriteRef<KeyType, ValueType> write,
+            QueryPlan<KeyType, ValueType> plan) {
+        var event = write.getEvent();
+        try {
+            var contribution = plan == null
+                    ? RowContribution.from(predicateRead.getPredicate().evaluate(
+                            new MapVisibleState<>(Map.of(event.getKey(), event.getValue()),
+                                    relationResolver)))
+                    : plan.evaluateRowContribution(
+                            event.getKey(), event.getValue(), relationResolver);
+            return CachedRowContribution.valid(contribution);
+        } catch (QueryException exception) {
+            return CachedRowContribution.invalid();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private QueryPlan<KeyType, ValueType> rowLocalQueryPlan(
+            Event<KeyType, ValueType> predicateRead) {
+        if (rowLocalQueryPlans.containsKey(predicateRead)) {
+            return rowLocalQueryPlans.get(predicateRead);
+        }
+        if (!(predicateRead.getPredicate() instanceof QueryPlan)) {
+            rowLocalQueryPlans.put(predicateRead, null);
+            return null;
+        }
+        var plan = (QueryPlan<KeyType, ValueType>) predicateRead.getPredicate();
+        var rowLocalPlan = plan.isRowLocal() ? plan : null;
+        rowLocalQueryPlans.put(predicateRead, rowLocalPlan);
+        return rowLocalPlan;
     }
 
     /**
@@ -996,6 +1703,32 @@ class SERSolverAR<KeyType, ValueType> {
         };
     }
 
+    private static final class CompactRowMatchCache {
+        private final BitSet computed = new BitSet();
+        private final BitSet matched = new BitSet();
+        private final BitSet invalid = new BitSet();
+    }
+
+    private static final class CachedRowContribution<KeyType> {
+        private final boolean valid;
+        private final RowContribution<KeyType> contribution;
+
+        private CachedRowContribution(boolean valid, RowContribution<KeyType> contribution) {
+            this.valid = valid;
+            this.contribution = contribution;
+        }
+
+        private static <KeyType> CachedRowContribution<KeyType> valid(
+                RowContribution<KeyType> contribution) {
+            return new CachedRowContribution<>(true,
+                    Objects.requireNonNull(contribution, "contribution"));
+        }
+
+        private static <KeyType> CachedRowContribution<KeyType> invalid() {
+            return new CachedRowContribution<>(false, null);
+        }
+    }
+
     private static final class KeyFrontier<KeyType, ValueType> {
         private final KeyType key;
         private final Transaction<KeyType, ValueType> reader;
@@ -1041,6 +1774,30 @@ class SERSolverAR<KeyType, ValueType> {
         }
     }
 
+    private static final class RowLocalPredicateCheck<KeyType, ValueType> {
+        private final KnownGraph.PredicateObservation<KeyType, ValueType> observation;
+        private final List<KeyWriteIndex<KeyType, ValueType>> scopedEntries;
+        private final RelationResolver<KeyType> relationResolver;
+        private final Object[] recordedSourcesByKeyId;
+        private final BitSet materializedKeyIds = new BitSet();
+
+        private RowLocalPredicateCheck(
+                KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+                List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
+                RelationResolver<KeyType> relationResolver,
+                Object[] recordedSourcesByKeyId) {
+            this.observation = observation;
+            this.scopedEntries = scopedEntries;
+            this.relationResolver = relationResolver;
+            this.recordedSourcesByKeyId = recordedSourcesByKeyId;
+        }
+
+        @SuppressWarnings("unchecked")
+        private KnownGraph.WriteRef<KeyType, ValueType> recordedSource(int keyId) {
+            return (KnownGraph.WriteRef<KeyType, ValueType>) recordedSourcesByKeyId[keyId];
+        }
+    }
+
     private static final class GuardedDependencyEdge<KeyType, ValueType> {
         private final SEREdge<KeyType, ValueType> edge;
         private final Lit guard;
@@ -1059,6 +1816,9 @@ class SERSolverAR<KeyType, ValueType> {
      */
     private Lit beforeWrite(KnownGraph.WriteRef<KeyType, ValueType> left,
                             KnownGraph.WriteRef<KeyType, ValueType> right) {
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.beforeWriteCalls++;
+        }
         if (left == right) {
             return Lit.False;
         }
@@ -1156,6 +1916,20 @@ class SERSolverAR<KeyType, ValueType> {
         return result;
     }
 
+    private static <KeyType, ValueType> List<KeyWriteIndex<KeyType, ValueType>>
+            buildKeyWriteIndexes(
+                    Map<KeyType, List<KnownGraph.WriteRef<KeyType, ValueType>>> writesByKey) {
+        var entries = writesByKey.entrySet().stream()
+                .sorted(Comparator.comparing(entry -> String.valueOf(entry.getKey())))
+                .collect(Collectors.toList());
+        var indexes = new ArrayList<KeyWriteIndex<KeyType, ValueType>>(entries.size());
+        for (int keyId = 0; keyId < entries.size(); keyId++) {
+            var entry = entries.get(keyId);
+            indexes.add(new KeyWriteIndex<>(keyId, entry.getKey(), entry.getValue()));
+        }
+        return Collections.unmodifiableList(indexes);
+    }
+
     private Lit ar(Transaction<KeyType, ValueType> from, Transaction<KeyType, ValueType> to) {
         boolean fromBottom = isBottomTxn(from);
         boolean toBottom = isBottomTxn(to);
@@ -1199,6 +1973,9 @@ class SERSolverAR<KeyType, ValueType> {
         Transaction<KeyType, ValueType> first = leftIndex < rightIndex ? left : right;
         Transaction<KeyType, ValueType> second = leftIndex < rightIndex ? right : left;
         if (comparablePairs.add(Pair.of(first, second))) {
+            if (collectingPredicateMetrics) {
+                predicateEncodingMetrics.comparablePairsCreated++;
+            }
             solver.assertTrue(Logic.xor(directArEdge(first, second), directArEdge(second, first)));
         }
     }
@@ -1206,6 +1983,178 @@ class SERSolverAR<KeyType, ValueType> {
     private Lit directArEdge(Transaction<KeyType, ValueType> from, Transaction<KeyType, ValueType> to) {
         return arCache.computeIfAbsent(Pair.of(from, to), ignored ->
                 arGraph.addEdge(arNodes[txnIndex.get(from)], arNodes[txnIndex.get(to)]));
+    }
+
+    /**
+     * Immutable solver-local index over one key's already sorted write list.
+     * Writer groups retain their first-occurrence order while the candidate for
+     * each group is its final write, matching LinkedHashMap put replacement.
+     */
+    private static final class KeyWriteIndex<KeyType, ValueType> {
+        private final int keyId;
+        private final KeyType key;
+        private final List<KnownGraph.WriteRef<KeyType, ValueType>> writes;
+        private final List<Transaction<KeyType, ValueType>> writers;
+        private final List<List<KnownGraph.WriteRef<KeyType, ValueType>>> writesByWriter;
+        private final List<KnownGraph.WriteRef<KeyType, ValueType>> latestWritesByWriter;
+
+        private KeyWriteIndex(int keyId, KeyType key,
+                List<KnownGraph.WriteRef<KeyType, ValueType>> writes) {
+            this.keyId = keyId;
+            this.key = key;
+            this.writes = writes;
+
+            var groupedWrites = new LinkedHashMap<Transaction<KeyType, ValueType>,
+                    List<KnownGraph.WriteRef<KeyType, ValueType>>>();
+            for (var write : writes) {
+                groupedWrites.computeIfAbsent(
+                        write.getTxn(), ignored -> new ArrayList<>()).add(write);
+            }
+            this.writers = new ArrayList<>(groupedWrites.keySet());
+            var writerWrites = new ArrayList<
+                    List<KnownGraph.WriteRef<KeyType, ValueType>>>(groupedWrites.size());
+            var latestWrites = new ArrayList<KnownGraph.WriteRef<KeyType, ValueType>>();
+            for (var writerGroup : groupedWrites.values()) {
+                writerWrites.add(writerGroup);
+                latestWrites.add(writerGroup.get(writerGroup.size() - 1));
+            }
+            this.writesByWriter = writerWrites;
+            this.latestWritesByWriter = latestWrites;
+        }
+
+        private KnownGraph.WriteRef<KeyType, ValueType> latestSelfBefore(
+                Transaction<KeyType, ValueType> reader, int eventIndex) {
+            int writer = writerIndex(reader);
+            if (writer < 0) {
+                return null;
+            }
+            var writerWrites = writesByWriter.get(writer);
+            int low = 0;
+            int high = writerWrites.size();
+            while (low < high) {
+                int middle = (low + high) >>> 1;
+                if (writerWrites.get(middle).getIndex() < eventIndex) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            return low == 0 ? null : writerWrites.get(low - 1);
+        }
+
+        private List<KnownGraph.WriteRef<KeyType, ValueType>> latestExternalWrites(
+                Transaction<KeyType, ValueType> reader) {
+            int readerWriter = writerIndex(reader);
+            if (readerWriter < 0) {
+                return latestWritesByWriter;
+            }
+            if (latestWritesByWriter.size() == 1) {
+                return Collections.emptyList();
+            }
+            var externalWrites = new ArrayList<KnownGraph.WriteRef<KeyType, ValueType>>(
+                    latestWritesByWriter.size() - 1);
+            for (int index = 0; index < latestWritesByWriter.size(); index++) {
+                if (index != readerWriter) {
+                    externalWrites.add(latestWritesByWriter.get(index));
+                }
+            }
+            return externalWrites;
+        }
+
+        private int writerIndex(Transaction<KeyType, ValueType> writer) {
+            for (int index = 0; index < writers.size(); index++) {
+                var candidate = writers.get(index);
+                if (candidate == writer || candidate.equals(writer)) {
+                    return index;
+                }
+            }
+            return -1;
+        }
+    }
+
+    private static final class PredicateEncodingMetrics {
+        private long sourceIndexNanos;
+        private long scopeLookupNanos;
+        private long snapshotValidationNanos;
+        private long rowLocalKeyScanNanos;
+        private long generalKeyScanNanos;
+        private long observations;
+        private long nullPredicates;
+        private long resultSources;
+        private long duplicateResultSources;
+        private long scopedKeys;
+        private long rowLocalAttempts;
+        private long rowLocalEncoded;
+        private long rowLocalFallbacks;
+        private long generalObservations;
+        private long generalExternalKeys;
+        private long rowLocalKeyVisits;
+        private long internalKeys;
+        private long externalKeys;
+        private long recordedSourceKeys;
+        private long latestWriterLookups;
+        private long latestWriterInputWrites;
+        private long latestWriterResults;
+        private long frontiers;
+        private long frontierCandidates;
+        private long badWrites;
+        private long beforeWriteCalls;
+        private long comparablePairsCreated;
+        private long knownPredicateEdgeAttempts;
+        private long knownPredicateEdgeDuplicates;
+        private long dependencyEdgeAttempts;
+        private long dependencyEdgeDuplicates;
+        private long dependencyEdgesSkipped;
+        private long dependencyEdgesQueued;
+        private long blockingClauses;
+        private long blockingClauseLiterals;
+
+        private void publish(Profiler profiler, boolean includeCounts) {
+            profiler.addDurationNanos("SER_PRED_SOURCE_INDEX", sourceIndexNanos);
+            profiler.addDurationNanos("SER_PRED_SCOPE_LOOKUP", scopeLookupNanos);
+            profiler.addDurationNanos(
+                    "SER_PRED_SNAPSHOT_VALIDATE", snapshotValidationNanos);
+            profiler.addDurationNanos("SER_PRED_ROW_LOCAL_KEY_SCAN", rowLocalKeyScanNanos);
+            profiler.addDurationNanos("SER_PRED_GENERAL_KEY_SCAN", generalKeyScanNanos);
+            if (!includeCounts) {
+                return;
+            }
+            profiler.addCount("SER_PRED_OBSERVATIONS_COUNT", observations);
+            profiler.addCount("SER_PRED_NULL_COUNT", nullPredicates);
+            profiler.addCount("SER_PRED_RESULT_SOURCES_COUNT", resultSources);
+            profiler.addCount("SER_PRED_DUPLICATE_SOURCES_COUNT", duplicateResultSources);
+            profiler.addCount("SER_PRED_SCOPED_KEYS_COUNT", scopedKeys);
+            profiler.addCount("SER_PRED_ROW_LOCAL_ATTEMPTS_COUNT", rowLocalAttempts);
+            profiler.addCount("SER_PRED_ROW_LOCAL_ENCODED_COUNT", rowLocalEncoded);
+            profiler.addCount("SER_PRED_ROW_LOCAL_FALLBACKS_COUNT", rowLocalFallbacks);
+            profiler.addCount("SER_PRED_GENERAL_COUNT", generalObservations);
+            profiler.addCount("SER_PRED_GENERAL_EXTERNAL_KEYS_COUNT", generalExternalKeys);
+            profiler.addCount("SER_PRED_ROW_LOCAL_KEY_VISITS_COUNT", rowLocalKeyVisits);
+            profiler.addCount("SER_PRED_INTERNAL_KEYS_COUNT", internalKeys);
+            profiler.addCount("SER_PRED_EXTERNAL_KEYS_COUNT", externalKeys);
+            profiler.addCount("SER_PRED_RECORDED_SOURCE_KEYS_COUNT", recordedSourceKeys);
+            profiler.addCount("SER_PRED_LATEST_WRITER_LOOKUPS_COUNT", latestWriterLookups);
+            profiler.addCount("SER_PRED_LATEST_WRITER_INPUT_WRITES_COUNT",
+                    latestWriterInputWrites);
+            profiler.addCount("SER_PRED_LATEST_WRITER_RESULTS_COUNT", latestWriterResults);
+            profiler.addCount("SER_PRED_FRONTIERS_COUNT", frontiers);
+            profiler.addCount("SER_PRED_FRONTIER_CANDIDATES_COUNT", frontierCandidates);
+            profiler.addCount("SER_PRED_BAD_WRITES_COUNT", badWrites);
+            profiler.addCount("SER_PRED_BEFORE_WRITE_CALLS_COUNT", beforeWriteCalls);
+            profiler.addCount("SER_PRED_COMPARABLE_PAIRS_CREATED_COUNT",
+                    comparablePairsCreated);
+            profiler.addCount("SER_PRED_KNOWN_EDGE_ATTEMPTS_COUNT",
+                    knownPredicateEdgeAttempts);
+            profiler.addCount("SER_PRED_KNOWN_EDGE_DUPLICATES_COUNT",
+                    knownPredicateEdgeDuplicates);
+            profiler.addCount("SER_PRED_DEPENDENCY_ATTEMPTS_COUNT", dependencyEdgeAttempts);
+            profiler.addCount("SER_PRED_DEPENDENCY_DUPLICATES_COUNT",
+                    dependencyEdgeDuplicates);
+            profiler.addCount("SER_PRED_DEPENDENCY_SKIPPED_COUNT", dependencyEdgesSkipped);
+            profiler.addCount("SER_PRED_DEPENDENCY_QUEUED_COUNT", dependencyEdgesQueued);
+            profiler.addCount("SER_PRED_BLOCKING_CLAUSES_COUNT", blockingClauses);
+            profiler.addCount("SER_PRED_BLOCKING_LITERALS_COUNT", blockingClauseLiterals);
+        }
     }
 
     private static boolean isBottomTxn(Transaction<?, ?> txn) {
@@ -1262,7 +2211,8 @@ class SERSolverAR<KeyType, ValueType> {
     }
 
     private boolean isSatisfiable(Collection<SERConstraint<KeyType, ValueType>> activeConstraints) {
-        return new SERSolverAR<>(history, graph, activeConstraints, false).solve();
+        return new SERSolverAR<>(history, graph, activeConstraints, false, false,
+                predicateSolvingMode).solve();
     }
 
     /**

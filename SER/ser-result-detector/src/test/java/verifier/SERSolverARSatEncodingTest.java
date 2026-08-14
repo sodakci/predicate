@@ -1,16 +1,23 @@
 package verifier;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import graph.EdgeType;
 import graph.Edge;
 import graph.KnownGraph;
 import history.Event;
 import history.History;
 import history.Transaction;
+import history.query.QueryPlan;
+import history.query.QueryValue;
+import history.query.RelationResolver;
+import history.query.StructuredQueryParser;
+import history.query.ValueAdapter;
 import monosat.Lit;
 import monosat.Solver;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.commons.lang3.tuple.Triple;
 import org.junit.jupiter.api.Test;
+import util.Profiler;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -24,6 +31,12 @@ import static history.Event.EventType.WRITE;
 import static org.junit.jupiter.api.Assertions.*;
 
 class SERSolverARSatEncodingTest {
+    private static final ObjectMapper QUERY_MAPPER = new ObjectMapper();
+    private static final ValueAdapter<Integer> INTEGER_VALUES =
+            value -> QueryValue.integer(value);
+    private static final StructuredQueryParser<String, Integer> QUERY_PARSER =
+            new StructuredQueryParser<>(
+                    INTEGER_VALUES, RelationResolver.canonicalStringKeys());
 
     private static History<String, Integer> makeHistory(
             Set<Long> sessions,
@@ -84,6 +97,18 @@ class SERSolverARSatEncodingTest {
         return history;
     }
 
+    private static QueryPlan<String, Integer> kvPlan(String predicate) {
+        try {
+            return QUERY_PARSER.parse(QUERY_MAPPER.readTree("{"
+                    + "\"from\":{\"relation\":\"kv\"},"
+                    + "\"where\":[\"" + predicate + "\"],"
+                    + "\"select\":{\"columns\":[\"k\",\"value\"],"
+                    + "\"distinct\":false}}"));
+        } catch (Exception exception) {
+            throw new AssertionError(exception);
+        }
+    }
+
     @Test
     void monoSatAssertOrAcceptsClauseLargerThanDefaultJniBuffer() {
         try (var solver = new Solver()) {
@@ -112,6 +137,125 @@ class SERSolverARSatEncodingTest {
 
         assertEquals(6, solver.getArVariableCount());
         assertTrue(solver.solve());
+    }
+
+    @Test
+    void profilesArEncodingAndMonoSatSolveAsSeparateStages() {
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+        var history = makeHistory(
+                Set.of(1L),
+                Map.of(1L, List.of(1L, 2L, 3L)),
+                Map.of(),
+                Map.of());
+        var graph = new KnownGraph<>(history);
+
+        var solver = new SERSolverAR<>(history, graph, List.of());
+        assertTrue(solver.solve());
+
+        assertEquals(1, profiler.getCounter("SER_AR_ENCODE_SETUP"));
+        assertEquals(1, profiler.getCounter("SER_AR_ENCODE_KNOWN_EDGES"));
+        assertEquals(1, profiler.getCounter("SER_AR_ENCODE_WW"));
+        assertEquals(1, profiler.getCounter("SER_AR_ENCODE_RW"));
+        assertEquals(1, profiler.getCounter("SER_AR_ENCODE_PREDICATE"));
+        assertEquals(1, profiler.getCounter("SER_AR_ENCODE_DEPENDENCIES"));
+        assertEquals(1, profiler.getCounter("SER_AR_ENCODE_TOTAL_ORDER"));
+        assertEquals(1, profiler.getCounter("SER_MONOSAT_SOLVE"));
+        assertEquals(1, profiler.getCounter("SER_AR_PREDICATE_REFINEMENT"));
+    }
+
+    @Test
+    void profilesPredicateEncodingSubstagesAndCounts() {
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+        var history = makeHistory(
+                Set.of(1L, 2L),
+                Map.of(1L, List.of(1L), 2L, List.of(2L)),
+                Map.of(1L, List.of(Triple.of(WRITE, "x", 10))),
+                Map.of(2L, Pair.of(
+                        (PredicateFixtures.RowPredicate<String, Integer>)
+                                (key, value) -> value > 5,
+                        List.of(new Event.PredResult<>("x", 10)))));
+        var graph = new KnownGraph<>(history);
+
+        var solver = new SERSolverAR<>(
+                history, graph, generateConstraints(history, graph), true, true);
+
+        assertEquals(1, profiler.getCount("SER_PRED_OBSERVATIONS_COUNT"));
+        assertEquals(1, profiler.getCount("SER_PRED_RESULT_SOURCES_COUNT"));
+        assertEquals(1, profiler.getCount("SER_PRED_SCOPED_KEYS_COUNT"));
+        assertEquals(1, profiler.getCount("SER_PRED_GENERAL_COUNT"));
+        assertEquals(1, profiler.getCount("SER_PRED_FRONTIERS_COUNT"));
+        assertEquals(1, profiler.getCount("SER_PRED_FRONTIER_CANDIDATES_COUNT"));
+        assertTrue(profiler.getCount("SER_PRED_DEPENDENCY_ATTEMPTS_COUNT") > 0);
+        assertTrue(solver.solve());
+    }
+
+    @Test
+    void calfeMaterializesTheOriginalRecordedSourceConstraintAndRefinesAgain() {
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+        var history = new History<String, Integer>();
+        var readerSession = history.addSession(1L);
+        var writerSession = history.addSession(2L);
+        var reader = history.addTransaction(readerSession, 1L);
+        var writer = history.addTransaction(writerSession, 2L);
+        history.addEvent(writer, WRITE, "kv:x", 10);
+        history.addPredicateReadEvent(reader, kvPlan("value > 5"),
+                List.of(new Event.PredResult<>("kv:x", 10)));
+        commitAll(history);
+
+        var graph = new KnownGraph<>(history);
+        var solver = new SERSolverAR<>(
+                history, graph, generateConstraints(history, graph), true, true);
+
+        assertTrue(solver.solve());
+        assertTrue(profiler.getCount("SER_CALFE_MATERIALIZED_KEYS_COUNT") > 0);
+        assertTrue(profiler.getCount("SER_CALFE_REPLAY_ROUNDS_COUNT") >= 2);
+        assertEquals(1L, countEdgesOfType(graph.getKnownGraphA(), EdgeType.PR_WR));
+    }
+
+    @Test
+    void calfeRejectsAnAbsentResultWithAKnownVisibleMatchingWriter() {
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+        var history = new History<String, Integer>();
+        var session = history.addSession(1L);
+        var writer = history.addTransaction(session, 1L);
+        var reader = history.addTransaction(session, 2L);
+        history.addEvent(writer, WRITE, "kv:x", 10);
+        history.addPredicateReadEvent(reader, kvPlan("value > 5"), List.of());
+        commitAll(history);
+
+        var graph = new KnownGraph<>(history);
+        var solver = new SERSolverAR<>(
+                history, graph, generateConstraints(history, graph), true, true);
+
+        assertFalse(solver.solve());
+        assertEquals(1L, profiler.getCount("SER_CALFE_MATERIALIZED_KEYS_COUNT"));
+    }
+
+    @Test
+    void eagerModeMaterializesRowLocalConstraintsBeforeSolving() {
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+        var history = new History<String, Integer>();
+        var session = history.addSession(1L);
+        var writer = history.addTransaction(session, 1L);
+        var reader = history.addTransaction(session, 2L);
+        history.addEvent(writer, WRITE, "kv:x", 10);
+        history.addPredicateReadEvent(reader, kvPlan("value > 5"), List.of());
+        commitAll(history);
+
+        var graph = new KnownGraph<>(history);
+        var solver = new SERSolverAR<>(
+                history, graph, generateConstraints(history, graph), true, true,
+                SERVerifier.PredicateSolvingMode.EAGER);
+
+        assertEquals(1L, profiler.getCount("SER_PRED_ROW_LOCAL_KEY_VISITS_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_CALFE_MATERIALIZED_KEYS_COUNT"));
+        assertFalse(solver.solve());
+        assertEquals(0L, profiler.getCount("SER_CALFE_REPLAY_ROUNDS_COUNT"));
     }
 
     @Test
@@ -237,6 +381,64 @@ class SERSolverARSatEncodingTest {
         var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
 
         assertFalse(solver.solve(), "predicate result source must be the latest visible write under AR");
+    }
+
+    @Test
+    void predicateFrontierUsesOnlyLastWriteFromEachWriterTransaction() {
+        var history = makeHistory(
+                Set.of(1L, 2L, 3L),
+                Map.of(1L, List.of(1L), 2L, List.of(2L), 3L, List.of(3L)),
+                Map.of(
+                        1L, List.of(
+                                Triple.of(WRITE, "x", 10),
+                                Triple.of(WRITE, "x", 20)),
+                        2L, List.of(Triple.of(WRITE, "x", 30))),
+                Map.of(3L, Pair.of(
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
+                        List.of(new Event.PredResult<>("x", 20)))));
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+        var graph = new KnownGraph<>(history);
+        var solver = new SERSolverAR<>(
+                history, graph, generateConstraints(history, graph), true, true);
+
+        assertEquals(1, profiler.getCount("SER_PRED_FRONTIERS_COUNT"));
+        assertEquals(2, profiler.getCount("SER_PRED_FRONTIER_CANDIDATES_COUNT"));
+        assertTrue(solver.solve(),
+                "the second write of txn 1 must remain its only external frontier candidate");
+
+        var staleHistory = makeHistory(
+                Set.of(1L, 2L, 3L),
+                Map.of(1L, List.of(1L), 2L, List.of(2L), 3L, List.of(3L)),
+                Map.of(
+                        1L, List.of(
+                                Triple.of(WRITE, "x", 10),
+                                Triple.of(WRITE, "x", 20)),
+                        2L, List.of(Triple.of(WRITE, "x", 30))),
+                Map.of(3L, Pair.of(
+                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
+                        List.of(new Event.PredResult<>("x", 10)))));
+
+        assertFalse(solveSer(staleHistory),
+                "an earlier write from the same writer must not become a frontier candidate");
+    }
+
+    @Test
+    void keyWriteIndexFindsLatestSelfWriteBeforePredicateEvent() {
+        var history = singleTxnHistory();
+        var txn = history.getTransaction(1L);
+        history.addEvent(txn, WRITE, "x", 10);
+        history.addPredicateReadEvent(txn, keyAtLeast("x", 5),
+                List.of(new Event.PredResult<>("x", 10)));
+        history.addEvent(txn, WRITE, "x", 20);
+        commitAll(history);
+
+        var graph = new KnownGraph<>(history);
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL,
+                graph.getPredicateObservations().get(0).getPredicateReadType("x"));
+        assertTrue(new SERSolverAR<>(
+                history, graph, generateConstraints(history, graph)).solve(),
+                "the later self-write must not replace the write visible at the predicate event");
     }
 
     @Test

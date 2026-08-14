@@ -12,6 +12,8 @@ from typing import Any, Iterable, Iterator
 
 ABSENT_BASE = -1_000_000_000_000
 SOURCE_FIELDS = frozenset({"source_write_id", "source_txn", "source_op_index"})
+ANOMALY_TRACE_MARKER = "|kvpredicate-anomaly:"
+WRITE_SKEW_ROLES = frozenset({"left", "right"})
 
 
 class ConversionError(ValueError):
@@ -190,6 +192,170 @@ def convert_transaction(row: dict[str, Any], context: str) -> dict[str, Any]:
     return txn
 
 
+def parse_anomaly_trace_tag(row: dict[str, Any], context: str) -> dict[str, Any] | None:
+    txn_type = row.get("txn_type")
+    if not isinstance(txn_type, str) or ANOMALY_TRACE_MARKER not in txn_type:
+        return None
+    payload = txn_type.rsplit(ANOMALY_TRACE_MARKER, 1)[1]
+    fields = payload.split(":")
+    if len(fields) != 5:
+        raise ConversionError(f"{context}.txn_type: malformed anomaly trace tag")
+    mode, variant, role, seed_text, isolate_text = fields
+    if mode != "write-skew":
+        raise ConversionError(f"{context}.txn_type: unsupported anomaly mode {mode!r}")
+    if variant not in {"injected", "control"}:
+        raise ConversionError(f"{context}.txn_type: unsupported anomaly variant {variant!r}")
+    if role not in WRITE_SKEW_ROLES:
+        raise ConversionError(f"{context}.txn_type: unsupported write-skew role {role!r}")
+    if isolate_text not in {"true", "false"}:
+        raise ConversionError(f"{context}.txn_type: invalid background isolation flag")
+    return {
+        "mode": mode,
+        "variant": variant,
+        "role": role,
+        "layout_seed": require_int(seed_text, f"{context}.txn_type.seed"),
+        "background_predicates_isolated": isolate_text == "true",
+    }
+
+
+def anomaly_core_transaction(
+    transaction: dict[str, Any], tag: dict[str, Any], context: str
+) -> dict[str, Any]:
+    ops = transaction["ops"]
+    predicate_indexes = [index for index, op in enumerate(ops) if op.get("type") == "pr"]
+    write_indexes = [index for index, op in enumerate(ops) if op.get("type") == "w"]
+    if len(predicate_indexes) != 1 or len(write_indexes) != 1:
+        raise ConversionError(
+            f"{context}: tagged write-skew transaction must contain one predicate and one write"
+        )
+    predicate_index = predicate_indexes[0]
+    write_index = write_indexes[0]
+    if predicate_index >= write_index:
+        raise ConversionError(f"{context}: write-skew predicate must precede its write")
+
+    role = tag["role"]
+    expected_where = ["value = 0"] if role == "left" else ["value = 1"]
+    expected_predicate_key = "kv:0" if role == "left" else "kv:1"
+    expected_padding_key = "kv:3" if role == "left" else "kv:4"
+    if role == "left":
+        expected_write_key = "kv:1"
+    elif tag["variant"] == "injected":
+        expected_write_key = "kv:0"
+    else:
+        expected_write_key = "kv:2"
+
+    predicate = ops[predicate_index]
+    if predicate["query"]["where"] != expected_where:
+        raise ConversionError(f"{context}: write-skew predicate does not match role {role}")
+    predicate_input_keys = [item["key"] for item in predicate["result"]["inputs"]]
+    predicate_result_keys = [f"kv:{item['k']}" for item in predicate["result"]["values"]]
+    if predicate_input_keys != [expected_predicate_key]:
+        raise ConversionError(
+            f"{context}: write-skew predicate inputs must be [{expected_predicate_key!r}]"
+        )
+    if predicate_result_keys != [expected_predicate_key]:
+        raise ConversionError(
+            f"{context}: write-skew predicate result must be [{expected_predicate_key!r}]"
+        )
+
+    write = ops[write_index]
+    if write["key"] != expected_write_key:
+        raise ConversionError(
+            f"{context}: {role} {tag['variant']} write must target {expected_write_key}"
+        )
+    for index, op in enumerate(ops):
+        if index in {predicate_index, write_index}:
+            continue
+        if op.get("type") != "r" or op.get("key") != expected_padding_key:
+            raise ConversionError(
+                f"{context}.ops[{index}]: write-skew padding must read {expected_padding_key}"
+            )
+
+    return {
+        **tag,
+        "txn": transaction["txn"],
+        "session": transaction["session"],
+        "session_seq": transaction["session_seq"],
+        "visible_operation_count": len(ops),
+        "predicate_op_index": predicate_index,
+        "predicate_where": expected_where,
+        "predicate_input_keys": predicate_input_keys,
+        "predicate_result_keys": predicate_result_keys,
+        "write_op_index": write_index,
+        "write_key": write["key"],
+        "write_value": write["value"],
+        "padding_read_key": expected_padding_key,
+    }
+
+
+def build_anomaly_manifest(
+    core_transactions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not core_transactions:
+        return None
+    if len(core_transactions) != 2:
+        raise ConversionError("write-skew trace must contain exactly two tagged core transactions")
+    by_role = {transaction["role"]: transaction for transaction in core_transactions}
+    if set(by_role) != WRITE_SKEW_ROLES:
+        raise ConversionError("write-skew trace must contain one left and one right core transaction")
+
+    common_fields = ("mode", "variant", "layout_seed", "background_predicates_isolated")
+    left = by_role["left"]
+    right = by_role["right"]
+    for field in common_fields:
+        if left[field] != right[field]:
+            raise ConversionError(f"write-skew core transactions disagree on {field}")
+
+    expected_edges = [
+        {
+            "type": "PR_RW",
+            "from_role": "right",
+            "from_txn": right["txn"],
+            "to_role": "left",
+            "to_txn": left["txn"],
+            "key": "kv:1",
+        }
+    ]
+    if left["variant"] == "injected":
+        expected_edges.insert(
+            0,
+            {
+                "type": "PR_RW",
+                "from_role": "left",
+                "from_txn": left["txn"],
+                "to_role": "right",
+                "to_txn": right["txn"],
+                "key": "kv:0",
+            },
+        )
+
+    public_transactions = []
+    for role in ("left", "right"):
+        transaction = by_role[role]
+        public_transactions.append(
+            {
+                key: value
+                for key, value in transaction.items()
+                if key not in common_fields
+            }
+        )
+    return {
+        "mode": left["mode"],
+        "variant": left["variant"],
+        "layout_seed": left["layout_seed"],
+        "background_predicates_isolated": left["background_predicates_isolated"],
+        "reserved_keys": {
+            "predicate_cycle": ["kv:0", "kv:1"],
+            "control_sink": "kv:2",
+            "left_padding": "kv:3",
+            "right_padding": "kv:4",
+        },
+        "core_transactions": public_transactions,
+        "expected_dependency_edges": expected_edges,
+        "expected_cycle": left["variant"] == "injected",
+    }
+
+
 def absent_initial_from_read(op: dict[str, Any], context: str) -> dict[str, Any] | None:
     reject_source_fields(op, context)
     if not bool(op.get("absent", False)):
@@ -309,6 +475,7 @@ def convert(
     initial_count = 0
     transaction_count = 0
     abort_count = 0
+    anomaly_core_transactions: list[dict[str, Any]] = []
     section = 0
     previous_transaction_order: tuple[int, int, int] | None = None
     try:
@@ -334,6 +501,17 @@ def convert(
                         raise ConversionError("raw trace transactions must precede abort rows")
                     section = 1
                     transaction = convert_transaction(row, f"raw.txn[{transaction_count}]")
+                    anomaly_tag = parse_anomaly_trace_tag(
+                        row, f"raw.txn[{transaction_count}]"
+                    )
+                    if anomaly_tag is not None:
+                        anomaly_core_transactions.append(
+                            anomaly_core_transaction(
+                                transaction,
+                                anomaly_tag,
+                                f"raw.txn[{transaction_count}]",
+                            )
+                        )
                     transaction_order = (
                         transaction["session"],
                         transaction["session_seq"],
@@ -361,6 +539,8 @@ def convert(
                     )
                     transaction_count += 1
                 elif record_type == "abort":
+                    if parse_anomaly_trace_tag(row, f"raw.abort[{abort_count}]") is not None:
+                        raise ConversionError("tagged anomaly core transaction aborted")
                     section = 2
                     abort_count += 1
                 else:
@@ -372,6 +552,7 @@ def convert(
             )
         initial.extend(absent_initials.values())
         initial.sort(key=lambda row: row["key"])
+        anomaly_injection = build_anomaly_manifest(anomaly_core_transactions)
         stats = validate_structure(initial, iter_jsonl(history_tmp_path))
         initial_path.write_text(
             json.dumps(initial, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -400,6 +581,8 @@ def convert(
         "captured_aborted_attempts": abort_count,
         **stats,
     }
+    if anomaly_injection is not None:
+        manifest["anomaly_injection"] = anomaly_injection
     if expected_verdict is not None:
         manifest["expected_verdict"] = expected_verdict.upper()
         if expected_verdict.upper() == "ACCEPT":

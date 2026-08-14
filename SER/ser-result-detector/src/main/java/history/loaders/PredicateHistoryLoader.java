@@ -6,8 +6,8 @@ import history.Event;
 import history.History;
 import history.InvalidHistoryError;
 import history.Transaction;
-import history.query.PredicateEvaluator;
 import history.query.QueryException;
+import history.query.QueryPlan;
 import history.query.QueryValue;
 import history.query.RecordedQueryResult;
 import history.query.RelationResolver;
@@ -18,6 +18,7 @@ import java.io.File;
 import java.io.FileReader;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import lombok.EqualsAndHashCode;
@@ -134,9 +135,11 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
             if (opNode.has("predicate") || opNode.has("results") || !opNode.has("query")) {
                 throw new InvalidHistoryError();
             }
-            var parsedResult = parseQueryPredicateResult(requiredObject(opNode, "result"));
+            var predicate = parseQueryPredicate(requiredObject(opNode, "query"));
+            var parsedResult = parseQueryPredicateResult(
+                    requiredObject(opNode, "result"), predicate);
             history.addPredicateReadEvent(transaction,
-                    parseQueryPredicate(requiredObject(opNode, "query")),
+                    predicate,
                     parsedResult.inputs,
                     parsedResult.recorded);
             break;
@@ -146,7 +149,7 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
     }
 
     private ParsedQueryResult parseQueryPredicateResult(
-            JsonNode resultNode) {
+            JsonNode resultNode, QueryPlan<String, PredicateValue> predicate) {
         var inputs = requiredArray(resultNode, "inputs");
         var results = new ArrayList<Event.PredResult<String, PredicateValue>>();
         var recordedInputs = new LinkedHashMap<String, PredicateValue>();
@@ -160,15 +163,59 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
         }
 
         var valuesNode = requiredArray(resultNode, "values");
-        var values = new ArrayList<QueryValue>();
-        for (var valueNode : valuesNode) {
-            values.add(parseQueryValue(valueNode));
+        RecordedQueryResult<String, PredicateValue> recorded;
+        var compactProjection = predicate.compactResultProjection();
+        if (compactProjection != null) {
+            recorded = RecordedQueryResult.rowLocal(recordedInputs,
+                    compactValuesMatch(valuesNode, recordedInputs, compactProjection),
+                    predicate, relationResolver, valueAdapter);
+        } else {
+            var values = new ArrayList<QueryValue>();
+            for (var valueNode : valuesNode) {
+                values.add(parseQueryValue(valueNode));
+            }
+            recorded = RecordedQueryResult.general(recordedInputs, values, valueAdapter);
         }
-        var recorded = new RecordedQueryResult<>(recordedInputs, values, valueAdapter);
         return new ParsedQueryResult(results, recorded);
     }
 
-    private PredicateEvaluator<String, PredicateValue> parseQueryPredicate(JsonNode queryNode) {
+    private boolean compactValuesMatch(JsonNode valuesNode,
+            LinkedHashMap<String, PredicateValue> recordedInputs,
+            QueryPlan.CompactResultProjection projection) {
+        if (valuesNode.size() != recordedInputs.size()) {
+            valuesNode.forEach(this::parseQueryValue);
+            return false;
+        }
+
+        var seenKeys = new HashSet<String>();
+        var matches = true;
+        for (var valueNode : valuesNode) {
+            parseQueryValue(valueNode);
+            if (!valueNode.isObject() || valueNode.size() != 2
+                    || !valueNode.has("k") || !valueNode.has("value")
+                    || !valueNode.get("k").isTextual()) {
+                matches = false;
+                continue;
+            }
+            var localKey = valueNode.get("k").asText();
+            var qualifiedKey = projection.relation() + ":" + localKey;
+            var hasQualifiedKey = recordedInputs.containsKey(qualifiedKey);
+            var hasLegacyKey = recordedInputs.containsKey(localKey);
+            if (hasQualifiedKey && hasLegacyKey && !qualifiedKey.equals(localKey)) {
+                matches = false;
+                continue;
+            }
+            var key = hasQualifiedKey ? qualifiedKey : localKey;
+            var expected = recordedInputs.get(key);
+            if (expected == null || !seenKeys.add(key)
+                    || !expected.queryValue().equals(parseQueryValue(valueNode.get("value")))) {
+                matches = false;
+            }
+        }
+        return matches && seenKeys.size() == recordedInputs.size();
+    }
+
+    private QueryPlan<String, PredicateValue> parseQueryPredicate(JsonNode queryNode) {
         try {
             return queryParser.parse(queryNode);
         } catch (QueryException exception) {

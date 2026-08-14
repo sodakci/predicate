@@ -7,6 +7,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.function.BiPredicate;
 import java.util.stream.Collectors;
 
 /** Executable query AST and the generic predicate evaluator implementation. */
@@ -18,6 +20,8 @@ public final class QueryPlan<KeyType, ValueType>
     private final QueryScope<KeyType> scope;
     private final ValueAdapter<ValueType> valueAdapter;
     private final String identity;
+    private final Optional<BiPredicate<KeyType, ValueType>> compiledRowMatcher;
+    private final CompactResultProjection compactResultProjection;
 
     public QueryPlan(QueryAst.RelationalNode<KeyType, ValueType> root,
             List<QueryAst.ProjectedColumn<KeyType, ValueType>> columns,
@@ -33,6 +37,13 @@ public final class QueryPlan<KeyType, ValueType>
         this.scope = Objects.requireNonNull(scope, "scope");
         this.valueAdapter = Objects.requireNonNull(valueAdapter, "valueAdapter");
         this.identity = buildIdentity();
+        var rowAlias = QueryAst.rowLocalAlias(root);
+        this.compiledRowMatcher = isRowLocal() && rowAlias != null
+                ? QueryAst.compileRowMatcher(root, rowAlias, valueAdapter)
+                        .map(matcher -> (key, value) -> scope.covers(key)
+                                && matcher.test(key, value))
+                : Optional.empty();
+        this.compactResultProjection = buildCompactResultProjection(rowAlias);
     }
 
     @Override
@@ -84,6 +95,21 @@ public final class QueryPlan<KeyType, ValueType>
         return columns;
     }
 
+    /** Allocation-light single-row membership evaluator compiled from the AST. */
+    public Optional<BiPredicate<KeyType, ValueType>> compiledRowMatcher() {
+        return compiledRowMatcher;
+    }
+
+    /** Canonical full contribution for non-compact row-local projections. */
+    public RowContribution<KeyType> evaluateRowContribution(
+            KeyType key, ValueType value, RelationResolver<KeyType> relationResolver) {
+        if (!isRowLocal()) {
+            throw new QueryException("row contribution requires a row-local query");
+        }
+        return RowContribution.from(evaluate(new MapVisibleState<>(
+                Map.of(key, value), relationResolver)));
+    }
+
     /**
      * Whether this plan is a bag union of independent single-row evaluations.
      * Joins, DISTINCT, and custom AST nodes deliberately fall back to the
@@ -94,6 +120,42 @@ public final class QueryPlan<KeyType, ValueType>
                 && QueryAst.isRowLocal(root)
                 && columns.stream()
                         .allMatch(column -> QueryAst.isRowLocal(column.expression()));
+    }
+
+    /**
+     * Describes the compact result shape used by current KV histories. A null
+     * result means the recorded values must retain the general representation.
+     */
+    public CompactResultProjection compactResultProjection() {
+        return compactResultProjection;
+    }
+
+    private CompactResultProjection buildCompactResultProjection(String rowAlias) {
+        if (!isRowLocal() || rowAlias == null || scope.relations().size() != 1
+                || columns.size() != 2
+                || !isProjectedField(columns.get(0), "k", rowAlias)
+                || !isProjectedField(columns.get(1), "value", rowAlias)) {
+            return null;
+        }
+        return new CompactResultProjection(scope.relations().iterator().next());
+    }
+
+    private boolean isProjectedField(
+            QueryAst.ProjectedColumn<KeyType, ValueType> column,
+            String field, String rowAlias) {
+        if (!field.equals(column.outputName())
+                || !(column.expression() instanceof QueryAst.FieldExpression)) {
+            return false;
+        }
+        @SuppressWarnings("unchecked")
+        var expression = (QueryAst.FieldExpression<KeyType, ValueType>) column.expression();
+        var path = expression.path();
+        return (path.size() == 1
+                    && !rowAlias.equals(path.get(0))
+                    && field.equalsIgnoreCase(path.get(0)))
+                || (path.size() == 2
+                    && rowAlias.equals(path.get(0))
+                    && field.equalsIgnoreCase(path.get(1)));
     }
 
     private ArrayList<ProjectedRow<KeyType, ValueType>> distinct(
@@ -136,6 +198,18 @@ public final class QueryPlan<KeyType, ValueType>
         private ProjectedRow(QueryValue value, Map<KeyType, ValueType> sources) {
             this.value = value;
             this.sources = new LinkedHashMap<>(sources);
+        }
+    }
+
+    public static final class CompactResultProjection {
+        private final String relation;
+
+        private CompactResultProjection(String relation) {
+            this.relation = relation;
+        }
+
+        public String relation() {
+            return relation;
         }
     }
 }

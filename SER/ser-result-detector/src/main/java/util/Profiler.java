@@ -26,6 +26,7 @@ package util;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
@@ -41,6 +42,7 @@ public class Profiler {
     private final HashMap<String, Long> start_time = new HashMap<String, Long>();
     private final HashMap<String, Long> total_time = new HashMap<String, Long>();
     private final HashMap<String, Integer> counter = new HashMap<String, Integer>();
+    private final LinkedHashMap<String, Long> counts = new LinkedHashMap<>();
     private final List<String> tags = new ArrayList<>();
 
     private static final AtomicLong max_memory = new AtomicLong();
@@ -78,6 +80,8 @@ public class Profiler {
         start_time.clear();
         total_time.clear();
         counter.clear();
+        counts.clear();
+        tags.clear();
     }
 
     public synchronized void startTick(String tag) {
@@ -129,6 +133,30 @@ public class Profiler {
         } else {
             return 0;
         }
+    }
+
+    public synchronized void addDurationNanos(String tag, long durationNanos) {
+        if (!counter.containsKey(tag)) {
+            tags.add(tag);
+            counter.put(tag, 0);
+            total_time.put(tag, 0L);
+        }
+        total_time.put(tag, total_time.get(tag) + durationNanos / 1_000_000L);
+        counter.put(tag, counter.get(tag) + 1);
+    }
+
+    public synchronized void addCount(String tag, long amount) {
+        counts.merge(tag, amount, Long::sum);
+    }
+
+    public synchronized long getCount(String tag) {
+        return counts.getOrDefault(tag, 0L);
+    }
+
+    public synchronized Collection<Pair<String, Long>> getCounts() {
+        return counts.entrySet().stream()
+                .map(entry -> Pair.of(entry.getKey(), entry.getValue()))
+                .collect(Collectors.toList());
     }
 
     public long getMaxMemory() {

@@ -4,12 +4,16 @@ import static history.Event.EventType.PREDICATE_READ;
 import static history.Event.EventType.READ;
 import static history.Event.EventType.WRITE;
 
+import java.util.AbstractMap;
+import java.util.AbstractSet;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Set;
 
 import com.google.common.graph.Graph;
@@ -49,16 +53,133 @@ public class KnownGraph<KeyType, ValueType> {
         private final WriteRef<KeyType, ValueType> sourceWrite;
     }
 
-    @Data
     public static class PredicateObservation<KeyType, ValueType> {
+        @Getter
         private final Transaction<KeyType, ValueType> txn;
+        @Getter
         private final Event<KeyType, ValueType> predicateReadEvent;
+        @Getter
         private final int eventIndex;
+        @Getter
         private final List<PredicateTupleSource<KeyType, ValueType>> tupleSources;
-        private final Map<KeyType, PredicateReadType> predicateReadTypes;
+        private final List<KeyType> predicateKeysById;
+        private final Map<KeyType, Integer> predicateKeyIds;
+        private final BitSet coveredKeyIds;
+        @Getter
+        private final int coverageEpoch;
+        private final PredicateReadType defaultPredicateReadType;
+        private final BitSet exceptionKeyIds;
+
+        private PredicateObservation(Transaction<KeyType, ValueType> txn,
+                Event<KeyType, ValueType> predicateReadEvent, int eventIndex,
+                List<PredicateTupleSource<KeyType, ValueType>> tupleSources,
+                List<KeyType> predicateKeysById, Map<KeyType, Integer> predicateKeyIds,
+                BitSet coveredKeyIds, BitSet internalKeyIds, int coverageEpoch) {
+            this.txn = txn;
+            this.predicateReadEvent = predicateReadEvent;
+            this.eventIndex = eventIndex;
+            this.tupleSources = tupleSources;
+            this.predicateKeysById = predicateKeysById;
+            this.predicateKeyIds = predicateKeyIds;
+            this.coveredKeyIds = (BitSet) coveredKeyIds.clone();
+            this.coverageEpoch = coverageEpoch;
+            if (coverageEpoch > 0) {
+                this.defaultPredicateReadType = PredicateReadType.INTERNAL;
+                this.exceptionKeyIds = new BitSet();
+                return;
+            }
+            var internalCount = internalKeyIds.cardinality();
+            var externalCount = coveredKeyIds.cardinality() - internalCount;
+            this.defaultPredicateReadType = internalCount > externalCount
+                    ? PredicateReadType.INTERNAL
+                    : PredicateReadType.EXTERNAL;
+
+            var exceptionBits = defaultPredicateReadType == PredicateReadType.INTERNAL
+                    ? (BitSet) coveredKeyIds.clone()
+                    : (BitSet) internalKeyIds.clone();
+            if (defaultPredicateReadType == PredicateReadType.INTERNAL) {
+                exceptionBits.andNot(internalKeyIds);
+            }
+            this.exceptionKeyIds = exceptionBits;
+        }
 
         public PredicateReadType getPredicateReadType(KeyType key) {
-            return predicateReadTypes.get(key);
+            var keyId = predicateKeyIds.get(key);
+            if (keyId == null || !coveredKeyIds.get(keyId)) {
+                return null;
+            }
+            return exceptionKeyIds.get(keyId)
+                    ? opposite(defaultPredicateReadType)
+                    : defaultPredicateReadType;
+        }
+
+        public Map<KeyType, PredicateReadType> getPredicateReadTypes() {
+            return new PredicateReadTypeMap<>(this);
+        }
+
+        private static PredicateReadType opposite(PredicateReadType type) {
+            return type == PredicateReadType.INTERNAL
+                    ? PredicateReadType.EXTERNAL
+                    : PredicateReadType.INTERNAL;
+        }
+    }
+
+    private static final class PredicateReadTypeMap<KeyType>
+            extends AbstractMap<KeyType, PredicateReadType> {
+        private final PredicateObservation<KeyType, ?> observation;
+
+        private PredicateReadTypeMap(PredicateObservation<KeyType, ?> observation) {
+            this.observation = observation;
+        }
+
+        @Override
+        public PredicateReadType get(Object key) {
+            @SuppressWarnings("unchecked")
+            var typedKey = (KeyType) key;
+            return observation.getPredicateReadType(typedKey);
+        }
+
+        @Override
+        public boolean containsKey(Object key) {
+            return get(key) != null;
+        }
+
+        @Override
+        public int size() {
+            return observation.coveredKeyIds.cardinality();
+        }
+
+        @Override
+        public Set<Entry<KeyType, PredicateReadType>> entrySet() {
+            return new AbstractSet<>() {
+                @Override
+                public int size() {
+                    return PredicateReadTypeMap.this.size();
+                }
+
+                @Override
+                public Iterator<Entry<KeyType, PredicateReadType>> iterator() {
+                    return new Iterator<>() {
+                        private int nextKeyId = observation.coveredKeyIds.nextSetBit(0);
+
+                        @Override
+                        public boolean hasNext() {
+                            return nextKeyId >= 0;
+                        }
+
+                        @Override
+                        public Entry<KeyType, PredicateReadType> next() {
+                            if (nextKeyId < 0) {
+                                throw new NoSuchElementException();
+                            }
+                            var keyId = nextKeyId;
+                            nextKeyId = observation.coveredKeyIds.nextSetBit(keyId + 1);
+                            var key = observation.predicateKeysById.get(keyId);
+                            return Map.entry(key, observation.getPredicateReadType(key));
+                        }
+                    };
+                }
+            };
         }
     }
 
@@ -132,10 +253,17 @@ public class KnownGraph<KeyType, ValueType> {
 
         // Build the finite key universe represented by the history. Each
         // Each evaluator narrows this universe through its query scope.
-        var predicateKeyUniverse = new HashSet<KeyType>();
+        var predicateKeysById = new ArrayList<KeyType>();
+        var predicateKeyIds = new HashMap<KeyType, Integer>();
         for (var write : allWrites) {
-            predicateKeyUniverse.add(write.getEvent().getKey());
+            var key = write.getEvent().getKey();
+            if (!predicateKeyIds.containsKey(key)) {
+                predicateKeyIds.put(key, predicateKeysById.size());
+                predicateKeysById.add(key);
+            }
         }
+        var immutablePredicateKeysById = List.copyOf(predicateKeysById);
+        var immutablePredicateKeyIds = Map.copyOf(predicateKeyIds);
 
         // Collect predicate-read observations and classify each covered key.
         // A key is internal when any earlier predicate read in this transaction
@@ -143,12 +271,13 @@ public class KnownGraph<KeyType, ValueType> {
         // wrote the key before this read.
         history.getTransactions().forEach(txn -> {
             var txnEvents = txn.getEvents();
-            var writtenKeys = new HashSet<KeyType>();
-            var predicateObservedKeys = new HashSet<KeyType>();
+            var writtenKeyIds = new BitSet(predicateKeysById.size());
+            var predicateObservedKeyIds = new BitSet(predicateKeysById.size());
+            int coverageEpoch = 0;
             for (int i = 0; i < txnEvents.size(); i++) {
                 var ev = txnEvents.get(i);
                 if (ev.getType() == WRITE) {
-                    writtenKeys.add(ev.getKey());
+                    writtenKeyIds.set(predicateKeyIds.get(ev.getKey()));
                     continue;
                 }
                 if (ev.getType() != PREDICATE_READ) {
@@ -159,20 +288,30 @@ public class KnownGraph<KeyType, ValueType> {
                     var sourceWrite = resolvePredicateResultSource(result);
                     tupleSources.add(new PredicateTupleSource<>(result.getKey(), result.getValue(), sourceWrite));
                 }
-                var predicateReadTypes = new HashMap<KeyType, PredicateReadType>();
+                var coveredKeyIds = new BitSet(predicateKeysById.size());
+                var internalKeyIds = new BitSet(predicateKeysById.size());
                 var predicate = ev.getPredicate();
-                for (var key : predicateKeyUniverse) {
+                for (int keyId = 0; keyId < predicateKeysById.size(); keyId++) {
+                    var key = predicateKeysById.get(keyId);
                     if (predicate != null && !predicate.scope().covers(key)) {
                         continue;
                     }
-                    var type = predicateObservedKeys.contains(key) || writtenKeys.contains(key)
-                            ? PredicateReadType.INTERNAL
-                            : PredicateReadType.EXTERNAL;
-                    predicateReadTypes.put(key, type);
+                    coveredKeyIds.set(keyId);
+                    if (coverageEpoch == 0
+                            && (predicateObservedKeyIds.get(keyId) || writtenKeyIds.get(keyId))) {
+                        internalKeyIds.set(keyId);
+                    }
                 }
                 predicateObservations.add(new PredicateObservation<>(txn, ev, i, tupleSources,
-                        Map.copyOf(predicateReadTypes)));
-                predicateObservedKeys.addAll(predicateReadTypes.keySet());
+                        immutablePredicateKeysById, immutablePredicateKeyIds,
+                        coveredKeyIds, internalKeyIds, coverageEpoch));
+                if (!predicateKeysById.isEmpty()
+                        && coveredKeyIds.cardinality() == predicateKeysById.size()) {
+                    coverageEpoch++;
+                    predicateObservedKeyIds.clear();
+                } else if (coverageEpoch == 0) {
+                    predicateObservedKeyIds.or(coveredKeyIds);
+                }
             }
         });
     }

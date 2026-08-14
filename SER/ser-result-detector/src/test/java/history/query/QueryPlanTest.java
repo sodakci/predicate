@@ -2,6 +2,8 @@ package history.query;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -9,6 +11,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
@@ -19,6 +22,22 @@ class QueryPlanTest {
             RelationResolver.canonicalStringKeys();
     private static final StructuredQueryParser<String, JsonNode> PARSER =
             new StructuredQueryParser<>(ValueAdapter.jsonNodes(), RELATIONS);
+
+    @Test
+    void relationScopeCacheKeysUseStableValueSemantics() {
+        var first = QueryScope.forRelations(
+                Set.of("kv"), RelationResolver.canonicalStringKeys());
+        var equivalent = QueryScope.forRelations(
+                Set.of("kv"), RelationResolver.canonicalStringKeys());
+        var differentRelations = QueryScope.forRelations(
+                Set.of("kv", "audit"), RelationResolver.canonicalStringKeys());
+        var unknownResolver = QueryScope.forRelations(Set.of("kv"), key -> "kv");
+
+        assertTrue(first.cacheKey().isPresent());
+        assertEquals(first.cacheKey(), equivalent.cacheKey());
+        assertFalse(first.cacheKey().equals(differentRelations.cacheKey()));
+        assertTrue(unknownResolver.cacheKey().isEmpty());
+    }
 
     @Test
     void evaluatesArbitraryRelationsAndDeduplicatesSharedInput() {
@@ -138,10 +157,84 @@ class QueryPlanTest {
                 + "\"where\":[\"value % 4 = 3\"],"
                 + "\"select\":{\"columns\":[\"k\",\"value\"],\"distinct\":true}}");
         var join = parse(sharedProjectionQuery(false));
+        var aliasNamedK = parse("{"
+                + "\"from\":{\"relation\":\"kv\",\"alias\":\"k\"},"
+                + "\"select\":{\"columns\":[\"k\",\"value\"],\"distinct\":false}}");
 
         assertTrue(rowLocal.isRowLocal());
+        assertNotNull(rowLocal.compactResultProjection());
         assertFalse(distinct.isRowLocal());
         assertFalse(join.isRowLocal());
+        assertTrue(aliasNamedK.isRowLocal());
+        assertNull(aliasNamedK.compactResultProjection());
+    }
+
+    @Test
+    void compiledKvMatchersPreserveFullEvaluatorMembershipForEveryQueryKind() {
+        var predicates = List.of(
+                "",
+                "true",
+                "value = 3",
+                "value % 4 = 3",
+                "value > 3",
+                "value < 3");
+
+        for (var predicate : predicates) {
+            var where = predicate.isEmpty()
+                    ? ""
+                    : "\"where\":[\"" + predicate + "\"],";
+            var plan = parse("{"
+                    + "\"from\":{\"relation\":\"kv\"},"
+                    + where
+                    + "\"select\":{\"columns\":[\"k\",\"value\"],"
+                    + "\"distinct\":false}}");
+
+            assertNotNull(plan.compactResultProjection());
+            assertTrue(plan.compiledRowMatcher().isPresent());
+            var matcher = plan.compiledRowMatcher().get();
+            for (int value = -5; value <= 7; value++) {
+                var node = json(Integer.toString(value));
+                var expected = plan.evaluate(state(
+                        "kv:7", Integer.toString(value)))
+                        .inputs().containsKey("kv:7");
+                assertEquals(expected, matcher.test("kv:7", node),
+                        predicate + " at value " + value);
+                assertFalse(matcher.test("audit:7", node));
+            }
+        }
+    }
+
+    @Test
+    void compiledKvMatcherPreservesQueryErrors() {
+        var plan = parse("{"
+                + "\"from\":{\"relation\":\"kv\"},"
+                + "\"where\":[\"value % 0 = 1\"],"
+                + "\"select\":{\"columns\":[\"k\",\"value\"],"
+                + "\"distinct\":false}}");
+
+        assertThrows(QueryException.class,
+                () -> plan.evaluate(state("kv:0", "3")));
+        assertThrows(QueryException.class,
+                () -> plan.compiledRowMatcher().orElseThrow().test("kv:0", json("3")));
+    }
+
+    @Test
+    void canonicalRowContributionIncludesProjectionBagAndPhysicalInput() {
+        var plan = parse("{"
+                + "\"from\":{\"relation\":\"kv\"},"
+                + "\"select\":{\"columns\":[\"value % 2 AS parity\"],"
+                + "\"distinct\":false}}");
+
+        assertTrue(plan.isRowLocal());
+        assertNull(plan.compactResultProjection());
+        var first = plan.evaluateRowContribution("kv:0", json("3"), RELATIONS);
+        var same = plan.evaluateRowContribution("kv:0", json("3"), RELATIONS);
+        var sameProjectionDifferentInput = plan.evaluateRowContribution(
+                "kv:0", json("5"), RELATIONS);
+
+        assertTrue(first.containsInput("kv:0"));
+        assertTrue(first.canonicalEquals(same));
+        assertFalse(first.canonicalEquals(sameProjectionDifferentInput));
     }
 
     @Test

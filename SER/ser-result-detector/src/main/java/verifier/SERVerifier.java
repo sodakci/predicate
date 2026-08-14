@@ -26,7 +26,14 @@ import util.TriConsumer;
 
 @SuppressWarnings("UnstableApiUsage")
 public class SERVerifier<KeyType, ValueType> {
+    public enum PredicateSolvingMode {
+        CALFE,
+        EAGER
+    }
+
     private final History<KeyType, ValueType> history;
+    private final boolean detailedPredicateMetrics;
+    private final PredicateSolvingMode predicateSolvingMode;
 
     @Getter
     @Setter
@@ -41,7 +48,21 @@ public class SERVerifier<KeyType, ValueType> {
     private static boolean compareDerivedPredicateEdges = false;
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader) {
+        this(loader, false, PredicateSolvingMode.CALFE);
+    }
+
+    public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
+            boolean detailedPredicateMetrics) {
+        this(loader, detailedPredicateMetrics, PredicateSolvingMode.CALFE);
+    }
+
+    public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
+            boolean detailedPredicateMetrics,
+            PredicateSolvingMode predicateSolvingMode) {
         history = loader.loadHistory();
+        this.detailedPredicateMetrics = detailedPredicateMetrics;
+        this.predicateSolvingMode = Objects.requireNonNull(
+                predicateSolvingMode, "predicateSolvingMode");
         System.err.printf("Sessions count: %d\nTransactions count: %d\nEvents count: %d\n",
                 history.getClientSessions().size(), history.getClientTransactions().size(), history.getEvents().size());
     }
@@ -95,9 +116,22 @@ public class SERVerifier<KeyType, ValueType> {
         profiler.endTick("ONESHOT_CONS");
 
         profiler.startTick("ONESHOT_SOLVE");
-        var solver = new SERSolverAR<>(history, graph, constraints);
+        SERSolverAR<KeyType, ValueType> solver;
+        profiler.startTick("SER_AR_ENCODE");
+        try {
+            solver = new SERSolverAR<>(history, graph, constraints,
+                    true, detailedPredicateMetrics, predicateSolvingMode);
+        } finally {
+            profiler.endTick("SER_AR_ENCODE");
+        }
 
-        boolean accepted = solver.solve();
+        profiler.startTick("SER_AR_SOLVE");
+        boolean accepted;
+        try {
+            accepted = solver.solve();
+        } finally {
+            profiler.endTick("SER_AR_SOLVE");
+        }
         profiler.endTick("ONESHOT_SOLVE");
 
         if (!accepted) {
