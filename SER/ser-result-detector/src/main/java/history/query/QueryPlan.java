@@ -122,6 +122,11 @@ public final class QueryPlan<KeyType, ValueType>
                         .allMatch(column -> QueryAst.isRowLocal(column.expression()));
     }
 
+    /** Whether adding visible rows can only add projected rows to this query. */
+    public boolean isMonotone() {
+        return !distinct && QueryAst.isMonotone(root);
+    }
+
     /**
      * Describes the compact result shape used by current KV histories. A null
      * result means the recorded values must retain the general representation.

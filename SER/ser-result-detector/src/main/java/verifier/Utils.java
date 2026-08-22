@@ -28,6 +28,7 @@ import history.Transaction;
 import history.Event.EventType;
 import history.query.MapVisibleState;
 import history.query.QueryException;
+import history.query.QueryPlan;
 import history.query.RelationResolver;
 
 class Utils {
@@ -210,6 +211,14 @@ class Utils {
         if (recorded != null && !recorded.inputs().equals(resultByKey)) {
             System.err.printf("%s result.inputs disagree with resolved predicate inputs\n", ev);
             return null;
+        }
+
+        // A whole-snapshot query cannot be checked by evaluating one locally
+        // written row in isolation. Source and latest-local-write checks above
+        // still apply; complete JOIN/DISTINCT semantics are left to the solver.
+        if (predicate instanceof QueryPlan
+                && !((QueryPlan<?, ?>) predicate).isRowLocal()) {
+            return new PredicateReadState<>(pos, new HashMap<>(resultByKey));
         }
 
         int previousIndex = previous == null ? -1 : previous.getEventIndex();

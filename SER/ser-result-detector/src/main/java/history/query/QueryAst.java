@@ -2,6 +2,7 @@ package history.query;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
@@ -82,6 +83,27 @@ public final class QueryAst {
             var result = new ArrayList<BindingRow<KeyType, ValueType>>();
             var leftRows = left.execute(context);
             var rightRows = right.execute(context);
+            var equiJoin = equiJoinKey(left, right, condition);
+            if (equiJoin.isPresent()) {
+                var key = equiJoin.get();
+                var rightIndex = new LinkedHashMap<QueryValue,
+                        List<BindingRow<KeyType, ValueType>>>();
+                for (var rightRow : rightRows) {
+                    rightIndex.computeIfAbsent(
+                            key.right.evaluate(rightRow, context),
+                            ignored -> new ArrayList<>()).add(rightRow);
+                }
+                for (var leftRow : leftRows) {
+                    var matches = rightIndex.get(key.left.evaluate(leftRow, context));
+                    if (matches == null) {
+                        continue;
+                    }
+                    for (var rightRow : matches) {
+                        result.add(leftRow.merging(rightRow));
+                    }
+                }
+                return result;
+            }
             for (var leftRow : leftRows) {
                 for (var rightRow : rightRows) {
                     var joined = leftRow.merging(rightRow);
@@ -364,6 +386,79 @@ public final class QueryAst {
             return isRowLocal(filter.input) && isRowLocal(filter.predicate);
         }
         return false;
+    }
+
+    static boolean isMonotone(RelationalNode<?, ?> node) {
+        if (node instanceof ScanNode) {
+            return true;
+        }
+        if (node instanceof FilterNode) {
+            return isMonotone(((FilterNode<?, ?>) node).input);
+        }
+        if (node instanceof InnerJoinNode) {
+            var join = (InnerJoinNode<?, ?>) node;
+            return isMonotone(join.left) && isMonotone(join.right);
+        }
+        return false;
+    }
+
+    private static Set<String> aliases(RelationalNode<?, ?> node) {
+        if (node instanceof ScanNode) {
+            return Set.of(((ScanNode<?, ?>) node).alias);
+        }
+        if (node instanceof FilterNode) {
+            return aliases(((FilterNode<?, ?>) node).input);
+        }
+        if (node instanceof InnerJoinNode) {
+            var join = (InnerJoinNode<?, ?>) node;
+            var result = new LinkedHashSet<String>();
+            result.addAll(aliases(join.left));
+            result.addAll(aliases(join.right));
+            return result;
+        }
+        return Set.of();
+    }
+
+    private static <KeyType, ValueType> Optional<JoinKey<KeyType, ValueType>> equiJoinKey(
+            RelationalNode<KeyType, ValueType> left,
+            RelationalNode<KeyType, ValueType> right,
+            Expression<KeyType, ValueType> condition) {
+        if (!(condition instanceof ComparisonExpression)) {
+            return Optional.empty();
+        }
+        @SuppressWarnings("unchecked")
+        var comparison = (ComparisonExpression<KeyType, ValueType>) condition;
+        if (comparison.operator != ComparisonOperator.EQ
+                || !(comparison.left instanceof FieldExpression)
+                || !(comparison.right instanceof FieldExpression)) {
+            return Optional.empty();
+        }
+        @SuppressWarnings("unchecked")
+        var first = (FieldExpression<KeyType, ValueType>) comparison.left;
+        @SuppressWarnings("unchecked")
+        var second = (FieldExpression<KeyType, ValueType>) comparison.right;
+        var leftAliases = aliases(left);
+        var rightAliases = aliases(right);
+        var firstAlias = first.path.get(0);
+        var secondAlias = second.path.get(0);
+        if (leftAliases.contains(firstAlias) && rightAliases.contains(secondAlias)) {
+            return Optional.of(new JoinKey<>(first, second));
+        }
+        if (leftAliases.contains(secondAlias) && rightAliases.contains(firstAlias)) {
+            return Optional.of(new JoinKey<>(second, first));
+        }
+        return Optional.empty();
+    }
+
+    private static final class JoinKey<KeyType, ValueType> {
+        private final Expression<KeyType, ValueType> left;
+        private final Expression<KeyType, ValueType> right;
+
+        private JoinKey(Expression<KeyType, ValueType> left,
+                Expression<KeyType, ValueType> right) {
+            this.left = left;
+            this.right = right;
+        }
     }
 
     static String rowLocalAlias(RelationalNode<?, ?> node) {

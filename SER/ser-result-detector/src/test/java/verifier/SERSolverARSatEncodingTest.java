@@ -192,50 +192,6 @@ class SERSolverARSatEncodingTest {
     }
 
     @Test
-    void calfeMaterializesTheOriginalRecordedSourceConstraintAndRefinesAgain() {
-        var profiler = Profiler.getInstance();
-        profiler.clear();
-        var history = new History<String, Integer>();
-        var readerSession = history.addSession(1L);
-        var writerSession = history.addSession(2L);
-        var reader = history.addTransaction(readerSession, 1L);
-        var writer = history.addTransaction(writerSession, 2L);
-        history.addEvent(writer, WRITE, "kv:x", 10);
-        history.addPredicateReadEvent(reader, kvPlan("value > 5"),
-                List.of(new Event.PredResult<>("kv:x", 10)));
-        commitAll(history);
-
-        var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(
-                history, graph, generateConstraints(history, graph), true, true);
-
-        assertTrue(solver.solve());
-        assertTrue(profiler.getCount("SER_CALFE_MATERIALIZED_KEYS_COUNT") > 0);
-        assertTrue(profiler.getCount("SER_CALFE_REPLAY_ROUNDS_COUNT") >= 2);
-        assertEquals(1L, countEdgesOfType(graph.getKnownGraphA(), EdgeType.PR_WR));
-    }
-
-    @Test
-    void calfeRejectsAnAbsentResultWithAKnownVisibleMatchingWriter() {
-        var profiler = Profiler.getInstance();
-        profiler.clear();
-        var history = new History<String, Integer>();
-        var session = history.addSession(1L);
-        var writer = history.addTransaction(session, 1L);
-        var reader = history.addTransaction(session, 2L);
-        history.addEvent(writer, WRITE, "kv:x", 10);
-        history.addPredicateReadEvent(reader, kvPlan("value > 5"), List.of());
-        commitAll(history);
-
-        var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(
-                history, graph, generateConstraints(history, graph), true, true);
-
-        assertFalse(solver.solve());
-        assertEquals(1L, profiler.getCount("SER_CALFE_MATERIALIZED_KEYS_COUNT"));
-    }
-
-    @Test
     void eagerModeMaterializesRowLocalConstraintsBeforeSolving() {
         var profiler = Profiler.getInstance();
         profiler.clear();
@@ -253,9 +209,30 @@ class SERSolverARSatEncodingTest {
                 SERVerifier.PredicateSolvingMode.EAGER);
 
         assertEquals(1L, profiler.getCount("SER_PRED_ROW_LOCAL_KEY_VISITS_COUNT"));
-        assertEquals(0L, profiler.getCount("SER_CALFE_MATERIALIZED_KEYS_COUNT"));
         assertFalse(solver.solve());
-        assertEquals(0L, profiler.getCount("SER_CALFE_REPLAY_ROUNDS_COUNT"));
+    }
+
+    @Test
+    void gmwrModeResolvesKnownBadWriter() {
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+        var history = new History<String, Integer>();
+        var session = history.addSession(1L);
+        var writer = history.addTransaction(session, 1L);
+        var reader = history.addTransaction(session, 2L);
+        history.addEvent(writer, WRITE, "kv:x", 10);
+        history.addPredicateReadEvent(reader, kvPlan("value > 5"), List.of());
+        commitAll(history);
+
+        var graph = new KnownGraph<>(history);
+        var solver = new SERSolverAR<>(
+                history, graph, generateConstraints(history, graph), true, true,
+                SERVerifier.PredicateSolvingMode.GMWR);
+
+        assertFalse(solver.solve());
+        assertEquals(1L, profiler.getCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT"));
+        assertEquals(1L, profiler.getCount("SER_GMWR_BUNDLES_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT"));
     }
 
     @Test

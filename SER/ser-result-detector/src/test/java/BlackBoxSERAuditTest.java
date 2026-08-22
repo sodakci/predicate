@@ -126,6 +126,8 @@ class BlackBoxSERAuditTest {
         assertEquals(0, result.exitCode);
         assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"));
         assertTrue(result.stderr.contains("backend=monosat"), () -> "stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains("predicate-solving-mode=eager"),
+                () -> "stderr was:\n" + result.stderr);
     }
 
     @Test
@@ -143,6 +145,35 @@ class BlackBoxSERAuditTest {
     }
 
     @Test
+    void auditCliComparesPruningModes() throws Exception {
+        var historyDir = writeTextHistoryAsPrhist("prun-pruning-history", List.of(
+                "w(1,1,1,1)",
+                "w(1,2,2,2)",
+                "w(2,2,2,2)",
+                "r(1,1,3,3)",
+                "r(2,2,3,3)"));
+
+        var reachability = runAuditCommand("audit", "--pruning-mode=REACHABILITY",
+                historyDir.toString());
+        var snapshot = runAuditCommand("audit", "--pruning-mode=SNAPSHOT",
+                historyDir.toString());
+        var prun = runAuditCommand("audit", "--pruning-mode=PRUN",
+                historyDir.toString());
+
+        assertEquals(reachability.exitCode, snapshot.exitCode);
+        assertEquals(reachability.exitCode, prun.exitCode);
+        assertEquals(0, snapshot.exitCode);
+        assertEquals(0, prun.exitCode);
+        assertTrue(snapshot.stderr.contains("SNAPSHOT pruning round 1"),
+                () -> "stderr was:\n" + snapshot.stderr);
+        assertTrue(snapshot.stderr.contains(
+                "SNAPSHOT post-check [==============================] 100%"),
+                () -> "stderr was:\n" + snapshot.stderr);
+        assertTrue(prun.stderr.contains("PRUN post-check [==============================] 100%"),
+                () -> "stderr was:\n" + prun.stderr);
+    }
+
+    @Test
     void auditCli_monosatRejectsSmallRejectCase() throws Exception {
         var historyDir = writeTextHistoryAsPrhist("reject-history", List.of(
                 "r(1,0,1,1)",
@@ -153,9 +184,13 @@ class BlackBoxSERAuditTest {
                 "w(2,1,2,2)"));
 
         var monosat = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat", historyDir.toString());
+        var prun = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat",
+                "--pruning-mode=PRUN", historyDir.toString());
 
         assertEquals(-1, monosat.exitCode);
+        assertEquals(monosat.exitCode, prun.exitCode);
         assertTrue(monosat.stderr.contains("[[[[ REJECT ]]]]"));
+        assertTrue(prun.stderr.contains("[[[[ REJECT ]]]]"));
     }
 
     @Test

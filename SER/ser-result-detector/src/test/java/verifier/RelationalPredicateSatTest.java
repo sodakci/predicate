@@ -1,6 +1,7 @@
 package verifier;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import history.loaders.PredicateHistoryLoader;
@@ -8,10 +9,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import util.Profiler;
 
 class RelationalPredicateSatTest {
     private static final String PURCHASE =
             "{\"key\":\"purchases:p0\",\"value\":{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"buyer\":\"u0\"}}";
+    private static final String PURCHASE_UPDATED =
+            "{\"key\":\"purchases:p0\",\"value\":{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"buyer\":\"u1\"}}";
+    private static final String PURCHASE_UPDATE =
+            "{\"type\":\"w\",\"key\":\"purchases:p0\","
+                    + "\"value\":{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"buyer\":\"u1\"}}";
     private static final String INVENTORY_EMPTY =
             "{\"key\":\"inventory:i0\",\"value\":{\"sku\":\"s0\",\"stock\":0}}";
     private static final String INVENTORY_AVAILABLE =
@@ -30,6 +37,35 @@ class RelationalPredicateSatTest {
                         "[{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"stock\":2}]")));
 
         assertTrue(audit(history));
+    }
+
+    @Test
+    void acceptsJoinThatUsesLatestLocalWrite() throws Exception {
+        var history = writeHistory(
+                "join-latest-local-write",
+                "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
+                transaction(0, 10,
+                        PURCHASE_UPDATE + "," + joinRead(
+                                "[" + PURCHASE_UPDATED + ","
+                                        + INVENTORY_AVAILABLE + "]",
+                                "[{\"purchase_id\":\"p0\",\"sku\":\"s0\","
+                                        + "\"stock\":2}]")));
+
+        assertTrue(audit(history));
+    }
+
+    @Test
+    void rejectsJoinThatIgnoresLatestLocalWrite() throws Exception {
+        var history = writeHistory(
+                "join-ignores-latest-local-write",
+                "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
+                transaction(0, 10,
+                        PURCHASE_UPDATE + "," + joinRead(
+                                "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
+                                "[{\"purchase_id\":\"p0\",\"sku\":\"s0\","
+                                        + "\"stock\":2}]")));
+
+        assertFalse(audit(history));
     }
 
     @Test
@@ -85,6 +121,52 @@ class RelationalPredicateSatTest {
                 reader);
 
         assertTrue(audit(history));
+    }
+
+    @Test
+    void gmwrUsesMultiKeyWitnessForMonotoneJoin() throws Exception {
+        var initialState = "[" + PURCHASE + "," + INVENTORY_EMPTY + ","
+                + "{\"key\":\"control:c0\",\"value\":{\"version\":0}}]";
+        var writer = transaction(1, 11,
+                "{\"type\":\"w\",\"key\":\"inventory:i0\","
+                        + "\"value\":{\"sku\":\"s0\",\"stock\":2}},"
+                        + "{\"type\":\"w\",\"key\":\"control:c0\","
+                        + "\"value\":{\"version\":1}}");
+        var reader = transaction(2, 12,
+                "{\"type\":\"r\",\"key\":\"control:c0\","
+                        + "\"value\":{\"version\":1}},"
+                        + joinRead("[]", "[]"));
+        var history = writeHistory("gmwr-multi-key-witness", initialState, writer, reader);
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+
+        assertFalse(audit(history, SERVerifier.PredicateSolvingMode.GMWR));
+        assertEquals(1L, profiler.getCount("SER_GMWR_GENERAL_OBSERVATIONS_COUNT"));
+        assertEquals(1L, profiler.getCount("SER_GMWR_GENERAL_WITNESSES_COUNT"));
+        assertEquals(2L, profiler.getCount("SER_GMWR_GENERAL_WITNESS_KEYS_COUNT"));
+    }
+
+    @Test
+    void gmwrBundlesCompetingWriterForRecordedJoinInput() throws Exception {
+        var writer = transaction(1, 11,
+                "{\"type\":\"w\",\"key\":\"inventory:i0\","
+                        + "\"value\":{\"sku\":\"s0\",\"stock\":3}}");
+        var reader = transaction(2, 12, joinRead(
+                "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
+                "[{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"stock\":2}]"));
+        var history = writeHistory(
+                "gmwr-recorded-input-bundle",
+                "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
+                writer,
+                reader);
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+
+        assertTrue(audit(history, SERVerifier.PredicateSolvingMode.GMWR));
+        assertEquals(1L, profiler.getCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT"));
+        assertEquals(1L, profiler.getCount("SER_GMWR_BUNDLES_COUNT"));
+        assertEquals(1L, profiler.getCount("SER_GMWR_RESOLVED_BUNDLES_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT"));
     }
 
     @Test
@@ -230,5 +312,10 @@ class RelationalPredicateSatTest {
 
     private static boolean audit(Path historyDirectory) {
         return new SERVerifier<>(new PredicateHistoryLoader(historyDirectory)).audit();
+    }
+
+    private static boolean audit(Path historyDirectory,
+            SERVerifier.PredicateSolvingMode mode) {
+        return new SERVerifier<>(new PredicateHistoryLoader(historyDirectory), true, mode).audit();
     }
 }

@@ -20,7 +20,7 @@ import verifier.Pruning;
 import verifier.SERVerifier;
 
 @Command(name = "ser-result-detector", mixinStandardHelpOptions = true, version = "ser-result-detector 0.1.0", subcommands = { Audit.class,
-        Stat.class, Dump.class })
+        ConstraintStat.class, Stat.class, Dump.class })
 public class Main implements Callable<Integer> {
     @SneakyThrows
     public static void main(String[] args) {
@@ -36,6 +36,40 @@ public class Main implements Callable<Integer> {
     }
 }
 
+@Command(name = "constraint-stat", mixinStandardHelpOptions = true,
+        description = "Count SER constraints before and after pruning without solving")
+class ConstraintStat implements Callable<Integer> {
+    @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
+    private final HistoryType type = HistoryType.PRHIST;
+
+    @Option(names = { "--pruning-mode" }, required = true,
+            description = "WW/RW pruning mode: ${COMPLETION-CANDIDATES}")
+    private SERVerifier.PruningMode pruningMode;
+
+    @Parameters(description = "history path")
+    private Path path;
+
+    @Override
+    public Integer call() {
+        var loader = Utils.getLoader(type, path);
+        var verifier = new SERVerifier<>(loader, false,
+                SERVerifier.PredicateSolvingMode.EAGER, pruningMode);
+        var stats = verifier.analyzeConstraintsOnly();
+        System.out.printf(
+                "CONSTRAINT_STATS pruning_mode=%s constraints_before=%d constraints_after=%d "
+                        + "implications_before=%d implications_after=%d "
+                        + "internally_consistent=%s pruning_inconsistent=%s%n",
+                pruningMode.name(),
+                stats.constraintsBefore,
+                stats.constraintsAfter,
+                stats.implicationsBefore,
+                stats.implicationsAfter,
+                stats.internallyConsistent,
+                stats.pruningInconsistent);
+        return stats.internallyConsistent ? 0 : 2;
+    }
+}
+
 @Command(name = "audit", mixinStandardHelpOptions = true, description = "Verify a history")
 class Audit implements Callable<Integer> {
     @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
@@ -43,6 +77,11 @@ class Audit implements Callable<Integer> {
 
     @Option(names = { "--no-pruning" }, description = "disable pruning")
     private final Boolean noPruning = false;
+
+    @Option(names = { "--pruning-mode" },
+            description = "WW/RW pruning mode: ${COMPLETION-CANDIDATES}")
+    private SERVerifier.PruningMode pruningMode =
+            SERVerifier.PruningMode.REACHABILITY;
 
     @Option(names = { "--no-coalescing" }, description = "disable coalescing")
     private final Boolean noCoalescing = false;
@@ -66,7 +105,7 @@ class Audit implements Callable<Integer> {
     @Option(names = { "--predicate-solving-mode" },
             description = "predicate solving mode: ${COMPLETION-CANDIDATES}")
     private SERVerifier.PredicateSolvingMode predicateSolvingMode =
-            SERVerifier.PredicateSolvingMode.CALFE;
+            SERVerifier.PredicateSolvingMode.EAGER;
 
     @Parameters(description = "history path")
     private Path path;
@@ -77,7 +116,11 @@ class Audit implements Callable<Integer> {
     public Integer call() {
         var loader = Utils.getLoader(type, path);
 
-        Pruning.setEnablePruning(!noPruning);
+        var selectedPruningMode = noPruning
+                ? SERVerifier.PruningMode.NONE
+                : pruningMode;
+        Pruning.setEnablePruning(selectedPruningMode
+                == SERVerifier.PruningMode.REACHABILITY);
         SERVerifier.setCoalesceConstraints(!noCoalescing);
         SERVerifier.setDotOutput(dotOutput);
         SERVerifier.setCompareDerivedPredicateEdges(compareDerivedPredicateEdges);
@@ -89,7 +132,8 @@ class Audit implements Callable<Integer> {
 
         profiler.startTick("ENTIRE_EXPERIMENT");
         var pass = true;
-        var verifier = new SERVerifier<>(loader, solverStats, predicateSolvingMode);
+        var verifier = new SERVerifier<>(loader, solverStats,
+                predicateSolvingMode, selectedPruningMode);
         pass = verifier.audit();
         profiler.endTick("ENTIRE_EXPERIMENT");
 

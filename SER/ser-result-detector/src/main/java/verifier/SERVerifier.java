@@ -27,13 +27,41 @@ import util.TriConsumer;
 @SuppressWarnings("UnstableApiUsage")
 public class SERVerifier<KeyType, ValueType> {
     public enum PredicateSolvingMode {
-        CALFE,
-        EAGER
+        EAGER,
+        GMWR
+    }
+
+    public enum PruningMode {
+        NONE,
+        REACHABILITY,
+        SNAPSHOT,
+        PRUN
+    }
+
+    public static final class ConstraintStats {
+        public final boolean internallyConsistent;
+        public final boolean pruningInconsistent;
+        public final int constraintsBefore;
+        public final int constraintsAfter;
+        public final int implicationsBefore;
+        public final int implicationsAfter;
+
+        private ConstraintStats(boolean internallyConsistent, boolean pruningInconsistent,
+                int constraintsBefore, int constraintsAfter,
+                int implicationsBefore, int implicationsAfter) {
+            this.internallyConsistent = internallyConsistent;
+            this.pruningInconsistent = pruningInconsistent;
+            this.constraintsBefore = constraintsBefore;
+            this.constraintsAfter = constraintsAfter;
+            this.implicationsBefore = implicationsBefore;
+            this.implicationsAfter = implicationsAfter;
+        }
     }
 
     private final History<KeyType, ValueType> history;
     private final boolean detailedPredicateMetrics;
     private final PredicateSolvingMode predicateSolvingMode;
+    private final PruningMode pruningMode;
 
     @Getter
     @Setter
@@ -48,21 +76,31 @@ public class SERVerifier<KeyType, ValueType> {
     private static boolean compareDerivedPredicateEdges = false;
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader) {
-        this(loader, false, PredicateSolvingMode.CALFE);
+        this(loader, false, PredicateSolvingMode.EAGER, PruningMode.REACHABILITY);
     }
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
             boolean detailedPredicateMetrics) {
-        this(loader, detailedPredicateMetrics, PredicateSolvingMode.CALFE);
+        this(loader, detailedPredicateMetrics, PredicateSolvingMode.EAGER,
+                PruningMode.REACHABILITY);
     }
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
             boolean detailedPredicateMetrics,
             PredicateSolvingMode predicateSolvingMode) {
+        this(loader, detailedPredicateMetrics, predicateSolvingMode,
+                PruningMode.REACHABILITY);
+    }
+
+    public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
+            boolean detailedPredicateMetrics,
+            PredicateSolvingMode predicateSolvingMode,
+            PruningMode pruningMode) {
         history = loader.loadHistory();
         this.detailedPredicateMetrics = detailedPredicateMetrics;
         this.predicateSolvingMode = Objects.requireNonNull(
                 predicateSolvingMode, "predicateSolvingMode");
+        this.pruningMode = Objects.requireNonNull(pruningMode, "pruningMode");
         System.err.printf("Sessions count: %d\nTransactions count: %d\nEvents count: %d\n",
                 history.getClientSessions().size(), history.getClientTransactions().size(), history.getEvents().size());
     }
@@ -108,9 +146,33 @@ public class SERVerifier<KeyType, ValueType> {
                     countEdgesOfType(derivedPredicateGraph.getKnownGraphB(), EdgeType.PR_RW));
         }
 
-        if (Pruning.pruneConstraints(graph, constraints, history)) {
+        boolean pruningRejected;
+        switch (pruningMode) {
+        case NONE:
+            pruningRejected = false;
+            break;
+        case PRUN:
+            pruningRejected = Prun.prune(
+                    history, graph, constraints).inconsistent;
+            break;
+        case SNAPSHOT:
+            pruningRejected = Prun.pruneSnapshotOnly(
+                    history, graph, constraints).inconsistent;
+            break;
+        case REACHABILITY:
+        default:
+            pruningRejected = Pruning.pruneConstraints(graph, constraints, history);
+            break;
+        }
+
+        if (pruningRejected) {
             profiler.endTick("ONESHOT_CONS");
-            emitRejectDiagnostics(graph, constraints, Pruning.getLastConflicts());
+            var conflicts = pruningMode == PruningMode.REACHABILITY
+                    ? Pruning.<KeyType, ValueType>getLastConflicts()
+                    : Pair.<Collection<Pair<com.google.common.graph.EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>,
+                            Collection<SERConstraint<KeyType, ValueType>>>of(
+                                    Collections.emptyList(), Collections.emptyList());
+            emitRejectDiagnostics(graph, constraints, conflicts);
             return false;
         }
         profiler.endTick("ONESHOT_CONS");
@@ -139,6 +201,51 @@ public class SERVerifier<KeyType, ValueType> {
         }
 
         return accepted;
+    }
+
+    public ConstraintStats analyzeConstraintsOnly() {
+        if (!Utils.verifyInternalConsistency(history)) {
+            return new ConstraintStats(false, false, 0, 0, 0, 0);
+        }
+
+        var graph = new KnownGraph<>(history);
+        var constraints = generateConstraintsSER(history, graph);
+        int constraintsBefore = constraints.size();
+        int implicationsBefore = countConstraintImplications(constraints);
+
+        boolean pruningInconsistent;
+        switch (pruningMode) {
+        case NONE:
+            pruningInconsistent = false;
+            break;
+        case PRUN:
+            pruningInconsistent = Prun.prune(history, graph, constraints).inconsistent;
+            break;
+        case SNAPSHOT:
+            pruningInconsistent = Prun.pruneSnapshotOnly(
+                    history, graph, constraints).inconsistent;
+            break;
+        case REACHABILITY:
+        default:
+            pruningInconsistent = Pruning.pruneConstraints(graph, constraints, history);
+            break;
+        }
+
+        return new ConstraintStats(
+                true,
+                pruningInconsistent,
+                constraintsBefore,
+                constraints.size(),
+                implicationsBefore,
+                countConstraintImplications(constraints));
+    }
+
+    private int countConstraintImplications(
+            Collection<SERConstraint<KeyType, ValueType>> constraints) {
+        return constraints.stream()
+                .mapToInt(constraint -> constraint.getEdges1().size()
+                        + constraint.getEdges2().size())
+                .sum();
     }
 
     private void emitRejectDiagnostics(

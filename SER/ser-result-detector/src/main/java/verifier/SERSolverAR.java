@@ -95,8 +95,28 @@ class SERSolverAR<KeyType, ValueType> {
     // Predicate constraints are refined lazily from concrete SAT models.  This
     // avoids eagerly enumerating the Cartesian product of every key frontier.
     private final List<PredicateCheck<KeyType, ValueType>> predicateChecks = new ArrayList<>();
-    private final List<RowLocalPredicateCheck<KeyType, ValueType>> rowLocalPredicateChecks =
-            new ArrayList<>();
+    // GMWR row-local item obligations are quotiented by (reader,bad-writer);
+    // monotone multi-row queries use exact model refinement with a compact
+    // multi-key witness.
+    private final Map<Pair<Transaction<KeyType, ValueType>, Transaction<KeyType, ValueType>>,
+            GmwrBundle<KeyType, ValueType>> gmwrBundles = new LinkedHashMap<>();
+    private GmwrOrderClosure gmwrClosure;
+    private BitSet[] gmwrSeenBadWritersByReader;
+    private long gmwrBundleCount;
+    private long gmwrItemObligations;
+    private long gmwrReturnedItemObligations;
+    private long gmwrAbsentItemObligations;
+    private long gmwrDuplicateItemClauses;
+    private long gmwrForcedOrders;
+    private long gmwrResolvedBundles;
+    private long gmwrResidualBundles;
+    private long gmwrResidualClauses;
+    private long gmwrResidualLiterals;
+    private long gmwrResolutionRounds;
+    private long gmwrBuildNanos;
+    private long gmwrResolutionNanos;
+    private long gmwrGeneralObservations;
+
     // Writer comparability is key-local and independent of the predicate read.
     // Initialize each key's writer pairs once, then reuse them across reads.
     private final Set<KeyType> initializedPredicateWriteOrders = new HashSet<>();
@@ -117,7 +137,7 @@ class SERSolverAR<KeyType, ValueType> {
                 KnownGraph<KeyType, ValueType> graph,
                 Collection<SERConstraint<KeyType, ValueType>> constraints) {
         this(history, graph, constraints, true, false,
-                SERVerifier.PredicateSolvingMode.CALFE);
+                SERVerifier.PredicateSolvingMode.EAGER);
     }
 
     private SERSolverAR(History<KeyType, ValueType> history,
@@ -125,7 +145,7 @@ class SERSolverAR<KeyType, ValueType> {
                         Collection<SERConstraint<KeyType, ValueType>> constraints,
                         boolean collectConflicts) {
         this(history, graph, constraints, collectConflicts, false,
-                SERVerifier.PredicateSolvingMode.CALFE);
+                SERVerifier.PredicateSolvingMode.EAGER);
     }
 
     SERSolverAR(History<KeyType, ValueType> history,
@@ -134,7 +154,7 @@ class SERSolverAR<KeyType, ValueType> {
                 boolean collectConflicts,
                 boolean collectPredicateMetrics) {
         this(history, graph, constraints, collectConflicts, collectPredicateMetrics,
-                SERVerifier.PredicateSolvingMode.CALFE);
+                SERVerifier.PredicateSolvingMode.EAGER);
     }
 
     SERSolverAR(History<KeyType, ValueType> history,
@@ -161,6 +181,9 @@ class SERSolverAR<KeyType, ValueType> {
                 txnIndex.put(txns.get(i), i);
             }
             this.knownOrder = buildKnownOrder();
+            if (predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR) {
+                this.gmwrClosure = new GmwrOrderClosure();
+            }
             this.arGraph = new Graph(solver);
             this.arNodes = createArNodes();
             this.writesByKey = buildWritesByKey(graph);
@@ -176,9 +199,6 @@ class SERSolverAR<KeyType, ValueType> {
         profileVoid(profiler, "SER_AR_ENCODE_WW", this::encodeRemainingWwChoices);
         profileVoid(profiler, "SER_AR_ENCODE_RW", this::encodeRwFromWrAndWw);
         profileVoid(profiler, "SER_AR_ENCODE_PREDICATE", this::encodePredicateConstraints);
-        if (predicateSolvingMode == SERVerifier.PredicateSolvingMode.CALFE) {
-            profileVoid(profiler, "SER_CALFE_PREDECLARE_AR", this::predeclareRowLocalArPairs);
-        }
         profileVoid(profiler, "SER_AR_ENCODE_DEPENDENCIES", this::encodeDependencyEdges);
         profileVoid(profiler, "SER_AR_ENCODE_TOTAL_ORDER", this::encodeStrictTotalOrder);
     }
@@ -236,10 +256,7 @@ class SERSolverAR<KeyType, ValueType> {
         return txns.size() * Math.max(0, txns.size() - 1);
     }
 
-    /**
-     * Allocates one graph node per real transaction. Pairwise AR edge
-     * literals are created lazily by ar(...).
-     */
+    /** Allocates one graph node per real transaction. */
     private int[] createArNodes() {
         var result = new int[txns.size()];
         for (int i = 0; i < txns.size(); i++) {
@@ -248,12 +265,7 @@ class SERSolverAR<KeyType, ValueType> {
         return result;
     }
 
-    /**
-     * The selected AR graph is a strict partial order. Every queried pair is
-     * forced comparable in ensureComparable(...), so the partial order satisfies
-     * all formula-visible total-order choices and can be extended to a strict
-     * total serial order for unqueried pairs.
-     */
+    /** Forbids directed cycles; queried pairs are made comparable on demand. */
     private void encodeStrictTotalOrder() {
         solver.assertTrue(arGraph.acyclic());
     }
@@ -559,12 +571,18 @@ class SERSolverAR<KeyType, ValueType> {
                     if (collectingPredicateMetrics) {
                         predicateEncodingMetrics.rowLocalAttempts++;
                     }
-                    var encoded = predicateSolvingMode ==
-                            SERVerifier.PredicateSolvingMode.EAGER
-                            ? encodeRowLocalPredicateEager(
-                                    observation, scopedEntries, resultSourcesByKey)
-                            : registerRowLocalPredicateCheck(
-                                    observation, scopedEntries, resultSourcesByKey);
+                    final boolean encoded;
+                    switch (predicateSolvingMode) {
+                    case GMWR:
+                        encoded = encodeRowLocalPredicateGmwr(
+                                observation, scopedEntries, resultSourcesByKey);
+                        break;
+                    case EAGER:
+                    default:
+                        encoded = encodeRowLocalPredicateEager(
+                                observation, scopedEntries, resultSourcesByKey);
+                        break;
+                    }
                     if (encoded) {
                         if (collectingPredicateMetrics) {
                             predicateEncodingMetrics.rowLocalEncoded++;
@@ -579,10 +597,34 @@ class SERSolverAR<KeyType, ValueType> {
                     predicateEncodingMetrics.generalObservations++;
                 }
 
+                boolean gmwrMonotone = predicateSolvingMode
+                        == SERVerifier.PredicateSolvingMode.GMWR
+                        && predicate instanceof QueryPlan
+                        && ((QueryPlan<?, ?>) predicate).isMonotone();
+                if (gmwrMonotone) {
+                    gmwrGeneralObservations++;
+                    var expectedInputs = expectedPredicateInputs(predicateRead);
+                    if (!predicateSnapshotMatches(predicateRead, expectedInputs,
+                            relationResolverFor(predicateRead))) {
+                        solver.assertTrue(Lit.False);
+                    }
+                    for (var entry : scopedEntries) {
+                        var recordedSource = resultSourcesByKey.get(entry.key);
+                        if (recordedSource != null
+                                && observation.getPredicateReadType(entry.key)
+                                    == KnownGraph.PredicateReadType.EXTERNAL) {
+                            encodeGeneralGmwrRecordedSource(
+                                    observation, entry, recordedSource);
+                        }
+                    }
+                }
+
                 started = System.nanoTime();
                 var frontierEntries = scopedEntries.stream()
                         .filter(entry -> observation.getPredicateReadType(entry.key)
                                 == KnownGraph.PredicateReadType.EXTERNAL)
+                        .filter(entry -> !gmwrMonotone
+                                || !resultSourcesByKey.containsKey(entry.key))
                         .collect(Collectors.toList());
                 predicateEncodingMetrics.generalKeyScanNanos +=
                         System.nanoTime() - started;
@@ -625,12 +667,43 @@ class SERSolverAR<KeyType, ValueType> {
                     }
                 }
                 predicateChecks.add(new PredicateCheck<>(predicateRead, frontiers,
-                        snapshot, relationResolverFor(predicateRead)));
+                        snapshot, relationResolverFor(predicateRead), gmwrMonotone,
+                        resultSourcesByKey.keySet()));
+            }
+            if (predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR) {
+                resolveAndEncodeGmwrBundles();
             }
         } finally {
             collectingPredicateMetrics = false;
             predicateEncodingMetrics.publish(
                     Profiler.getInstance(), collectPredicateMetrics);
+        }
+    }
+
+    private void encodeGeneralGmwrRecordedSource(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            KeyWriteIndex<KeyType, ValueType> entry,
+            KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
+        var started = System.nanoTime();
+        try {
+            var reader = observation.getTxn();
+            var candidates = latestExternalWrites(entry, reader);
+            if (!containsIdentity(candidates, recordedSource)) {
+                solver.assertTrue(Lit.False);
+                return;
+            }
+            gmwrForceOrder(recordedSource.getTxn(), reader);
+            for (var other : candidates) {
+                if (other == recordedSource
+                        || Objects.equals(other.getEvent().getValue(),
+                                recordedSource.getEvent().getValue())) {
+                    continue;
+                }
+                gmwrAddItem(reader, other.getTxn(),
+                        List.of(recordedSource.getTxn()), true);
+            }
+        } finally {
+            gmwrBuildNanos += System.nanoTime() - started;
         }
     }
 
@@ -646,6 +719,472 @@ class SERSolverAR<KeyType, ValueType> {
         return sortedKeyWriteIndexes.stream()
                 .filter(entry -> scope.covers(entry.key))
                 .collect(Collectors.toUnmodifiableList());
+    }
+
+    /**
+     * Independent GMWR encoding for row-local predicate reads.
+     *
+     * <p>The formal predicate semantics remain item-wise.  The solver-side
+     * representation is quotiented before SAT: every bad writer B for reader R
+     * contributes one item clause to a generalized (R,B) bundle.  All clauses
+     * in the bundle share the same outside-snapshot branch R&lt;B.  Returned
+     * items use their recorded source as the repair writer; absent items use
+     * every writer whose row contribution is empty.</p>
+     */
+    private boolean encodeRowLocalPredicateGmwr(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
+            Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
+        var started = System.nanoTime();
+        try {
+            var predicateRead = observation.getPredicateReadEvent();
+            var relationResolver = relationResolverFor(predicateRead);
+            var snapshotStarted = System.nanoTime();
+            var snapshotValid = rowLocalSnapshotValid(
+                    predicateRead, relationResolver, resultSourcesByKey);
+            predicateEncodingMetrics.snapshotValidationNanos +=
+                    System.nanoTime() - snapshotStarted;
+            if (!snapshotValid) {
+                return false;
+            }
+
+            var reader = observation.getTxn();
+            for (var entry : scopedEntries) {
+                var key = entry.key;
+                var recordedSource = resultSourcesByKey.get(key);
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.rowLocalKeyVisits++;
+                }
+
+                if (observation.getPredicateReadType(key)
+                        == KnownGraph.PredicateReadType.INTERNAL) {
+                    if (collectingPredicateMetrics) {
+                        predicateEncodingMetrics.internalKeys++;
+                        predicateEncodingMetrics.latestWriterLookups++;
+                        predicateEncodingMetrics.latestWriterInputWrites += entry.writes.size();
+                    }
+                    var latestSelf = entry.latestSelfBefore(
+                            reader, observation.getEventIndex());
+                    if (latestSelf == null) {
+                        latestSelf = recordedSource;
+                    }
+                    if (recordedSource != null) {
+                        if (latestSelf != recordedSource) {
+                            solver.assertTrue(Lit.False);
+                        }
+                    } else if (latestSelf != null
+                            && !hasEmptyPredicateContribution(
+                                    predicateRead, relationResolver, latestSelf)) {
+                        solver.assertTrue(Lit.False);
+                    }
+                    continue;
+                }
+
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.externalKeys++;
+                }
+                var candidates = latestExternalWrites(entry, reader);
+
+                if (recordedSource != null) {
+                    if (collectingPredicateMetrics) {
+                        predicateEncodingMetrics.recordedSourceKeys++;
+                    }
+                    if (!containsIdentity(candidates, recordedSource)) {
+                        solver.assertTrue(Lit.False);
+                        continue;
+                    }
+
+                    // The recorded source is mandatory visible under the current
+                    // detector semantics. Add it to the GMWR closure as a
+                    // transaction-level fact.
+                    gmwrForceOrder(recordedSource.getTxn(), reader);
+
+                    for (var other : candidates) {
+                        if (other == recordedSource
+                                || !writeChangesPredicateResult(
+                                        recordedSource, other, predicateRead)) {
+                            continue;
+                        }
+                        gmwrAddItem(reader, other.getTxn(),
+                                List.of(recordedSource.getTxn()), true);
+                    }
+                    continue;
+                }
+
+                var goodWriterTxns = new ArrayList<Transaction<KeyType, ValueType>>();
+                var badWrites = new ArrayList<KnownGraph.WriteRef<KeyType, ValueType>>();
+                for (var write : candidates) {
+                    if (hasEmptyPredicateContribution(
+                            predicateRead, relationResolver, write)) {
+                        goodWriterTxns.add(write.getTxn());
+                    } else {
+                        badWrites.add(write);
+                    }
+                }
+                if (collectingPredicateMetrics) {
+                    predicateEncodingMetrics.badWrites += badWrites.size();
+                }
+                for (var badWrite : badWrites) {
+                    gmwrAddItem(reader, badWrite.getTxn(), goodWriterTxns, false);
+                }
+            }
+
+            for (var resultKey : resultSourcesByKey.keySet()) {
+                if (!predicateRead.getPredicate().scope().covers(resultKey)
+                        || !writesByKey.containsKey(resultKey)) {
+                    solver.assertTrue(Lit.False);
+                }
+            }
+            return true;
+        } finally {
+            gmwrBuildNanos += System.nanoTime() - started;
+        }
+    }
+
+    private void gmwrAddItem(
+            Transaction<KeyType, ValueType> reader,
+            Transaction<KeyType, ValueType> badWriter,
+            Collection<Transaction<KeyType, ValueType>> repairWriters,
+            boolean returnedItem) {
+        if (reader.equals(badWriter)) {
+            solver.assertTrue(Lit.False);
+            return;
+        }
+
+        gmwrItemObligations++;
+        if (returnedItem) {
+            gmwrReturnedItemObligations++;
+        } else {
+            gmwrAbsentItemObligations++;
+        }
+        gmwrMarkBundleSeen(reader, badWriter);
+
+        var repairs = new LinkedHashSet<Transaction<KeyType, ValueType>>();
+        for (var repair : repairWriters) {
+            if (repair == null || repair.equals(reader) || repair.equals(badWriter)) {
+                continue;
+            }
+            repairs.add(repair);
+        }
+        var repairList = List.copyOf(repairs);
+        var key = Pair.of(reader, badWriter);
+
+        int status = gmwrResolveItem(reader, badWriter, repairList);
+        if (status < 0) {
+            solver.assertTrue(Lit.False);
+            gmwrBundles.remove(key);
+            return;
+        }
+        if (status > 0) {
+            // R<B resolves every item in this bundle.  A unique repair resolves
+            // only this item, but old residual items are rechecked at the final
+            // fixed point, so no new state is needed here.
+            if (gmwrClosure.before(reader, badWriter)) {
+                gmwrBundles.remove(key);
+            }
+            return;
+        }
+
+        // Only genuinely unresolved item clauses are materialized.  Real SER
+        // workloads resolve the overwhelming majority during this streaming
+        // pass, which keeps the working set proportional to the residual
+        // kernel rather than to all item-wise obligations.
+        var signature = Collections.unmodifiableSet(new HashSet<>(repairList));
+        var bundle = gmwrBundles.computeIfAbsent(
+                key, ignored -> new GmwrBundle<>(reader, badWriter));
+        var existing = bundle.items.get(signature);
+        if (existing != null) {
+            existing.multiplicity++;
+            gmwrDuplicateItemClauses++;
+            return;
+        }
+        bundle.items.put(signature, new GmwrItem<>(repairList, 1L));
+    }
+
+    private void gmwrMarkBundleSeen(
+            Transaction<KeyType, ValueType> reader,
+            Transaction<KeyType, ValueType> badWriter) {
+        if (gmwrSeenBadWritersByReader == null) {
+            gmwrSeenBadWritersByReader = new BitSet[txns.size()];
+            for (int index = 0; index < txns.size(); index++) {
+                gmwrSeenBadWritersByReader[index] = new BitSet(txns.size() + 1);
+            }
+        }
+        int readerId = txnIndex.get(reader);
+        int badId = isBottomTxn(badWriter) ? txns.size() : txnIndex.get(badWriter);
+        var seen = gmwrSeenBadWritersByReader[readerId];
+        if (!seen.get(badId)) {
+            seen.set(badId);
+            gmwrBundleCount++;
+        }
+    }
+
+    /**
+     * Resolves one item clause against the current mandatory order.
+     * -1 contradiction; 0 unresolved; 1 resolved without/with forced order.
+     */
+    private int gmwrResolveItem(
+            Transaction<KeyType, ValueType> reader,
+            Transaction<KeyType, ValueType> bad,
+            Collection<Transaction<KeyType, ValueType>> repairs) {
+        if (gmwrClosure.before(reader, bad)) {
+            return 1;
+        }
+        if (gmwrRepairSatisfied(bad, reader, repairs)) {
+            return 1;
+        }
+        var feasible = gmwrFeasibleRepairs(bad, reader, repairs);
+        boolean outsideImpossible = gmwrClosure.before(bad, reader);
+        if (feasible.isEmpty()) {
+            if (outsideImpossible) {
+                return -1;
+            }
+            gmwrForceOrder(reader, bad);
+            return 1;
+        }
+        if (outsideImpossible && feasible.size() == 1) {
+            var repair = feasible.get(0);
+            gmwrForceOrder(bad, repair);
+            gmwrForceOrder(repair, reader);
+            return 1;
+        }
+        return 0;
+    }
+
+    /**
+     * Polynomial GMWR kernelization over the currently mandatory AR closure.
+     * Rules are deliberately conservative: they only add an order when every
+     * total extension satisfying the original item clause must contain it.
+     */
+    private void resolveAndEncodeGmwrBundles() {
+        var started = System.nanoTime();
+        try {
+            if (gmwrClosure == null) {
+                return;
+            }
+            if (gmwrBundles.isEmpty()) {
+                gmwrResolvedBundles = gmwrBundleCount;
+                return;
+            }
+
+            boolean changed;
+            do {
+                gmwrResolutionRounds++;
+                changed = false;
+                for (var bundle : gmwrBundles.values()) {
+                    if (bundle.resolved) {
+                        continue;
+                    }
+                    if (gmwrResolveBundle(bundle)) {
+                        changed = true;
+                    }
+                }
+            } while (changed);
+
+            for (var bundle : gmwrBundles.values()) {
+                if (!bundle.resolved) {
+                    gmwrResidualBundles++;
+                    gmwrEncodeResidualBundle(bundle);
+                }
+            }
+            gmwrResolvedBundles = Math.max(0L, gmwrBundleCount - gmwrResidualBundles);
+        } finally {
+            gmwrResolutionNanos += System.nanoTime() - started;
+            publishGmwrMetrics();
+        }
+    }
+
+    /** Returns true iff this pass added at least one mandatory order. */
+    private boolean gmwrResolveBundle(GmwrBundle<KeyType, ValueType> bundle) {
+        var reader = bundle.reader;
+        var bad = bundle.badWriter;
+
+        // Shared outside branch: if R<B is mandatory, every item in this
+        // generalized bundle is satisfied at once.
+        if (gmwrClosure.before(reader, bad)) {
+            bundle.resolved = true;
+            return false;
+        }
+
+        boolean changed = false;
+        boolean allItemsSatisfied = true;
+        boolean outsideImpossible = gmwrClosure.before(bad, reader);
+
+        for (var item : bundle.items.values()) {
+            if (gmwrRepairSatisfied(bad, reader, item.repairs)) {
+                continue;
+            }
+            allItemsSatisfied = false;
+
+            var feasible = gmwrFeasibleRepairs(bad, reader, item.repairs);
+            if (feasible.isEmpty()) {
+                if (outsideImpossible) {
+                    solver.assertTrue(Lit.False);
+                    bundle.resolved = true;
+                    return changed;
+                }
+                // This item has no repair in any extension.  Therefore the
+                // bundle's shared outside branch R<B is mandatory and resolves
+                // all sibling item clauses at once.
+                if (gmwrForceOrder(reader, bad)) {
+                    changed = true;
+                }
+                bundle.resolved = true;
+                return changed;
+            }
+
+            if (outsideImpossible && feasible.size() == 1) {
+                var repair = feasible.get(0);
+                if (gmwrForceOrder(bad, repair)) {
+                    changed = true;
+                }
+                if (gmwrForceOrder(repair, reader)) {
+                    changed = true;
+                }
+            }
+        }
+
+        if (allItemsSatisfied || gmwrClosure.before(reader, bad)) {
+            bundle.resolved = true;
+        }
+        return changed;
+    }
+
+    private boolean gmwrRepairSatisfied(
+            Transaction<KeyType, ValueType> bad,
+            Transaction<KeyType, ValueType> reader,
+            Collection<Transaction<KeyType, ValueType>> repairs) {
+        for (var repair : repairs) {
+            if (gmwrClosure.before(bad, repair)
+                    && gmwrClosure.before(repair, reader)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<Transaction<KeyType, ValueType>> gmwrFeasibleRepairs(
+            Transaction<KeyType, ValueType> bad,
+            Transaction<KeyType, ValueType> reader,
+            Collection<Transaction<KeyType, ValueType>> repairs) {
+        var feasible = new ArrayList<Transaction<KeyType, ValueType>>();
+        for (var repair : repairs) {
+            if (gmwrClosure.canPlaceBetween(bad, repair, reader)) {
+                feasible.add(repair);
+            }
+        }
+        return feasible;
+    }
+
+    private void gmwrEncodeResidualBundle(GmwrBundle<KeyType, ValueType> bundle) {
+        var outside = gmwrOrderLiteral(bundle.reader, bundle.badWriter);
+        if (outside == Lit.True) {
+            return;
+        }
+
+        for (var item : bundle.items.values()) {
+            if (gmwrRepairSatisfied(bundle.badWriter, bundle.reader, item.repairs)) {
+                continue;
+            }
+
+            var clause = new ArrayList<Lit>();
+            if (outside != Lit.False) {
+                clause.add(outside);
+            }
+            for (var repair : gmwrFeasibleRepairs(
+                    bundle.badWriter, bundle.reader, item.repairs)) {
+                var repairTerm = and(
+                        gmwrOrderLiteral(bundle.badWriter, repair),
+                        gmwrOrderLiteral(repair, bundle.reader));
+                if (repairTerm == Lit.True) {
+                    clause.clear();
+                    clause.add(Lit.True);
+                    break;
+                }
+                if (repairTerm != Lit.False && !repairTerm.isConstFalse()) {
+                    clause.add(repairTerm);
+                }
+            }
+
+            if (clause.contains(Lit.True)) {
+                continue;
+            }
+            gmwrResidualClauses++;
+            gmwrResidualLiterals += Math.max(1, clause.size());
+            if (clause.isEmpty()) {
+                solver.addClause(Lit.False);
+            } else {
+                solver.assertOr(clause);
+            }
+        }
+    }
+
+    private Lit gmwrOrderLiteral(
+            Transaction<KeyType, ValueType> from,
+            Transaction<KeyType, ValueType> to) {
+        if (gmwrClosure.before(from, to)) {
+            return Lit.True;
+        }
+        if (gmwrClosure.before(to, from)) {
+            return Lit.False;
+        }
+        return ar(from, to);
+    }
+
+    /** Adds one GMWR-implied order to both the fixed-point closure and SAT. */
+    private boolean gmwrForceOrder(
+            Transaction<KeyType, ValueType> from,
+            Transaction<KeyType, ValueType> to) {
+        if (gmwrClosure == null) {
+            solver.assertTrue(ar(from, to));
+            return false;
+        }
+        if (gmwrClosure.before(from, to)) {
+            return false;
+        }
+        if (from.equals(to) || gmwrClosure.before(to, from)) {
+            solver.assertTrue(Lit.False);
+            return false;
+        }
+        if (!gmwrClosure.add(from, to)) {
+            solver.assertTrue(Lit.False);
+            return false;
+        }
+        gmwrForcedOrders++;
+        solver.assertTrue(ar(from, to));
+        return true;
+    }
+
+    private void publishGmwrMetrics() {
+        if (predicateSolvingMode != SERVerifier.PredicateSolvingMode.GMWR) {
+            return;
+        }
+        var profiler = Profiler.getInstance();
+        profiler.addDurationNanos("SER_GMWR_BUILD", gmwrBuildNanos);
+        profiler.addDurationNanos("SER_GMWR_RESOLUTION", gmwrResolutionNanos);
+        if (!collectPredicateMetrics) {
+            return;
+        }
+        long uniqueItemClauses = gmwrBundles.values().stream()
+                .mapToLong(bundle -> bundle.items.size()).sum();
+        profiler.addCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT", gmwrItemObligations);
+        profiler.addCount("SER_GMWR_RETURNED_ITEM_OBLIGATIONS_COUNT",
+                gmwrReturnedItemObligations);
+        profiler.addCount("SER_GMWR_ABSENT_ITEM_OBLIGATIONS_COUNT",
+                gmwrAbsentItemObligations);
+        profiler.addCount("SER_GMWR_BUNDLES_COUNT", gmwrBundleCount);
+        profiler.addCount("SER_GMWR_UNIQUE_ITEM_CLAUSES_COUNT", uniqueItemClauses);
+        profiler.addCount("SER_GMWR_MATERIALIZED_ITEM_CLAUSES_COUNT", uniqueItemClauses);
+        profiler.addCount("SER_GMWR_DUPLICATE_ITEM_CLAUSES_COUNT",
+                gmwrDuplicateItemClauses);
+        profiler.addCount("SER_GMWR_RESOLVED_BUNDLES_COUNT", gmwrResolvedBundles);
+        profiler.addCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT", gmwrResidualBundles);
+        profiler.addCount("SER_GMWR_RESIDUAL_CLAUSES_COUNT", gmwrResidualClauses);
+        profiler.addCount("SER_GMWR_RESIDUAL_LITERALS_COUNT", gmwrResidualLiterals);
+        profiler.addCount("SER_GMWR_FORCED_ORDERS_COUNT", gmwrForcedOrders);
+        profiler.addCount("SER_GMWR_RESOLUTION_ROUNDS_COUNT", gmwrResolutionRounds);
+        profiler.addCount("SER_GMWR_GENERAL_OBSERVATIONS_COUNT",
+                gmwrGeneralObservations);
     }
 
     /** Eagerly materializes every row-local reader-key constraint before solve(). */
@@ -764,196 +1303,6 @@ class SERSolverAR<KeyType, ValueType> {
         return true;
     }
 
-    /** Registers one row-local observation for CALFE model replay. */
-    private boolean registerRowLocalPredicateCheck(
-            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
-            List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
-            Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
-        var predicateRead = observation.getPredicateReadEvent();
-        var relationResolver = relationResolverFor(predicateRead);
-        var started = System.nanoTime();
-        var snapshotValid = rowLocalSnapshotValid(
-                predicateRead, relationResolver, resultSourcesByKey);
-        predicateEncodingMetrics.snapshotValidationNanos +=
-                System.nanoTime() - started;
-        if (!snapshotValid) {
-            return false;
-        }
-
-        for (var resultKey : resultSourcesByKey.keySet()) {
-            if (!predicateRead.getPredicate().scope().covers(resultKey)
-                    || !writesByKey.containsKey(resultKey)) {
-                solver.assertTrue(Lit.False);
-            }
-        }
-        var recordedSourcesByKeyId = new Object[sortedKeyWriteIndexes.size()];
-        for (var entry : scopedEntries) {
-            recordedSourcesByKeyId[entry.keyId] = resultSourcesByKey.get(entry.key);
-        }
-        rowLocalPredicateChecks.add(new RowLocalPredicateCheck<>(
-                observation, scopedEntries, relationResolver, recordedSourcesByKeyId));
-        return true;
-    }
-
-    /**
-     * MonoSAT graph variables cannot be added after the first solve.  CALFE
-     * therefore allocates only the graph-edge variables that a later
-     * materialized reader-key constraint may reference.  It deliberately does
-     * not assert pair comparability yet: the unchanged ar(...) path adds that
-     * XOR exactly when the corresponding predicate formula is materialized.
-     * This creates no PR_WR/PR_RW edge, frontier guard, or blocking clause.
-     */
-    private void predeclareRowLocalArPairs() {
-        if (rowLocalPredicateChecks.isEmpty()) {
-            return;
-        }
-
-        var requiredPairs = new BitSet[txns.size()];
-        for (int index = 0; index < requiredPairs.length; index++) {
-            requiredPairs[index] = new BitSet(txns.size());
-        }
-        var preparedWriterPairs = new BitSet(sortedKeyWriteIndexes.size());
-        long readerKeyVisits = 0L;
-
-        for (var check : rowLocalPredicateChecks) {
-            var observation = check.observation;
-            var reader = observation.getTxn();
-            for (var entry : check.scopedEntries) {
-                if (observation.getPredicateReadType(entry.key)
-                        != KnownGraph.PredicateReadType.EXTERNAL) {
-                    continue;
-                }
-                readerKeyVisits++;
-
-                for (var write : entry.latestWritesByWriter) {
-                    markRequiredArPair(requiredPairs, reader, write.getTxn());
-                }
-
-                if (!preparedWriterPairs.get(entry.keyId)) {
-                    preparedWriterPairs.set(entry.keyId);
-                    var writes = entry.latestWritesByWriter;
-                    for (int left = 0; left < writes.size(); left++) {
-                        for (int right = left + 1; right < writes.size(); right++) {
-                            markRequiredArPair(requiredPairs,
-                                    writes.get(left).getTxn(),
-                                    writes.get(right).getTxn());
-                        }
-                    }
-                }
-            }
-        }
-
-        long pairCount = 0L;
-        for (int left = 0; left < requiredPairs.length; left++) {
-            for (int right = requiredPairs[left].nextSetBit(left + 1);
-                    right >= 0;
-                    right = requiredPairs[left].nextSetBit(right + 1)) {
-                var leftTxn = txns.get(left);
-                var rightTxn = txns.get(right);
-                directArEdge(leftTxn, rightTxn);
-                directArEdge(rightTxn, leftTxn);
-                pairCount++;
-            }
-        }
-        if (collectPredicateMetrics) {
-            var profiler = Profiler.getInstance();
-            profiler.addCount("SER_CALFE_PREDECLARE_READER_KEYS_COUNT", readerKeyVisits);
-            profiler.addCount("SER_CALFE_PREDECLARE_AR_PAIRS_COUNT", pairCount);
-        }
-    }
-
-    private void markRequiredArPair(
-            BitSet[] requiredPairs,
-            Transaction<KeyType, ValueType> left,
-            Transaction<KeyType, ValueType> right) {
-        if (left == right || left.equals(right)
-                || isBottomTxn(left) || isBottomTxn(right)) {
-            return;
-        }
-        int leftIndex = txnIndex.get(left);
-        int rightIndex = txnIndex.get(right);
-        if (!knownOrder.cyclic
-                && (knownOrder.reachable[leftIndex].get(rightIndex)
-                    || knownOrder.reachable[rightIndex].get(leftIndex))) {
-            return;
-        }
-        if (leftIndex < rightIndex) {
-            requiredPairs[leftIndex].set(rightIndex);
-        } else {
-            requiredPairs[rightIndex].set(leftIndex);
-        }
-    }
-
-    /** Materializes the unchanged eager constraint for one violating reader-key. */
-    private void materializeRowLocalKeyConstraint(
-            RowLocalPredicateCheck<KeyType, ValueType> check,
-            KeyWriteIndex<KeyType, ValueType> entry,
-            KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
-        var observation = check.observation;
-        var predicateRead = observation.getPredicateReadEvent();
-        var key = entry.key;
-
-        if (observation.getPredicateReadType(key)
-                == KnownGraph.PredicateReadType.INTERNAL) {
-            var latestSelf = entry.latestSelfBefore(
-                    observation.getTxn(), observation.getEventIndex());
-            if (latestSelf == null) {
-                latestSelf = recordedSource;
-            }
-            if (recordedSource != null) {
-                if (latestSelf != recordedSource) {
-                    solver.assertTrue(Lit.False);
-                }
-            } else if (latestSelf != null
-                    && !hasEmptyPredicateContribution(
-                            predicateRead, check.relationResolver, latestSelf)) {
-                solver.assertTrue(Lit.False);
-            }
-            return;
-        }
-
-        if (recordedSource != null) {
-            assertRecordedSourceLatest(observation, entry, recordedSource);
-            return;
-        }
-
-        var badWrites = latestExternalWrites(entry, observation.getTxn()).stream()
-                .filter(write -> !hasEmptyPredicateContribution(
-                        predicateRead, check.relationResolver, write))
-                .collect(Collectors.toList());
-        var frontier = createKeyFrontier(observation, entry, null, false);
-        if (badWrites.isEmpty()) {
-            return;
-        }
-
-        var badWriteSet = Collections.newSetFromMap(
-                new IdentityHashMap<KnownGraph.WriteRef<KeyType, ValueType>, Boolean>());
-        badWriteSet.addAll(badWrites);
-        for (var badWrite : badWrites) {
-            var badCandidate = candidateFor(frontier, badWrite);
-            if (badCandidate == null) {
-                continue;
-            }
-            var blockingClause = new ArrayList<Lit>();
-            blockingClause.add(Logic.not(badCandidate.visible));
-            for (var goodCandidate : frontier.candidates) {
-                if (badWriteSet.contains(goodCandidate.write)) {
-                    continue;
-                }
-                var laterVisible = and(goodCandidate.visible,
-                        beforeWrite(badWrite, goodCandidate.write));
-                if (laterVisible != Lit.False && !laterVisible.isConstFalse()) {
-                    blockingClause.add(laterVisible);
-                }
-            }
-            if (blockingClause.isEmpty()) {
-                solver.addClause(Lit.False);
-            } else {
-                solver.assertOr(blockingClause);
-            }
-        }
-    }
-
     private boolean rowLocalSnapshotValid(
             Event<KeyType, ValueType> predicateRead,
             RelationResolver<KeyType> relationResolver,
@@ -1062,11 +1411,19 @@ class SERSolverAR<KeyType, ValueType> {
                     recordedSource, other, observation.getPredicateReadEvent())) {
                 continue;
             }
-            addDependencyEdge(
-                    new SEREdge<>(observation.getTxn(), other.getTxn(),
-                            EdgeType.PR_RW, key),
-                    beforeWrite(recordedSource, other));
+            addPredicateRwDependency(
+                    observation.getTxn(), key, recordedSource, other);
         }
+    }
+
+    private void addPredicateRwDependency(
+            Transaction<KeyType, ValueType> reader,
+            KeyType key,
+            KnownGraph.WriteRef<KeyType, ValueType> source,
+            KnownGraph.WriteRef<KeyType, ValueType> later) {
+        addDependencyEdge(
+                new SEREdge<>(reader, later.getTxn(), EdgeType.PR_RW, key),
+                beforeWrite(source, later));
     }
 
     private KeyFrontier<KeyType, ValueType> createKeyFrontier(
@@ -1178,17 +1535,7 @@ class SERSolverAR<KeyType, ValueType> {
      * direct no-good clause for every mismatching visible snapshot.
      */
     private boolean refinePredicateConstraints() {
-        var refined = refineGeneralPredicateConstraints();
-        if (rowLocalPredicateChecks.isEmpty()) {
-            return refined;
-        }
-
-        var positions = candidateArPositions();
-        var rowLocalRefined = refineRowLocalPredicateConstraints(positions);
-        if (rowLocalRefined) {
-            encodeDependencyEdges();
-        }
-        return refined || rowLocalRefined;
+        return refineGeneralPredicateConstraints();
     }
 
     private boolean refineGeneralPredicateConstraints() {
@@ -1209,15 +1556,32 @@ class SERSolverAR<KeyType, ValueType> {
                 }
             }
 
-            if (predicateSnapshotMatches(check.predicateRead, snapshot,
-                    check.relationResolver)) {
+            var evaluation = evaluatePredicateSnapshot(
+                    check.predicateRead, snapshot, check.relationResolver);
+            if (predicateEvaluationMatches(check.predicateRead, evaluation)) {
                 continue;
             }
 
+            var witnessKeys = new HashSet<KeyType>();
+            if (check.gmwrMonotone && evaluation != null) {
+                witnessKeys.addAll(evaluation.inputs().keySet());
+                witnessKeys.removeAll(check.recordedInputKeys);
+            }
+            boolean useGmwrWitness = !witnessKeys.isEmpty();
             var blockingClause = new ArrayList<Lit>();
             for (int i = 0; i < check.frontiers.size(); i++) {
+                if (useGmwrWitness
+                        && !witnessKeys.contains(check.frontiers.get(i).key)) {
+                    continue;
+                }
                 appendNegatedSelection(check.frontiers.get(i), selected.get(i),
                         blockingClause);
+            }
+            if (useGmwrWitness && collectPredicateMetrics) {
+                var profiler = Profiler.getInstance();
+                profiler.addCount("SER_GMWR_GENERAL_WITNESSES_COUNT", 1L);
+                profiler.addCount("SER_GMWR_GENERAL_WITNESS_KEYS_COUNT",
+                        witnessKeys.size());
             }
             if (blockingClause.isEmpty()) {
                 solver.addClause(Lit.False);
@@ -1229,117 +1593,6 @@ class SERSolverAR<KeyType, ValueType> {
         return refined;
     }
 
-    private boolean refineRowLocalPredicateConstraints(int[] positions) {
-        long started = System.nanoTime();
-        long keyVisits = 0L;
-        long mismatches = 0L;
-        long materialized = 0L;
-        boolean refined = false;
-
-        for (var check : rowLocalPredicateChecks) {
-            for (var entry : check.scopedEntries) {
-                keyVisits++;
-                var recordedSource = check.recordedSource(entry.keyId);
-                if (!rowLocalKeyConstraintViolated(
-                        check, entry, recordedSource, positions)) {
-                    continue;
-                }
-                mismatches++;
-                if (check.materializedKeyIds.get(entry.keyId)) {
-                    throw new IllegalStateException(String.format(
-                            "materialized row-local predicate constraint still violated: txn=%s key=%s",
-                            check.observation.getTxn().getId(), entry.key));
-                }
-                materializeRowLocalKeyConstraint(check, entry, recordedSource);
-                check.materializedKeyIds.set(entry.keyId);
-                materialized++;
-                refined = true;
-            }
-        }
-
-        var profiler = Profiler.getInstance();
-        profiler.addDurationNanos("SER_CALFE_REPLAY", System.nanoTime() - started);
-        if (collectPredicateMetrics) {
-            profiler.addCount("SER_CALFE_REPLAY_ROUNDS_COUNT", 1L);
-            profiler.addCount("SER_CALFE_KEY_VISITS_COUNT", keyVisits);
-            profiler.addCount("SER_CALFE_MISMATCHES_COUNT", mismatches);
-            profiler.addCount("SER_CALFE_MATERIALIZED_KEYS_COUNT", materialized);
-        }
-        return refined;
-    }
-
-    /** Evaluates the unchanged eager reader-key formula in one concrete total AR. */
-    private boolean rowLocalKeyConstraintViolated(
-            RowLocalPredicateCheck<KeyType, ValueType> check,
-            KeyWriteIndex<KeyType, ValueType> entry,
-            KnownGraph.WriteRef<KeyType, ValueType> recordedSource,
-            int[] positions) {
-        var observation = check.observation;
-        var predicateRead = observation.getPredicateReadEvent();
-        var reader = observation.getTxn();
-
-        if (observation.getPredicateReadType(entry.key)
-                == KnownGraph.PredicateReadType.INTERNAL) {
-            var latestSelf = entry.latestSelfBefore(reader, observation.getEventIndex());
-            if (latestSelf == null) {
-                latestSelf = recordedSource;
-            }
-            if (recordedSource != null) {
-                return latestSelf != recordedSource;
-            }
-            return latestSelf != null
-                    && !hasEmptyPredicateContribution(
-                            predicateRead, check.relationResolver, latestSelf);
-        }
-
-        var latestSelf = entry.latestSelfBefore(reader, observation.getEventIndex());
-        if (latestSelf != null) {
-            return recordedSource != null && recordedSource != latestSelf;
-        }
-
-        var candidates = entry.latestExternalWrites(reader);
-        if (recordedSource != null) {
-            if (!containsIdentity(candidates, recordedSource)
-                    || !beforeInCandidate(recordedSource.getTxn(), reader, positions)) {
-                return true;
-            }
-            for (var other : candidates) {
-                if (other == recordedSource
-                        || !writeChangesPredicateResult(
-                                recordedSource, other, predicateRead)) {
-                    continue;
-                }
-                if (beforeInCandidate(recordedSource.getTxn(), other.getTxn(), positions)
-                        && beforeInCandidate(other.getTxn(), reader, positions)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        var latestVisible = latestVisibleWrite(candidates, reader, positions);
-        return latestVisible != null
-                && !hasEmptyPredicateContribution(
-                        predicateRead, check.relationResolver, latestVisible);
-    }
-
-    private KnownGraph.WriteRef<KeyType, ValueType> latestVisibleWrite(
-            List<KnownGraph.WriteRef<KeyType, ValueType>> candidates,
-            Transaction<KeyType, ValueType> reader,
-            int[] positions) {
-        KnownGraph.WriteRef<KeyType, ValueType> latest = null;
-        for (var candidate : candidates) {
-            if (!beforeInCandidate(candidate.getTxn(), reader, positions)) {
-                continue;
-            }
-            if (latest == null
-                    || beforeInCandidate(latest.getTxn(), candidate.getTxn(), positions)) {
-                latest = candidate;
-            }
-        }
-        return latest;
-    }
-
     private static boolean containsIdentity(List<?> candidates, Object expected) {
         for (var candidate : candidates) {
             if (candidate == expected) {
@@ -1347,65 +1600,6 @@ class SERSolverAR<KeyType, ValueType> {
             }
         }
         return false;
-    }
-
-    private boolean beforeInCandidate(
-            Transaction<KeyType, ValueType> from,
-            Transaction<KeyType, ValueType> to,
-            int[] positions) {
-        if (from == to || from.equals(to)) {
-            return false;
-        }
-        if (isBottomTxn(from)) {
-            return !isBottomTxn(to);
-        }
-        if (isBottomTxn(to)) {
-            return false;
-        }
-        return positions[txnIndex.get(from)] < positions[txnIndex.get(to)];
-    }
-
-    /** Builds one deterministic total extension of the current SAT-selected AR. */
-    private int[] candidateArPositions() {
-        var adjacency = new BitSet[txns.size()];
-        var indegree = new int[txns.size()];
-        for (int index = 0; index < adjacency.length; index++) {
-            adjacency[index] = new BitSet(adjacency.length);
-        }
-        for (var entry : arCache.entrySet()) {
-            if (!modelValue(entry.getValue())) {
-                continue;
-            }
-            int from = txnIndex.get(entry.getKey().getLeft());
-            int to = txnIndex.get(entry.getKey().getRight());
-            if (!adjacency[from].get(to)) {
-                adjacency[from].set(to);
-                indegree[to]++;
-            }
-        }
-
-        var ready = new PriorityQueue<Integer>();
-        for (int index = 0; index < indegree.length; index++) {
-            if (indegree[index] == 0) {
-                ready.add(index);
-            }
-        }
-        var positions = new int[txns.size()];
-        int position = 0;
-        while (!ready.isEmpty()) {
-            int from = ready.remove();
-            positions[from] = position++;
-            for (int to = adjacency[from].nextSetBit(0); to >= 0;
-                    to = adjacency[from].nextSetBit(to + 1)) {
-                if (--indegree[to] == 0) {
-                    ready.add(to);
-                }
-            }
-        }
-        if (position != txns.size()) {
-            throw new IllegalStateException("SAT model contains a cyclic AR");
-        }
-        return positions;
     }
 
     private FrontierCandidate<KeyType, ValueType> selectedCandidate(
@@ -1474,10 +1668,8 @@ class SERSolverAR<KeyType, ValueType> {
                     source.write, other, predicateRead)) {
                 continue;
             }
-            addDependencyEdge(
-                    new SEREdge<>(frontier.reader, other.getTxn(),
-                            EdgeType.PR_RW, frontier.key),
-                    beforeWrite(source.write, other));
+            addPredicateRwDependency(
+                    frontier.reader, frontier.key, source.write, other);
         }
     }
 
@@ -1666,14 +1858,28 @@ class SERSolverAR<KeyType, ValueType> {
             Event<KeyType, ValueType> predicateRead,
             Map<KeyType, ValueType> snapshot,
             RelationResolver<KeyType> relationResolver) {
-        final QueryEvaluation<KeyType, ValueType> evaluation;
+        return predicateEvaluationMatches(predicateRead,
+                evaluatePredicateSnapshot(predicateRead, snapshot, relationResolver));
+    }
+
+    private QueryEvaluation<KeyType, ValueType> evaluatePredicateSnapshot(
+            Event<KeyType, ValueType> predicateRead,
+            Map<KeyType, ValueType> snapshot,
+            RelationResolver<KeyType> relationResolver) {
         try {
-            evaluation = predicateRead.getPredicate().evaluate(
+            return predicateRead.getPredicate().evaluate(
                     new MapVisibleState<>(snapshot, relationResolver));
         } catch (QueryException exception) {
+            return null;
+        }
+    }
+
+    private boolean predicateEvaluationMatches(
+            Event<KeyType, ValueType> predicateRead,
+            QueryEvaluation<KeyType, ValueType> evaluation) {
+        if (evaluation == null) {
             return false;
         }
-
         var recorded = predicateRead.getRecordedPredicateResult();
         if (recorded != null) {
             return evaluation.canonicalEquals(recorded);
@@ -1761,40 +1967,23 @@ class SERSolverAR<KeyType, ValueType> {
         private final List<KeyFrontier<KeyType, ValueType>> frontiers;
         private final Map<KeyType, ValueType> fixedSnapshot;
         private final RelationResolver<KeyType> relationResolver;
+        private final boolean gmwrMonotone;
+        private final Set<KeyType> recordedInputKeys;
 
         private PredicateCheck(Event<KeyType, ValueType> predicateRead,
                 List<KeyFrontier<KeyType, ValueType>> frontiers,
                 Map<KeyType, ValueType> fixedSnapshot,
-                RelationResolver<KeyType> relationResolver) {
+                RelationResolver<KeyType> relationResolver,
+                boolean gmwrMonotone,
+                Collection<KeyType> recordedInputKeys) {
             this.predicateRead = predicateRead;
             this.frontiers = List.copyOf(frontiers);
             this.fixedSnapshot = Collections.unmodifiableMap(
                     new LinkedHashMap<>(fixedSnapshot));
             this.relationResolver = relationResolver;
-        }
-    }
-
-    private static final class RowLocalPredicateCheck<KeyType, ValueType> {
-        private final KnownGraph.PredicateObservation<KeyType, ValueType> observation;
-        private final List<KeyWriteIndex<KeyType, ValueType>> scopedEntries;
-        private final RelationResolver<KeyType> relationResolver;
-        private final Object[] recordedSourcesByKeyId;
-        private final BitSet materializedKeyIds = new BitSet();
-
-        private RowLocalPredicateCheck(
-                KnownGraph.PredicateObservation<KeyType, ValueType> observation,
-                List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
-                RelationResolver<KeyType> relationResolver,
-                Object[] recordedSourcesByKeyId) {
-            this.observation = observation;
-            this.scopedEntries = scopedEntries;
-            this.relationResolver = relationResolver;
-            this.recordedSourcesByKeyId = recordedSourcesByKeyId;
-        }
-
-        @SuppressWarnings("unchecked")
-        private KnownGraph.WriteRef<KeyType, ValueType> recordedSource(int keyId) {
-            return (KnownGraph.WriteRef<KeyType, ValueType>) recordedSourcesByKeyId[keyId];
+            this.gmwrMonotone = gmwrMonotone;
+            this.recordedInputKeys = Collections.unmodifiableSet(
+                    new HashSet<>(recordedInputKeys));
         }
     }
 
@@ -1883,25 +2072,6 @@ class SERSolverAR<KeyType, ValueType> {
         return Logic.or(left, right);
     }
 
-    private static Lit or(Collection<Lit> terms) {
-        var filtered = new ArrayList<Lit>(terms.size());
-        for (var term : terms) {
-            if (term == Lit.True) {
-                return Lit.True;
-            }
-            if (term != Lit.False) {
-                filtered.add(term);
-            }
-        }
-        if (filtered.isEmpty()) {
-            return Lit.False;
-        }
-        if (filtered.size() == 1) {
-            return filtered.get(0);
-        }
-        return Logic.or(filtered);
-    }
-
     /** Groups writes by key and gives each key a deterministic iteration order. */
     private Map<KeyType, List<KnownGraph.WriteRef<KeyType, ValueType>>> buildWritesByKey(KnownGraph<KeyType, ValueType> graph) {
         var result = new HashMap<KeyType, List<KnownGraph.WriteRef<KeyType, ValueType>>>();
@@ -1963,6 +2133,21 @@ class SERSolverAR<KeyType, ValueType> {
         return directArEdge(from, to);
     }
 
+    private boolean knownBefore(
+            Transaction<KeyType, ValueType> from,
+            Transaction<KeyType, ValueType> to) {
+        if (from.equals(to)) {
+            return false;
+        }
+        if (isBottomTxn(from)) {
+            return !isBottomTxn(to);
+        }
+        if (isBottomTxn(to) || knownOrder.cyclic) {
+            return false;
+        }
+        return knownOrder.reachable[txnIndex.get(from)].get(txnIndex.get(to));
+    }
+
     private void ensureComparable(Transaction<KeyType, ValueType> left,
                                   Transaction<KeyType, ValueType> right) {
         int leftIndex = txnIndex.get(left);
@@ -1983,6 +2168,113 @@ class SERSolverAR<KeyType, ValueType> {
     private Lit directArEdge(Transaction<KeyType, ValueType> from, Transaction<KeyType, ValueType> to) {
         return arCache.computeIfAbsent(Pair.of(from, to), ignored ->
                 arGraph.addEdge(arNodes[txnIndex.get(from)], arNodes[txnIndex.get(to)]));
+    }
+
+    private static final class GmwrBundle<KeyType, ValueType> {
+        private final Transaction<KeyType, ValueType> reader;
+        private final Transaction<KeyType, ValueType> badWriter;
+        private final Map<Set<Transaction<KeyType, ValueType>>, GmwrItem<KeyType, ValueType>> items =
+                new LinkedHashMap<>();
+        private boolean resolved;
+
+        private GmwrBundle(
+                Transaction<KeyType, ValueType> reader,
+                Transaction<KeyType, ValueType> badWriter) {
+            this.reader = reader;
+            this.badWriter = badWriter;
+        }
+    }
+
+    private static final class GmwrItem<KeyType, ValueType> {
+        private final List<Transaction<KeyType, ValueType>> repairs;
+        private long multiplicity;
+
+        private GmwrItem(
+                List<Transaction<KeyType, ValueType>> repairs,
+                long multiplicity) {
+            this.repairs = repairs;
+            this.multiplicity = multiplicity;
+        }
+    }
+
+    /** Incremental transitive closure used only by GMWR preprocessing. */
+    private final class GmwrOrderClosure {
+        private final BitSet[] reachable;
+
+        private GmwrOrderClosure() {
+            reachable = new BitSet[txns.size()];
+            for (int index = 0; index < reachable.length; index++) {
+                reachable[index] = (BitSet) knownOrder.reachable[index].clone();
+            }
+        }
+
+        private boolean before(
+                Transaction<KeyType, ValueType> from,
+                Transaction<KeyType, ValueType> to) {
+            if (from == to || from.equals(to)) {
+                return false;
+            }
+            if (isBottomTxn(from)) {
+                return !isBottomTxn(to);
+            }
+            if (isBottomTxn(to)) {
+                return false;
+            }
+            return reachable[txnIndex.get(from)].get(txnIndex.get(to));
+        }
+
+        /**
+         * Whether B<A<R can be added to the current partial order without a
+         * cycle.  Because the graph is a strict partial order, absence of the
+         * three reverse paths is sufficient for a total extension containing
+         * the requested placement.
+         */
+        private boolean canPlaceBetween(
+                Transaction<KeyType, ValueType> bad,
+                Transaction<KeyType, ValueType> repair,
+                Transaction<KeyType, ValueType> reader) {
+            if (bad.equals(repair) || repair.equals(reader) || bad.equals(reader)) {
+                return false;
+            }
+            if (before(reader, bad)) {
+                return false;
+            }
+            if (before(repair, bad)) {
+                return false;
+            }
+            if (before(reader, repair)) {
+                return false;
+            }
+            return true;
+        }
+
+        /** Adds one edge and closes transitively. Returns false on a cycle. */
+        private boolean add(
+                Transaction<KeyType, ValueType> from,
+                Transaction<KeyType, ValueType> to) {
+            if (from.equals(to) || before(to, from)) {
+                return false;
+            }
+            if (before(from, to) || isBottomTxn(from)) {
+                return true;
+            }
+            if (isBottomTxn(to)) {
+                return false;
+            }
+
+            int fromIndex = txnIndex.get(from);
+            int toIndex = txnIndex.get(to);
+            var successors = (BitSet) reachable[toIndex].clone();
+            successors.set(toIndex);
+
+            // Every predecessor of 'from' gains every successor of 'to'.
+            for (int pred = 0; pred < reachable.length; pred++) {
+                if (pred == fromIndex || reachable[pred].get(fromIndex)) {
+                    reachable[pred].or(successors);
+                }
+            }
+            return true;
+        }
     }
 
     /**
