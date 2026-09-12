@@ -40,7 +40,7 @@ class PruningReachabilityTest {
                 writer, target, 0);
         var constraints = new ArrayList<>(List.of(constraint));
 
-        boolean hasLoop = Pruning.pruneConstraints(graph, constraints, history);
+        boolean hasLoop = pruning(history).pruneConstraints(graph, constraints);
 
         assertFalse(hasLoop);
         assertTrue(constraints.isEmpty());
@@ -81,11 +81,15 @@ class PruningReachabilityTest {
                 b, c, 0);
         var constraints = new ArrayList<>(List.of(constraint));
 
-        boolean hasLoop = Pruning.pruneConstraints(graph, constraints, history);
+        boolean hasLoop = pruning(history).pruneConstraints(graph, constraints);
 
         assertFalse(hasLoop);
         assertTrue(constraints.isEmpty());
         assertTrue(graph.getKnownGraphA().hasEdgeConnecting(c, b));
         assertFalse(graph.getKnownGraphA().hasEdgeConnecting(b, c));
+    }
+
+    private static Pruning<String, Integer> pruning(History<String, Integer> history) {
+        return new Pruning<>(new PrecedenceOracle<>(history.getTransactions()));
     }
 }

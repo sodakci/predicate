@@ -54,7 +54,7 @@ public class SERDetectabilityTest {
     }
 
     private static boolean verifySer(History<String, Integer> h) {
-        return new SERVerifier<>(() -> h).audit();
+        return new SERVerifier<>(() -> h).audit() == SERVerifier.AuditResult.ACCEPT;
     }
 
     private static boolean hasKnownAEdgeOfType(KnownGraph<String, Integer> graph,

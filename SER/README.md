@@ -2,11 +2,22 @@
 
 SER 是本仓库中的谓词感知可串行化检测器。它读取 PRHIST 历史，构造事务之间的已知依赖和待定写写顺序，并调用 MonoSAT 判断是否存在一个合法的串行解释。
 
-详细的项目结构、核心算法流程和关键文件说明见：
+当前将带类型的逻辑依赖与 MonoSAT 物理图分层：
 
 ```text
-ser-result-detector/docs/PROJECT_OVERVIEW.md
+D = SO ∪ WR ∪ WW ∪ RW ∪ PR_WR ∪ PR_RW
 ```
+
+`SEREdge` 保留 `WR/WW/RW/PR_WR/PR_RW` 的 type/key/guard 元数据，用于 explanation、debugging 和论文描述；这些逻辑依赖统一投影到唯一的 `serializationGraph`，MonoSAT 只断言该图 `acyclic()`。
+
+```text
+History
+  -> Logical Dependency Layer
+  -> Serialization Constraint Graph
+  -> MonoSAT acyclic
+```
+
+详细的项目结构和求解公式见 [PROJECT_OVERVIEW.md](ser-result-detector/docs/PROJECT_OVERVIEW.md)，重点阅读“求解核心：分阶段 MonoSAT/typeedge 编码”及其内部状态、七阶段编码、依赖物化、EAGER/GMWR、no-good 与冲突缩减小节。
 
 ## 目录说明
 
@@ -18,6 +29,7 @@ SER/
     gradlew
     jdk11-env.sh
     docs/PROJECT_OVERVIEW.md
+    docs/prunning.md
     src/main/java/Main.java
     src/main/java/history/
     src/main/java/history/loaders/PredicateHistoryLoader.java
@@ -25,6 +37,8 @@ SER/
     src/main/java/verifier/
     tools/audit-prhist.sh
     tools/run_catalog_experiment.py
+    tools/run_gmwr_comparison.py
+    tools/run_pruning_constraint_comparison.py
     tools/validate_prhist_suite.py
     monosat/
 ```
@@ -81,6 +95,8 @@ cd SER/ser-result-detector
 ./gradlew test
 ```
 
+当前 SER 全量回归为 183 项测试、0 failure、0 error、2 skipped。
+
 ## 输入格式
 
 当前公开入口是 `PRHIST`。输入可以是：
@@ -113,6 +129,8 @@ hist-00000/
 ```json
 {"session":0,"session_seq":1,"txn":1001,"status":"commit","ops":[{"type":"r","key":"kv:0","value":0},{"type":"w","key":"kv:0","value":10}]}
 ```
+
+`session_seq`是必填整数。Java loader先检查同一`session`内的`session_seq`唯一性，再按`session_seq`建立session order；因此JSONL事务行可以任意排列。缺失、非整数、超出`long`范围或同session重复的`session_seq`都会使history无效。
 
 支持的操作类型：
 
@@ -202,8 +220,8 @@ java -Djava.library.path=build/monosat -Xmx8g \
 ## 常用 audit 参数
 
 ```text
---no-pruning
-    关闭 pruning。用于对比 pruning 前后的求解行为。
+--ww-pruning NONE|REACHABILITY
+    控制 WW 可达性剪枝，默认 REACHABILITY。NONE 仅用于实验对照。
 
 --no-coalescing
     关闭相同事务对上的 WW choice 合并。用于调试约束规模。
@@ -217,16 +235,65 @@ java -Djava.library.path=build/monosat -Xmx8g \
 --solver monosat
     指定 SAT 后端。当前只支持 monosat。
 
+--solver-timeout-seconds N
+    SAT 求解超时秒数，默认 600；0 表示禁用。计时从 `solve()` 调用开始，不包含编码。超时输出 `[[[[ TIMEOUT ]]]]`，退出码 124，并分别打印 encode/solve 时间。全检查器超时由 runner 进程超时负责，从 `audit()` 开始计算墙钟。
+
 --solver-stats
-    打印 SAT 后端标识和额外统计信息。
+    打印 SAT 后端标识、PR GMWR 模式和详细编码统计。
+
+--predicate-mode EAGER|GMWR
+    选择谓词编码：EAGER 或 GMWR。不再被 `--ser-propagation-mode` 覆盖。
+
+--ser-propagation-mode ww-only|ww-gmwr-oneway|ww-gmwr
+    WW 反馈。默认：EAGER 用 ww-only，GMWR 用 ww-gmwr。
+
+--gmwr-prepropagation / --no-gmwr-prepropagation
+    是否在 SAT 前做 GMWR 化简。只控制优化，不控制语义义务构造。默认随 `--predicate-mode`。
+
+--predicate-witness-coalescing / --no-predicate-witness-coalescing
+    是否合并相同端点的谓词逻辑 witness。默认开启。
+
+--graph-edge-interning / --no-graph-edge-interning
+    是否对相同 `(from,to)` 只创建一条 MonoSAT theory-edge，并保留全部逻辑来源。默认开启（论文主 baseline E2）。关闭时对应 E1 物理图消融。
 ```
+
+### 使用 GMWR
+
+`EAGER` 是默认模式，不启用谓词 dependency 剪枝。审计单个历史时，需要显式指定 `GMWR`：
+
+```bash
+cd SER/ser-result-detector
+java -Djava.library.path=build/monosat -Xmx8g \
+  -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
+  audit --predicate-mode=GMWR --solver-stats \
+  /absolute/path/to/hist-00000
+```
+
+完整 G2 配置示例：
+
+```bash
+java -Djava.library.path=build/monosat -Xmx8g \
+  -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
+  audit --predicate-mode=GMWR \
+  --ser-propagation-mode=ww-gmwr \
+  --gmwr-prepropagation \
+  --predicate-witness-coalescing \
+  --graph-edge-interning --solver-stats \
+  /absolute/path/to/hist-00000
+```
+
+输出末尾以 `[[[[ ACCEPT ]]]]`、`[[[[ REJECT ]]]]` 或 `[[[[ TIMEOUT ]]]]` 表示 verdict。超时退出码为 124。启用 `--solver-stats` 后，还会输出 `SER_GMWR_BUILD`、`SER_GMWR_RESOLUTION`、bundle、残余 clause、强制顺序以及 `SER_GMWR_SUBSUMED_ITEM_CLAUSES_COUNT` 等 GMWR 指标；不需要统计时可以省略该参数。
 
 当前实现会自动使用以下等价编码，无需额外命令行开关：
 
 - 对已知 SO/WR/依赖序计算传递闭包，并只向 MonoSAT 写入传递约简边；已由已知序确定的 AR 方向直接作为常量。
 - AR 比较只为公式实际涉及的事务对创建；无环偏序最终可扩展为串行全序。
 - 单表 `Scan/Filter`、`distinct=false` 且投影为逐行表达式的查询走 row-local 逐 key 编码。
-- `JOIN`、`DISTINCT` 和其他非逐行查询继续走完整快照求值，并按 SAT 模型惰性加入不匹配快照的阻断子句。
+- `GMWR` 对 row-local 查询使用 `(reader,bad-writer)` bundle；同一 bundle 内只保留最小 repair set 反链，较弱的超集子句不再物化。
+- GMWR 思想同样用于非 DISTINCT 的单调多表 `INNER JOIN`，但不会把跨表结果错误拆成逐 key bundle：它保留完整 QueryPlan 求值，复用 source 剪枝和 predicate witness coalescing / graph-edge interning，并用额外结果实际依赖的多表输入形成 multi-key witness no-good。
+- `DISTINCT`、非单调查询及 GMWR 未覆盖的部分继续走完整快照求值，并按 SAT 模型惰性加入不匹配快照的阻断子句。
+
+这里的紧凑编码有明确范围：row-local bundle 只压缩无 recorded source 的 EXTERNAL bad-writer obligations；predicate physical-edge 只合并相同 `(from,to,type)` 的多 key witnesses；多表 witness 只用于非 DISTINCT 单调 QueryPlan 的记录外结果。它们都不删除 recorded source、不省略完整多表求值，也不改变最终 typed dependency 并集判环。完整处理矩阵见 [PROJECT_OVERVIEW.md 的紧凑编码章节](ser-result-detector/docs/PROJECT_OVERVIEW.md#711-紧凑编码的设计范围与处理范围)。
 
 示例：
 
@@ -238,6 +305,16 @@ java -Djava.library.path=build/monosat -Xmx12g \
 ```
 
 ## 查看统计和 dump
+
+只统计剪枝前后的 WW/RW 约束而不构造 `SERSolverAR`、不运行 MonoSAT：
+
+```bash
+java -Djava.library.path=build/monosat -Xmx8g \
+  -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
+  constraint-stat --ww-pruning=REACHABILITY /absolute/path/to/hist-00000
+```
+
+输出包含 `constraints_before/after`、`implications_before/after`、内部一致性和剪枝一致性。默认使用 REACHABILITY，可用 `--ww-pruning=NONE` 做实验对照。
 
 统计历史规模：
 
@@ -299,6 +376,30 @@ Summary: ACCEPT=... REJECT=... RUNTIME_ERROR=...
 ```
 
 如果出现 `RUNTIME_ERROR`，优先看脚本打印的 per-history log 路径。
+
+## 运行剪枝与 GMWR 对比
+
+比较同一批历史在关闭和开启 WW reachability 时的约束规模：
+
+```bash
+cd SER/ser-result-detector
+./gradlew installDist
+python3 tools/run_pruning_constraint_comparison.py \
+  ../../predicateHistories/kvpredicate/test
+```
+
+脚本依次调用 `constraint-stat` 的 `NONE`、`REACHABILITY`，默认写入 `results/pruning_constraint_comparison.csv`，不会执行最终 SAT 求解。
+
+比较 EAGER 与 GMWR：
+
+```bash
+python3 tools/run_gmwr_comparison.py \
+  ../../predicateHistories/kvpredicate/test \
+  --ww-pruning REACHABILITY \
+  --repeats 5
+```
+
+该脚本为每次运行保存 stdout/stderr，逐项更新 raw CSV，并可从已有有效 verdict 断点续跑；summary CSV 汇总 verdict、耗时、MonoSAT、内存和 GMWR bundle 指标。
 
 ## 运行 catalog 实验
 

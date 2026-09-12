@@ -11,6 +11,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static history.Event.EventType.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -29,7 +30,7 @@ public class TestVerifier {
 		));
 
 		var s = new SERVerifier<>(h);
-		assertFalse(s.audit());
+		assertEquals(SERVerifier.AuditResult.REJECT, s.audit());
 	}
 
 	@Test
@@ -43,7 +44,7 @@ public class TestVerifier {
 				2, List.of(Triple.of(READ, "x", 1),
 					Triple.of(READ, "x", 2)))));
 
-		assertFalse(new SERVerifier<>(h).audit());
+		assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(h).audit());
 	}
 
 	@Test
@@ -59,7 +60,7 @@ public class TestVerifier {
 				2, List.of(Triple.of(READ, "x", 1),
 					Triple.of(READ, "y", 1)))));
 
-		assertFalse(new SERVerifier<>(h).audit());
+		assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(h).audit());
 	}
 
 	@Test
@@ -76,7 +77,7 @@ public class TestVerifier {
 				2, List.of(Triple.of(READ, "x", 1),
 					Triple.of(READ, "y", 2)))));
 
-		assertFalse(new SERVerifier<>(h).audit());
+		assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(h).audit());
 	}
 
 	@Test
@@ -95,7 +96,7 @@ public class TestVerifier {
 				3, List.of(Triple.of(READ, "x", 1),
 					Triple.of(READ, "y", 1)))));
 
-		assertFalse(new SERVerifier<>(h).audit());
+		assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(h).audit());
 	}
 
 	@Test
@@ -118,7 +119,7 @@ public class TestVerifier {
 				4, List.of(Triple.of(READ, "y", 2),
 					Triple.of(READ, "x", 1)))));
 
-		assertFalse(new SERVerifier<>(h).audit());
+		assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(h).audit());
 	}
 
 	@Test
@@ -134,7 +135,7 @@ public class TestVerifier {
 				2, List.of(Triple.of(READ, "x", 1),
 					Triple.of(WRITE, "x", 3)))));
 
-		assertFalse(new SERVerifier<>(h).audit());
+		assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(h).audit());
 	}
 
 	@Test
@@ -153,7 +154,7 @@ public class TestVerifier {
 					Triple.of(READ, "y", 1),
 					Triple.of(WRITE, "y", 2)))));
 
-		assertFalse(new SERVerifier<>(h).audit());
+		assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(h).audit());
 	}
 
     @Test
@@ -173,7 +174,7 @@ public class TestVerifier {
                                Triple.of(WRITE, "x", 1),
                                Triple.of(WRITE, "z", 2))));
 
-        assertFalse(new SERVerifier<>(h).audit());
+        assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(h).audit());
     }
 
     @Test
@@ -204,7 +205,7 @@ public class TestVerifier {
             )
         );
 
-        assertFalse(new SERVerifier<>(h).audit());
+        assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(h).audit());
     }
 
     @Test
@@ -219,7 +220,7 @@ public class TestVerifier {
             ))
         );
 
-        assertFalse(new SERVerifier<>(loader).audit());
+        assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(loader).audit());
     }
 
     @Test
@@ -235,7 +236,7 @@ public class TestVerifier {
             ))
         );
 
-        assertFalse(new SERVerifier<>(loader).audit());
+        assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(loader).audit());
     }
 
     @Test
@@ -251,7 +252,7 @@ public class TestVerifier {
             ))
         );
 
-        assertFalse(new SERVerifier<>(loader).audit());
+        assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(loader).audit());
     }
 
     @Test
@@ -265,7 +266,7 @@ public class TestVerifier {
             ))
         );
 
-        assertFalse(new SERVerifier<>(loader).audit());
+        assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(loader).audit());
     }
 
     @Test
@@ -298,7 +299,7 @@ public class TestVerifier {
             )
         );
 
-        assertFalse(new SERVerifier<>(loader).audit());
+        assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(loader).audit());
     }
 
     @Test
@@ -320,6 +321,6 @@ public class TestVerifier {
             )
         );
 
-        assertFalse(new SERVerifier<>(loader).audit());
+        assertEquals(SERVerifier.AuditResult.REJECT, new SERVerifier<>(loader).audit());
     }
 }

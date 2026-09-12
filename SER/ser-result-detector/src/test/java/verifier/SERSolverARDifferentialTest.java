@@ -1,11 +1,22 @@
 package verifier;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import graph.KnownGraph;
 import history.Event;
 import history.History;
 import history.Transaction;
 import history.loaders.PredicateHistoryLoader;
+import history.query.MapVisibleState;
+import history.query.QueryEvaluation;
+import history.query.QueryPlan;
+import history.query.QueryValue;
+import history.query.RecordedQueryResult;
+import history.query.RelationResolver;
+import history.query.StructuredQueryParser;
+import history.query.ValueAdapter;
+import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestFactory;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
@@ -38,8 +49,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *  - small histories are correctness oracle cases;
  *  - large/dense histories are stress/performance cases, not correctness oracle cases.
  *
- * This test intentionally uses exhaustive AR enumeration for tiny histories and then compares
- * histories covered by the currently implemented external-predicate path:
+ * This test intentionally uses exhaustive AR enumeration for tiny histories and then compares:
  *  - direct SERSolverAR encoding;
  *  - SERVerifier with pruning on/off;
  *  - SERVerifier with coalescing on/off;
@@ -56,6 +66,22 @@ class SERSolverARDifferentialTest {
     private static final int MAX_ORACLE_CLIENT_TXNS = 8;
     private static final int TXNS = 4;
     private static final List<String> KEYS = List.of("k0", "k1", "k2");
+    private static final ObjectMapper QUERY_MAPPER = new ObjectMapper();
+    private static final ValueAdapter<Integer> INTEGER_VALUES = QueryValue::integer;
+    private static final RelationResolver<String> RELATIONS =
+            RelationResolver.canonicalStringKeys();
+    private static final StructuredQueryParser<String, Integer> QUERY_PARSER =
+            new StructuredQueryParser<>(INTEGER_VALUES, RELATIONS);
+    private static final List<MatrixMode> MATRIX_MODES = List.of(
+            new MatrixMode("EAGER", SERVerifier.PredicateSolvingMode.EAGER,
+                    SERVerifier.PruningMode.REACHABILITY,
+                    SERVerifier.SerPropagationMode.WW_ONLY),
+            new MatrixMode("GMWR", SERVerifier.PredicateSolvingMode.GMWR,
+                    SERVerifier.PruningMode.REACHABILITY,
+                    SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY),
+            new MatrixMode("GMWR+WWBridge", SERVerifier.PredicateSolvingMode.GMWR,
+                    SERVerifier.PruningMode.REACHABILITY,
+                    SERVerifier.SerPropagationMode.WW_GMWR));
 
     @TempDir
     Path tempDir;
@@ -68,7 +94,14 @@ class SERSolverARDifferentialTest {
                 currentVersionSatisfiedButPredicateOmits(),
                 predicateContainsNewVersionOldBottomDoesNotConflict(),
                 widePredicateMissingOneKey(),
-                selfWriteVisibleInPredicate()
+                selfWriteVisibleInPredicate(),
+                emptyPredicateResultAfterVisibleMatch(),
+                multiKeyPredicateOmitsMatchingKey(),
+                internalWriteThenQuery(),
+                repeatedWriteSameTxn(),
+                newKeyInsertedAfterQuery(),
+                multipleRepairableWriters(),
+                predicateMatchUnchangedButValueChanged()
         );
 
         for (int i = 0; i < cases.size(); i++) {
@@ -77,10 +110,8 @@ class SERSolverARDifferentialTest {
             assertEquals(testCase.expected, oracle,
                     () -> "test case expectation is wrong: " + testCase.name + "\n" + describe(testCase.history));
 
-            if (usesOnlyExternalPredicateKeys(testCase.history)) {
-                assertDirectSolverMatchesOracle(testCase.history, oracle, "hand:" + testCase.name);
-                assertVerifierMatchesOracle(testCase.history, oracle, -10_000 - i, "hand:" + testCase.name);
-            }
+            assertDirectSolverMatchesOracle(testCase.history, oracle, "hand:" + testCase.name);
+            assertVerifierMatchesOracle(testCase.history, oracle, -10_000 - i, "hand:" + testCase.name);
         }
     }
 
@@ -95,55 +126,341 @@ class SERSolverARDifferentialTest {
     @Test
     void randomSmallHistoriesMatchExhaustiveArOracle() {
         int comparedPredicateCases = 0;
+        int comparedInternalPredicateCases = 0;
         for (int seed = 0; seed < IN_MEMORY_CASES; seed++) {
             int caseSeed = seed;
             var history = randomHistory(seed);
             boolean expected = exhaustiveOracle(history);
-            if (!usesOnlyExternalPredicateKeys(history)) {
-                continue;
-            }
 
             assertDirectSolverMatchesOracle(history, expected, "random:" + caseSeed);
             assertVerifierMatchesOracle(history, expected, caseSeed, "random:" + caseSeed);
             if (hasPredicateKeys(history)) {
                 comparedPredicateCases++;
             }
+            if (hasPredicateReadType(history, KnownGraph.PredicateReadType.INTERNAL)) {
+                comparedInternalPredicateCases++;
+            }
         }
-        assertTrue(comparedPredicateCases > 0, "external-predicate differential cases must not be empty");
+        assertTrue(comparedPredicateCases > 0, "predicate differential cases must not be empty");
+        assertTrue(comparedInternalPredicateCases > 0,
+                "random differential cases must include INTERNAL predicate keys");
     }
 
     @Test
     void randomPrhistJsonHistoriesMatchExhaustiveArOracle() throws Exception {
         int comparedPredicateCases = 0;
+        int comparedInternalPredicateCases = 0;
         for (int seed = 0; seed < PRHIST_CASES; seed++) {
             int caseSeed = seed;
             var historyDir = writeRandomPrhist(seed);
             var history = new PredicateHistoryLoader(historyDir).loadHistory();
             boolean expected = exhaustiveOracle(history);
-            if (!usesOnlyExternalPredicateKeys(history)) {
-                continue;
-            }
 
             assertDirectSolverMatchesOracle(history, expected, "prhist:" + caseSeed);
             assertVerifierMatchesOracle(history, expected, caseSeed, "prhist:" + caseSeed);
             if (hasPredicateKeys(history)) {
                 comparedPredicateCases++;
             }
+            if (hasPredicateReadType(history, KnownGraph.PredicateReadType.INTERNAL)) {
+                comparedInternalPredicateCases++;
+            }
         }
-        assertTrue(comparedPredicateCases > 0, "external PRHIST differential cases must not be empty");
+        assertTrue(comparedPredicateCases > 0, "PRHIST predicate differential cases must not be empty");
+        assertTrue(comparedInternalPredicateCases > 0,
+                "PRHIST differential cases must include INTERNAL predicate keys");
     }
 
-    private static boolean usesOnlyExternalPredicateKeys(History<String, ?> history) {
-        var graph = new KnownGraph<>(history);
-        var types = graph.getPredicateObservations().stream()
+    @TestFactory
+    List<DynamicTest> predicateWriterModeMatrixMatchesExhaustiveOracle() {
+        var cases = new ArrayList<PredicateMatrixCase>();
+        for (var predicateType : MatrixPredicateType.values()) {
+            for (var writerPattern : MatrixWriterPattern.values()) {
+                var matrixCase = predicateMatrixCase(predicateType, writerPattern);
+                assertMatrixShape(matrixCase);
+                cases.add(matrixCase);
+            }
+        }
+
+        var tests = new ArrayList<DynamicTest>();
+        for (var matrixCase : cases) {
+            boolean expected = exhaustiveOracle(matrixCase.history);
+            for (var mode : MATRIX_MODES) {
+                for (boolean coalescing : List.of(true, false)) {
+                    String name = String.format("predicate=%s writer=%s mode=%s coalesce=%s",
+                            matrixCase.predicateType, matrixCase.writerPattern,
+                            mode.name, coalescing);
+                    tests.add(DynamicTest.dynamicTest(name, () ->
+                            assertMatrixVerifierMatchesOracle(
+                                    matrixCase, mode, coalescing, expected)));
+                }
+            }
+        }
+        assertEquals(MatrixPredicateType.values().length
+                        * MatrixWriterPattern.values().length
+                        * MATRIX_MODES.size() * 2,
+                tests.size(), "the differential matrix must be a complete Cartesian product");
+        return tests;
+    }
+
+    private static boolean hasPredicateReadType(
+            History<String, ?> history, KnownGraph.PredicateReadType expected) {
+        return new KnownGraph<>(history).getPredicateObservations().stream()
                 .flatMap(observation -> observation.getPredicateReadTypes().values().stream())
-                .collect(Collectors.toList());
-        return types.stream().allMatch(type -> type == KnownGraph.PredicateReadType.EXTERNAL);
+                .anyMatch(expected::equals);
     }
 
     private static boolean hasPredicateKeys(History<String, ?> history) {
         return new KnownGraph<>(history).getPredicateObservations().stream()
                 .anyMatch(observation -> !observation.getPredicateReadTypes().isEmpty());
+    }
+
+    private static void assertMatrixVerifierMatchesOracle(
+            PredicateMatrixCase matrixCase,
+            MatrixMode mode,
+            boolean coalescing,
+            boolean expected) {
+        try {
+            Pruning.setEnablePruning(true);
+            SERVerifier.setCoalesceConstraints(coalescing);
+            SERVerifier.setDotOutput(false);
+            SERVerifier.setCompareDerivedPredicateEdges(false);
+
+            var settings = SERVerifier.SolverSettings.forModes(
+                    mode.predicateMode, mode.pruningMode, mode.propagationMode);
+            settings.gmwrPrepropagation = mode.predicateMode
+                    == SERVerifier.PredicateSolvingMode.GMWR;
+            settings.predicateWitnessCoalescing = true;
+            settings.graphEdgeInterning = true;
+            var actual = new SERVerifier<String, Integer>(
+                    () -> matrixCase.history, settings, false).audit();
+
+            assertEquals(expected ? SERVerifier.AuditResult.ACCEPT
+                            : SERVerifier.AuditResult.REJECT,
+                    actual,
+                    () -> String.format(
+                            "predicate=%s writer=%s mode=%s coalescing=%s%n%s",
+                            matrixCase.predicateType, matrixCase.writerPattern,
+                            mode.name, coalescing, describe(matrixCase.history)));
+        } finally {
+            Pruning.setEnablePruning(true);
+            SERVerifier.setCoalesceConstraints(true);
+            SERVerifier.setDotOutput(false);
+            SERVerifier.setCompareDerivedPredicateEdges(false);
+        }
+    }
+
+    private static void assertMatrixShape(PredicateMatrixCase matrixCase) {
+        assertTrue(Utils.verifyInternalConsistency(matrixCase.history),
+                () -> "matrix history must be internally consistent: " + matrixCase.name());
+        var graph = new KnownGraph<>(matrixCase.history);
+        assertEquals(1, graph.getPredicateObservations().size(),
+                () -> "matrix case must have exactly one predicate read: " + matrixCase.name());
+        var observation = graph.getPredicateObservations().get(0);
+        var readTypes = new HashSet<>(observation.getPredicateReadTypes().values());
+
+        switch (matrixCase.predicateType) {
+        case EXTERNAL:
+            assertEquals(Set.of(KnownGraph.PredicateReadType.EXTERNAL), readTypes,
+                    () -> "EXTERNAL classification missing: " + matrixCase.name());
+            break;
+        case INTERNAL:
+            assertEquals(Set.of(KnownGraph.PredicateReadType.INTERNAL), readTypes,
+                    () -> "INTERNAL classification missing: " + matrixCase.name());
+            break;
+        case MIXED:
+            assertEquals(Set.of(KnownGraph.PredicateReadType.EXTERNAL,
+                            KnownGraph.PredicateReadType.INTERNAL),
+                    readTypes, () -> "mixed classification missing: " + matrixCase.name());
+            break;
+        case ABSENT_RESULT:
+            assertTrue(observation.getPredicateReadEvent().getPredResults().isEmpty(),
+                    () -> "absent-result case returned inputs: " + matrixCase.name());
+            break;
+        case JOIN_PREDICATE:
+            assertTrue(observation.getPredicateReadEvent().getPredicate() instanceof QueryPlan,
+                    () -> "join case must use QueryPlan: " + matrixCase.name());
+            assertFalse(((QueryPlan<?, ?>) observation.getPredicateReadEvent().getPredicate()).isRowLocal(),
+                    () -> "join case must exercise whole-snapshot evaluation: " + matrixCase.name());
+            break;
+        default:
+            throw new AssertionError(matrixCase.predicateType);
+        }
+
+        assertWriterPatternShape(matrixCase);
+    }
+
+    private static void assertWriterPatternShape(PredicateMatrixCase matrixCase) {
+        var clientTxns = matrixCase.history.getTransactions().stream()
+                .filter(txn -> !isBottomTxn(txn))
+                .collect(Collectors.toList());
+        var reader = matrixCase.reader;
+        switch (matrixCase.writerPattern) {
+        case SINGLE_WRITER:
+            assertTrue(clientTxns.stream()
+                    .filter(txn -> txn != reader)
+                    .filter(txn -> writesKey(txn, matrixCase.patternKey))
+                    .count() == 1,
+                    () -> "single-writer witness missing: " + matrixCase.name());
+            break;
+        case MULTIPLE_WRITER:
+            assertTrue(clientTxns.stream()
+                    .filter(txn -> txn != reader)
+                    .filter(txn -> writesKey(txn, matrixCase.patternKey))
+                    .count() >= 2,
+                    () -> "multiple-writer witness missing: " + matrixCase.name());
+            break;
+        case SELF_WRITE:
+            assertTrue(writesKey(reader, matrixCase.patternKey),
+                    () -> "self-write witness missing: " + matrixCase.name());
+            break;
+        case WRITE_AFTER_READ:
+            assertTrue(clientTxns.stream().anyMatch(txn ->
+                            hasReadBeforeWrite(txn, matrixCase.patternKey)),
+                    () -> "write-after-read witness missing: " + matrixCase.name());
+            break;
+        case WRITE_CHAIN:
+            assertTrue(clientTxns.stream()
+                    .filter(txn -> txn != reader)
+                    .filter(txn -> writesKey(txn, matrixCase.patternKey))
+                    .count() >= 2
+                            && clientTxns.stream().anyMatch(txn ->
+                                    hasReadBeforeWrite(txn, matrixCase.patternKey)),
+                    () -> "write-chain witness missing: " + matrixCase.name());
+            break;
+        default:
+            throw new AssertionError(matrixCase.writerPattern);
+        }
+    }
+
+    private static boolean writesKey(Transaction<String, Integer> txn, String key) {
+        return txn.getEvents().stream()
+                .anyMatch(event -> event.getType() == WRITE
+                        && key.equals(event.getKey()));
+    }
+
+    private static boolean hasReadBeforeWrite(
+            Transaction<String, Integer> txn, String key) {
+        boolean sawRead = false;
+        for (var event : txn.getEvents()) {
+            if (!key.equals(event.getKey())) {
+                continue;
+            }
+            if (event.getType() == READ) {
+                sawRead = true;
+            } else if (event.getType() == WRITE && sawRead) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static PredicateMatrixCase predicateMatrixCase(
+            MatrixPredicateType predicateType,
+            MatrixWriterPattern writerPattern) {
+        return predicateType == MatrixPredicateType.JOIN_PREDICATE
+                ? joinMatrixCase(writerPattern)
+                : rowLocalMatrixCase(predicateType, writerPattern);
+    }
+
+    private static PredicateMatrixCase rowLocalMatrixCase(
+            MatrixPredicateType predicateType,
+            MatrixWriterPattern writerPattern) {
+        var builder = new MatrixHistoryBuilder();
+        var initialX = builder.initial("kv:x", 0);
+        builder.initial("kv:y", -1);
+        Version externalSource = writerPattern == MatrixWriterPattern.SELF_WRITE
+                ? initialX
+                : builder.applyExternalPattern(writerPattern, "kv:x", initialX);
+        var reader = builder.txn(90L);
+        String patternKey = "kv:x";
+
+        switch (predicateType) {
+        case EXTERNAL:
+            reader.pr(keysAtLeast(Set.of("kv:x"),
+                            writerPattern == MatrixWriterPattern.SELF_WRITE ? 0 : 1),
+                    externalSource);
+            if (writerPattern == MatrixWriterPattern.SELF_WRITE) {
+                reader.w("kv:x", 30);
+            }
+            break;
+        case INTERNAL:
+            var internal = reader.w("kv:x", 70);
+            reader.pr(keysAtLeast(Set.of("kv:x"), 1), internal);
+            break;
+        case MIXED:
+            var self = reader.w("kv:y", 70);
+            patternKey = writerPattern == MatrixWriterPattern.SELF_WRITE
+                    ? "kv:y" : "kv:x";
+            if (writerPattern == MatrixWriterPattern.SELF_WRITE) {
+                reader.pr(keysAtLeast(Set.of("kv:x", "kv:y"), 1), self);
+            } else {
+                reader.pr(keysAtLeast(Set.of("kv:x", "kv:y"), 1),
+                        externalSource, self);
+            }
+            break;
+        case ABSENT_RESULT:
+            if (writerPattern == MatrixWriterPattern.SELF_WRITE) {
+                reader.w("kv:x", -10);
+            } else {
+                reader.r(externalSource);
+            }
+            reader.pr(keysAtLeast(Set.of("kv:x"), 1));
+            break;
+        default:
+            throw new AssertionError(predicateType);
+        }
+
+        return new PredicateMatrixCase(predicateType, writerPattern,
+                patternKey, reader.txn, builder.finish());
+    }
+
+    private static PredicateMatrixCase joinMatrixCase(
+            MatrixWriterPattern writerPattern) {
+        var builder = new MatrixHistoryBuilder();
+        var initialPurchase = builder.initial("purchases:p0", 0);
+        for (int value : List.of(0, 10, 20, 30, 40, 50)) {
+            builder.initial("inventory:i" + value, value);
+        }
+        if (writerPattern != MatrixWriterPattern.SELF_WRITE) {
+            builder.applyExternalPattern(
+                    writerPattern, "purchases:p0", initialPurchase);
+        }
+        var reader = builder.txn(90L);
+        if (writerPattern == MatrixWriterPattern.SELF_WRITE) {
+            reader.w("purchases:p0", 30);
+        }
+        reader.join(joinPlan());
+
+        return new PredicateMatrixCase(MatrixPredicateType.JOIN_PREDICATE,
+                writerPattern, "purchases:p0", reader.txn, builder.finish());
+    }
+
+    private static PredicateFixtures.RowPredicate<String, Integer> keysAtLeast(
+            Set<String> keys, int threshold) {
+        return new PredicateFixtures.RowPredicate<>() {
+            @Override
+            public boolean test(String key, Integer value) {
+                return keys.contains(key) && value >= threshold;
+            }
+
+            @Override
+            public boolean covers(String key) {
+                return keys.contains(key);
+            }
+        };
+    }
+
+    private static QueryPlan<String, Integer> joinPlan() {
+        try {
+            return QUERY_PARSER.parse(QUERY_MAPPER.readTree("{"
+                    + "\"from\":{\"relation\":\"purchases\",\"alias\":\"p\"},"
+                    + "\"joins\":[{\"relation\":\"inventory\",\"alias\":\"i\","
+                    + "\"type\":\"INNER\",\"on\":[\"p.value = i.value\"]}],"
+                    + "\"select\":{\"columns\":[\"p.k AS purchase_key\","
+                    + "\"i.k AS inventory_key\"],\"distinct\":false}}"));
+        } catch (Exception exception) {
+            throw new AssertionError("invalid join matrix query", exception);
+        }
     }
 
     private static History<String, Integer> randomHistory(int seed) {
@@ -252,17 +569,63 @@ class SERSolverARDifferentialTest {
             History<String, ValueType> history,
             boolean expected,
             String label) {
-        for (boolean coalescing : List.of(true, false)) {
-            assertEquals(expected, solveSer(history, coalescing),
-                    () -> "direct SERSolverAR mismatch for " + label
-                            + " coalescing=" + coalescing + "\n" + describe(history));
+        var configs = List.of(
+                namedSettings("E1", SERVerifier.PredicateSolvingMode.EAGER,
+                        SERVerifier.SerPropagationMode.WW_ONLY, false, false),
+                namedSettings("E2", SERVerifier.PredicateSolvingMode.EAGER,
+                        SERVerifier.SerPropagationMode.WW_ONLY, false, true),
+                namedSettings("G1", SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY, true, true),
+                namedSettings("G2", SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.SerPropagationMode.WW_GMWR, true, true),
+                namedSettings("G1-nopreprop", SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY, false, true),
+                namedSettings("G2-nopreprop", SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.SerPropagationMode.WW_GMWR, false, true),
+                namedSettings("E1-coalesce-intern", SERVerifier.PredicateSolvingMode.EAGER,
+                        SERVerifier.SerPropagationMode.WW_ONLY, false, true));
+        for (var config : configs) {
+            for (boolean coalescing : List.of(true, false)) {
+                assertEquals(expected, solveSer(history, coalescing, config.settings),
+                        () -> "direct SERSolverAR mismatch for " + label
+                                + " config=" + config.name
+                                + " coalescing=" + coalescing + "\n" + describe(history));
+            }
         }
     }
 
-    private static <ValueType> boolean solveSer(History<String, ValueType> history, boolean coalesce) {
+    private static NamedSettings namedSettings(
+            String name,
+            SERVerifier.PredicateSolvingMode predicate,
+            SERVerifier.SerPropagationMode propagation,
+            boolean gmwrPrepropagation,
+            boolean graphEdgeInterning) {
+        var settings = SERVerifier.SolverSettings.forModes(
+                predicate, SERVerifier.PruningMode.REACHABILITY, propagation);
+        settings.gmwrPrepropagation = gmwrPrepropagation;
+        settings.graphEdgeInterning = graphEdgeInterning;
+        return new NamedSettings(name, settings);
+    }
+
+    private static final class NamedSettings {
+        private final String name;
+        private final SERVerifier.SolverSettings settings;
+
+        private NamedSettings(String name, SERVerifier.SolverSettings settings) {
+            this.name = name;
+            this.settings = settings;
+        }
+    }
+
+    private static <ValueType> boolean solveSer(
+            History<String, ValueType> history,
+            boolean coalesce,
+            SERVerifier.SolverSettings settings) {
         SERVerifier.setCoalesceConstraints(coalesce);
         var graph = new KnownGraph<>(history);
-        return new SERSolverAR<>(history, graph, SERVerifier.generateConstraintsSER(history, graph)).solve();
+        return new SERSolverAR<>(history, graph,
+                SERVerifier.generateConstraintsSER(history, graph),
+                true, false, settings).solve() == SolveStatus.SAT;
     }
 
     private static <ValueType> void assertVerifierMatchesOracle(
@@ -271,18 +634,25 @@ class SERSolverARDifferentialTest {
             int seed,
             String label) {
         try {
-            for (boolean pruning : List.of(true, false)) {
-                for (boolean coalescing : List.of(true, false)) {
-                    Pruning.setEnablePruning(pruning);
-                    SERVerifier.setCoalesceConstraints(coalescing);
-                    SERVerifier.setDotOutput(false);
-                    SERVerifier.setCompareDerivedPredicateEdges(false);
+            Pruning.setEnablePruning(true);
+            for (var predicateMode : SERVerifier.PredicateSolvingMode.values()) {
+                for (var pruningMode : List.of(
+                        SERVerifier.PruningMode.NONE,
+                        SERVerifier.PruningMode.REACHABILITY)) {
+                    for (boolean coalescing : List.of(true, false)) {
+                        SERVerifier.setCoalesceConstraints(coalescing);
+                        SERVerifier.setDotOutput(false);
+                        SERVerifier.setCompareDerivedPredicateEdges(false);
 
-                    boolean actual = new SERVerifier<String, ValueType>(() -> history).audit();
-                    assertEquals(expected, actual,
-                            () -> String.format(
-                                    "label=%s seed=%d solver=monosat pruning=%s coalescing=%s%n%s",
-                                    label, seed, pruning, coalescing, describe(history)));
+                        boolean actual = new SERVerifier<String, ValueType>(
+                                () -> history, false, predicateMode, pruningMode).audit()
+                                == SERVerifier.AuditResult.ACCEPT;
+                        assertEquals(expected, actual,
+                                () -> String.format(
+                                        "label=%s seed=%d solver=monosat predicateMode=%s pruningMode=%s coalescing=%s%n%s",
+                                        label, seed, predicateMode, pruningMode,
+                                        coalescing, describe(history)));
+                    }
                 }
             }
         } finally {
@@ -395,10 +765,6 @@ class SERSolverARDifferentialTest {
             List<WriteInstance<ValueType>> writes,
             Map<Long, WriteInstance<ValueType>> writesById,
             Map<Pair<String, ValueType>, List<WriteInstance<ValueType>>> writesByKeyValue) {
-        var keys = writes.stream()
-                .map(write -> write.event.getKey())
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-
         for (var txn : history.getTransactions()) {
             var events = txn.getEvents();
             for (int i = 0; i < events.size(); i++) {
@@ -407,13 +773,32 @@ class SERSolverARDifferentialTest {
                     continue;
                 }
 
-                var expected = new LinkedHashMap<String, Object>();
-                for (var key : keys) {
+                var visibleState = new LinkedHashMap<String, ValueType>();
+                for (var key : writes.stream()
+                        .map(write -> write.event.getKey())
+                        .collect(Collectors.toCollection(LinkedHashSet::new))) {
                     var latest = latestVisibleWrite(key, txn, i, order, writes);
-                    if (latest != null && PredicateFixtures.matches(
-                            event.getPredicate(), key, latest.event.getValue())) {
-                        expected.put(key, writeToken(latest));
+                    if (latest != null && latest.event.getValue() != null) {
+                        visibleState.put(key, latest.event.getValue());
                     }
+                }
+
+                QueryEvaluation<String, ValueType> evaluation;
+                try {
+                    evaluation = event.getPredicate().evaluate(new MapVisibleState<>(
+                            visibleState, oracleRelationResolver(event)));
+                } catch (RuntimeException exception) {
+                    return false;
+                }
+
+                var expected = new LinkedHashMap<String, Object>();
+                for (var input : evaluation.inputs().entrySet()) {
+                    var latest = latestVisibleWrite(input.getKey(), txn, i, order, writes);
+                    if (latest == null
+                            || !Objects.equals(input.getValue(), latest.event.getValue())) {
+                        return false;
+                    }
+                    expected.put(input.getKey(), writeToken(latest));
                 }
 
                 var actual = new LinkedHashMap<String, Object>();
@@ -438,17 +823,25 @@ class SERSolverARDifferentialTest {
                     return false;
                 }
 
-                for (var result : event.getPredResults()) {
-                    var actualSource = latestVisibleWrite(result.getKey(), txn, i, order, writes);
-                    var expectedSource = resolveSource(result.getKey(), result.getValue(),
-                            result.getSourceWriteId(), writesById, writesByKeyValue);
-                    if (!sameWrite(expectedSource, actualSource)) {
-                        return false;
-                    }
+                var recorded = event.getRecordedPredicateResult();
+                if (recorded != null && !evaluation.canonicalEquals(recorded)) {
+                    return false;
                 }
             }
         }
         return true;
+    }
+
+    private static <ValueType> RelationResolver<String> oracleRelationResolver(
+            Event<String, ValueType> predicateRead) {
+        var relations = predicateRead.getPredicate().scope().relations();
+        return key -> {
+            int separator = key.indexOf(':');
+            if (separator > 0) {
+                return key.substring(0, separator);
+            }
+            return relations.size() == 1 ? relations.iterator().next() : null;
+        };
     }
 
     private static <ValueType> void assertOracleScope(History<String, ValueType> history) {
@@ -527,9 +920,8 @@ class SERSolverARDifferentialTest {
                 throw new AssertionError("oracle predicate result source points to a different row: "
                         + result);
             }
-            if (!PredicateFixtures.matches(
-                    event.getPredicate(), result.getKey(), result.getValue())) {
-                throw new AssertionError("oracle predicate result row does not satisfy predicate: " + result);
+            if (!event.getPredicate().scope().covers(result.getKey())) {
+                throw new AssertionError("oracle predicate result is outside query scope: " + result);
             }
         }
     }
@@ -703,6 +1095,58 @@ class SERSolverARDifferentialTest {
         var txn = b.txn(1);
         var w = txn.w("k0", 20);
         txn.prGe(10, w);
+        return b.build();
+    }
+
+    private static TestCase emptyPredicateResultAfterVisibleMatch() {
+        var b = new CaseBuilder("empty-predicate-after-visible-match", false);
+        b.initial("k0", 0).initial("k1", 0).initial("k2", 0);
+        b.txn(1).w("k0", 20);
+        b.txn(2).prGe(10);
+        return b.build();
+    }
+
+    private static TestCase multiKeyPredicateOmitsMatchingKey() {
+        return widePredicateMissingOneKey();
+    }
+
+    private static TestCase internalWriteThenQuery() {
+        return selfWriteVisibleInPredicate();
+    }
+
+    private static TestCase repeatedWriteSameTxn() {
+        var b = new CaseBuilder("repeated-write-same-txn", true);
+        b.initial("k0", 0).initial("k1", 0).initial("k2", 0);
+        var txn = b.txn(1);
+        txn.w("k0", 5);
+        var latest = txn.w("k0", 20);
+        txn.prGe(10, latest);
+        return b.build();
+    }
+
+    private static TestCase newKeyInsertedAfterQuery() {
+        var b = new CaseBuilder("new-key-inserted-after-query", true);
+        b.initial("k0", 0).initial("k1", 0).initial("k2", 0);
+        var txn = b.txn(1);
+        txn.prGe(10);
+        txn.w("k0", 20);
+        return b.build();
+    }
+
+    private static TestCase multipleRepairableWriters() {
+        var b = new CaseBuilder("multiple-repairable-writers", true);
+        b.initial("k0", 0).initial("k1", 0).initial("k2", 0);
+        b.txn(1).w("k0", 20);
+        b.txn(2).w("k0", 5);
+        b.txn(3).prGe(10);
+        return b.build();
+    }
+
+    private static TestCase predicateMatchUnchangedButValueChanged() {
+        var b = new CaseBuilder("predicate-match-unchanged-value-changed", false);
+        b.initial("k0", 20).initial("k1", 0).initial("k2", 0);
+        b.txn(1).w("k0", 30);
+        b.txn(2).prGe(10);
         return b.build();
     }
 
@@ -918,6 +1362,181 @@ class SERSolverARDifferentialTest {
         T tmp = values.get(left);
         values.set(left, values.get(right));
         values.set(right, tmp);
+    }
+
+    private enum MatrixPredicateType {
+        EXTERNAL,
+        INTERNAL,
+        MIXED,
+        ABSENT_RESULT,
+        JOIN_PREDICATE
+    }
+
+    private enum MatrixWriterPattern {
+        SINGLE_WRITER,
+        MULTIPLE_WRITER,
+        SELF_WRITE,
+        WRITE_AFTER_READ,
+        WRITE_CHAIN
+    }
+
+    private static final class MatrixMode {
+        private final String name;
+        private final SERVerifier.PredicateSolvingMode predicateMode;
+        private final SERVerifier.PruningMode pruningMode;
+        private final SERVerifier.SerPropagationMode propagationMode;
+
+        private MatrixMode(
+                String name,
+                SERVerifier.PredicateSolvingMode predicateMode,
+                SERVerifier.PruningMode pruningMode,
+                SERVerifier.SerPropagationMode propagationMode) {
+            this.name = name;
+            this.predicateMode = predicateMode;
+            this.pruningMode = pruningMode;
+            this.propagationMode = propagationMode;
+        }
+    }
+
+    private static final class PredicateMatrixCase {
+        private final MatrixPredicateType predicateType;
+        private final MatrixWriterPattern writerPattern;
+        private final String patternKey;
+        private final Transaction<String, Integer> reader;
+        private final History<String, Integer> history;
+
+        private PredicateMatrixCase(
+                MatrixPredicateType predicateType,
+                MatrixWriterPattern writerPattern,
+                String patternKey,
+                Transaction<String, Integer> reader,
+                History<String, Integer> history) {
+            this.predicateType = predicateType;
+            this.writerPattern = writerPattern;
+            this.patternKey = patternKey;
+            this.reader = reader;
+            this.history = history;
+        }
+
+        private String name() {
+            return predicateType + "/" + writerPattern;
+        }
+    }
+
+    private static final class MatrixHistoryBuilder {
+        private final History<String, Integer> history = new History<>();
+        private final Transaction<String, Integer> initTxn;
+        private final Map<Long, Transaction<String, Integer>> txns = new LinkedHashMap<>();
+        private final Map<String, Version> latest = new LinkedHashMap<>();
+        private long nextWriteId = 1L;
+
+        private MatrixHistoryBuilder() {
+            var initSession = history.addSession(INIT_SESSION_ID);
+            initTxn = history.addTransaction(initSession, INIT_TXN_ID);
+        }
+
+        private Version initial(String key, int value) {
+            var version = write(initTxn, key, value);
+            return version;
+        }
+
+        private MatrixTxnBuilder txn(long id) {
+            var txn = txns.computeIfAbsent(id, ignored ->
+                    history.addTransaction(history.addSession(1_000L + id), id));
+            return new MatrixTxnBuilder(this, txn);
+        }
+
+        private Version applyExternalPattern(
+                MatrixWriterPattern pattern, String key, Version initial) {
+            switch (pattern) {
+            case SINGLE_WRITER:
+                return txn(1L).w(key, 10);
+            case MULTIPLE_WRITER:
+                txn(1L).w(key, 10);
+                return txn(2L).w(key, 20);
+            case WRITE_AFTER_READ:
+                return txn(1L).r(initial).w(key, 40);
+            case WRITE_CHAIN:
+                var first = txn(1L).w(key, 10);
+                return txn(2L).r(first).w(key, 50);
+            case SELF_WRITE:
+            default:
+                throw new IllegalArgumentException("SELF_WRITE is built in the reader transaction");
+            }
+        }
+
+        private Version write(
+                Transaction<String, Integer> txn, String key, int value) {
+            long writeId = nextWriteId++;
+            history.addWriteEvent(txn, key, value, writeId);
+            var version = new Version(key, value, writeId);
+            latest.put(key, version);
+            return version;
+        }
+
+        private History<String, Integer> finish() {
+            initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+            txns.values().forEach(
+                    txn -> txn.setStatus(Transaction.TransactionStatus.COMMIT));
+            return history;
+        }
+    }
+
+    private static final class MatrixTxnBuilder {
+        private final MatrixHistoryBuilder parent;
+        private final Transaction<String, Integer> txn;
+
+        private MatrixTxnBuilder(
+                MatrixHistoryBuilder parent,
+                Transaction<String, Integer> txn) {
+            this.parent = parent;
+            this.txn = txn;
+        }
+
+        private Version w(String key, int value) {
+            return parent.write(txn, key, value);
+        }
+
+        private MatrixTxnBuilder r(Version source) {
+            parent.history.addReadEvent(txn, source.key, source.value,
+                    source.writeId, null, null);
+            return this;
+        }
+
+        private MatrixTxnBuilder pr(
+                PredicateFixtures.RowPredicate<String, Integer> predicate,
+                Version... sources) {
+            var results = new ArrayList<Event.PredResult<String, Integer>>();
+            for (var source : sources) {
+                results.add(new Event.PredResult<>(source.key, source.value,
+                        source.writeId, null, null));
+            }
+            parent.history.addPredicateReadEvent(txn, predicate, results);
+            return this;
+        }
+
+        private MatrixTxnBuilder join(QueryPlan<String, Integer> plan) {
+            var snapshot = parent.latest.values().stream()
+                    .collect(Collectors.toMap(version -> version.key,
+                            version -> version.value,
+                            (left, right) -> right,
+                            LinkedHashMap::new));
+            var evaluation = plan.evaluate(new MapVisibleState<>(snapshot, RELATIONS));
+            var results = new ArrayList<Event.PredResult<String, Integer>>();
+            for (var input : evaluation.inputs().entrySet()) {
+                var source = parent.latest.get(input.getKey());
+                if (source == null || !Objects.equals(source.value, input.getValue())) {
+                    throw new AssertionError("join input has no exact source: " + input);
+                }
+                results.add(new Event.PredResult<>(source.key, source.value,
+                        source.writeId, null, null));
+            }
+            RecordedQueryResult<String, Integer> recorded =
+                    RecordedQueryResult.general(
+                            evaluation.inputs(), evaluation.values(), INTEGER_VALUES);
+            parent.history.addPredicateReadEvent(txn, plan, results, recorded);
+            return this;
+        }
     }
 
     private static final class TestCase {

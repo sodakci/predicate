@@ -87,6 +87,17 @@ class BlackBoxSERAuditTest {
         var result = runAuditCommand("audit", "-t", "PRHIST", historyDir.toString());
 
         assertEquals(-1, result.exitCode);
+        assertTrue(result.stderr.contains("Mode: SER, solving serialization constraint graph"),
+                () -> "expected serialization graph mode description, stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains("Predicate source constraints: 9")
+                        || result.stderr.contains("[SER] Cycle witness: 3 edges"),
+                () -> "expected predicate source constraints or an early PR_RW cycle witness, stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains("[SER] Conflict clause:"),
+                () -> "expected direct MonoSAT assumption conflict, stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains("[PREDICATE_OBLIGATION]"),
+                () -> "expected predicate assumption reason, stderr was:\n" + result.stderr);
+        assertFalse(result.stderr.contains("Conditional AR implications:"),
+                () -> "legacy AR implication count should not be printed, stderr was:\n" + result.stderr);
         assertTrue(result.stdout.contains("Cycle witness:"),
                 () -> "expected cycle witness, stdout was:\n" + result.stdout);
         assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_x"),
@@ -95,6 +106,26 @@ class BlackBoxSERAuditTest {
                 () -> "expected predicate RW edge for y, stdout was:\n" + result.stdout);
         assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_z"),
                 () -> "expected predicate RW edge for z, stdout was:\n" + result.stdout);
+    }
+
+    @Test
+    void auditCli_enablesPredicateDependencyPruningOnlyWhenRequested() throws Exception {
+        var historyDir = writePrhist("predicate-pruning-mode", "[]", List.of(
+                "{\"session\":0,\"txn\":0,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
+                        + "{\"type\":\"w\",\"key\":\"inventory_onhand_x\",\"value\":400000001,\"semantic\":40,\"write_id\":1},"
+                        + "{\"type\":\"w\",\"key\":\"inventory_onhand_y\",\"value\":400000002,\"semantic\":40,\"write_id\":2}]}",
+                "{\"session\":1,\"txn\":1,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
+                        + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_\",\"comparator\":\"ge\",\"threshold\":100},\"results\":[]}]}"));
+
+        var disabled = runAuditCommand("audit", "-t", "PRHIST", "--solver-stats",
+                "--no-predicate-witness-coalescing", historyDir.toString());
+        var enabled = runAuditCommand("audit", "-t", "PRHIST", "--solver-stats",
+                "--predicate-mode=GMWR", historyDir.toString());
+
+        assertEquals(disabled.exitCode, enabled.exitCode);
+        assertTrue(disabled.stderr.contains("predicate-mode=eager"));
+        assertFalse(disabled.stderr.contains("Predicate dependency prune:"));
+        assertTrue(enabled.stderr.contains("predicate-mode=gmwr"));
     }
 
     @Test
@@ -126,7 +157,7 @@ class BlackBoxSERAuditTest {
         assertEquals(0, result.exitCode);
         assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"));
         assertTrue(result.stderr.contains("backend=monosat"), () -> "stderr was:\n" + result.stderr);
-        assertTrue(result.stderr.contains("predicate-solving-mode=eager"),
+        assertTrue(result.stderr.contains("predicate-mode=eager"),
                 () -> "stderr was:\n" + result.stderr);
     }
 
@@ -145,7 +176,7 @@ class BlackBoxSERAuditTest {
     }
 
     @Test
-    void auditCliComparesPruningModes() throws Exception {
+    void auditCliSupportsNoneAndReachabilityWwPruning() throws Exception {
         var historyDir = writeTextHistoryAsPrhist("prun-pruning-history", List.of(
                 "w(1,1,1,1)",
                 "w(1,2,2,2)",
@@ -153,24 +184,37 @@ class BlackBoxSERAuditTest {
                 "r(1,1,3,3)",
                 "r(2,2,3,3)"));
 
-        var reachability = runAuditCommand("audit", "--pruning-mode=REACHABILITY",
+        var reachability = runAuditCommand("audit", "--ww-pruning=REACHABILITY",
                 historyDir.toString());
-        var snapshot = runAuditCommand("audit", "--pruning-mode=SNAPSHOT",
-                historyDir.toString());
-        var prun = runAuditCommand("audit", "--pruning-mode=PRUN",
+        var none = runAuditCommand("audit", "--ww-pruning=NONE",
                 historyDir.toString());
 
-        assertEquals(reachability.exitCode, snapshot.exitCode);
-        assertEquals(reachability.exitCode, prun.exitCode);
-        assertEquals(0, snapshot.exitCode);
-        assertEquals(0, prun.exitCode);
-        assertTrue(snapshot.stderr.contains("SNAPSHOT pruning round 1"),
-                () -> "stderr was:\n" + snapshot.stderr);
-        assertTrue(snapshot.stderr.contains(
-                "SNAPSHOT post-check [==============================] 100%"),
-                () -> "stderr was:\n" + snapshot.stderr);
-        assertTrue(prun.stderr.contains("PRUN post-check [==============================] 100%"),
-                () -> "stderr was:\n" + prun.stderr);
+        assertEquals(reachability.exitCode, none.exitCode);
+        assertEquals(0, reachability.exitCode);
+        assertEquals(0, none.exitCode);
+        assertTrue(reachability.stderr.contains("Pruning round 1"),
+                () -> "stderr was:\n" + reachability.stderr);
+        assertFalse(none.stderr.contains("Pruning round"),
+                () -> "stderr was:\n" + none.stderr);
+    }
+
+    @Test
+    void auditCli_skipsPruningWhenThereAreNoWwConstraints() throws Exception {
+        var historyDir = writeTextHistoryAsPrhist("no-ww-constraints", List.of(
+                "r(1,0,1,1)"));
+
+        for (var mode : List.of("REACHABILITY", "NONE")) {
+            var result = runAuditCommand("audit", "--ww-pruning=" + mode,
+                    historyDir.toString());
+
+            assertEquals(0, result.exitCode);
+            assertTrue(result.stderr.contains("Unresolved WW choices: 0"),
+                    () -> "stderr was:\n" + result.stderr);
+            assertFalse(result.stderr.contains("pruning round"),
+                    () -> "stderr was:\n" + result.stderr);
+            assertFalse(result.stderr.contains("post-check"),
+                    () -> "stderr was:\n" + result.stderr);
+        }
     }
 
     @Test
@@ -184,13 +228,13 @@ class BlackBoxSERAuditTest {
                 "w(2,1,2,2)"));
 
         var monosat = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat", historyDir.toString());
-        var prun = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat",
-                "--pruning-mode=PRUN", historyDir.toString());
+        var withoutWwPruning = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat",
+                "--ww-pruning=NONE", historyDir.toString());
 
         assertEquals(-1, monosat.exitCode);
-        assertEquals(monosat.exitCode, prun.exitCode);
+        assertEquals(monosat.exitCode, withoutWwPruning.exitCode);
         assertTrue(monosat.stderr.contains("[[[[ REJECT ]]]]"));
-        assertTrue(prun.stderr.contains("[[[[ REJECT ]]]]"));
+        assertTrue(withoutWwPruning.stderr.contains("[[[[ REJECT ]]]]"));
     }
 
     @Test
@@ -505,11 +549,17 @@ class BlackBoxSERAuditTest {
 
     private static List<String> compactTransactions(List<String> lines) throws Exception {
         var compactLines = new ArrayList<String>();
+        var lastSessionSeq = new LinkedHashMap<Long, Long>();
         for (var line : lines) {
             var txn = requiredObject(MAPPER.readTree(line), "transaction");
             var compactTxn = MAPPER.createObjectNode();
             copyIfPresent(txn, compactTxn, "session");
-            copyIfPresent(txn, compactTxn, "session_seq");
+            long session = txn.path("session").asLong();
+            long sessionSeq = txn.has("session_seq")
+                    ? txn.path("session_seq").asLong()
+                    : lastSessionSeq.getOrDefault(session, 0L) + 1L;
+            compactTxn.put("session_seq", sessionSeq);
+            lastSessionSeq.merge(session, sessionSeq, Math::max);
             copyIfPresent(txn, compactTxn, "txn");
             copyIfPresent(txn, compactTxn, "kind");
             copyIfPresent(txn, compactTxn, "status");
@@ -659,9 +709,9 @@ class BlackBoxSERAuditTest {
         var solvers = List.of("monosat");
         var optionSets = List.of(
                 List.<String>of(),
-                List.of("--no-pruning"),
+                List.of("--ww-pruning=none"),
                 List.of("--no-coalescing"),
-                List.of("--no-pruning", "--no-coalescing"));
+                List.of("--ww-pruning=none", "--no-coalescing"));
 
         for (var solver : solvers) {
             for (var options : optionSets) {

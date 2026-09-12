@@ -37,7 +37,7 @@ COUNT_RES = {
     "events_count": re.compile(r"Events count:\s*([0-9]+)"),
     "mandatory_known_edges": re.compile(r"Mandatory known precedence edges:\s*([0-9]+)"),
     "unresolved_ww_choices": re.compile(r"Unresolved WW choices:\s*([0-9]+)"),
-    "conditional_ar_implications": re.compile(r"Conditional AR implications:\s*([0-9]+)"),
+    "predicate_constraints": re.compile(r"Predicate source constraints:\s*([0-9]+)"),
 }
 MAX_MEMORY_RE = re.compile(r"Max memory:\s*(.+)")
 
@@ -275,7 +275,7 @@ def write_results(output_root: pathlib.Path, results: List[Dict[str, Any]], conf
     paper_fields = [
         "suite", "case", "expected_verdict", "manifest_expected_verdict", "actual_verdict", "matched_expected",
         "transactions_count", "events_count", "mandatory_known_edges",
-        "unresolved_ww_choices", "conditional_ar_implications",
+        "unresolved_ww_choices", "predicate_constraints",
         "time_entire_experiment_ms", "time_oneshot_cons_ms",
         "time_ser_prune_ms", "time_oneshot_solve_ms",
         "elapsed_wall_ms", "max_memory",

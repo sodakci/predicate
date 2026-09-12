@@ -83,11 +83,6 @@ public class KnownGraph<KeyType, ValueType> {
             this.predicateKeyIds = predicateKeyIds;
             this.coveredKeyIds = (BitSet) coveredKeyIds.clone();
             this.coverageEpoch = coverageEpoch;
-            if (coverageEpoch > 0) {
-                this.defaultPredicateReadType = PredicateReadType.INTERNAL;
-                this.exceptionKeyIds = new BitSet();
-                return;
-            }
             var internalCount = internalKeyIds.cardinality();
             var externalCount = coveredKeyIds.cardinality() - internalCount;
             this.defaultPredicateReadType = internalCount > externalCount
@@ -202,6 +197,12 @@ public class KnownGraph<KeyType, ValueType> {
      * The built graph contains SO and WR edges
      */
     public KnownGraph(History<KeyType, ValueType> history) {
+        var synthesized = history.ensureInitialVersions();
+        if (!synthesized.isEmpty()) {
+            System.err.printf(
+                    "[SER] synthesized ABSENT initial versions for keys: %s%n",
+                    synthesized);
+        }
         history.getTransactions().forEach(txn -> {
             knownGraphA.addNode(txn);
             knownGraphB.addNode(txn);
@@ -266,13 +267,13 @@ public class KnownGraph<KeyType, ValueType> {
         var immutablePredicateKeyIds = Map.copyOf(predicateKeyIds);
 
         // Collect predicate-read observations and classify each covered key.
-        // A key is internal when any earlier predicate read in this transaction
-        // covered it, regardless of predicate identity, or when this transaction
-        // wrote the key before this read.
+        // A key is internal only when this transaction already wrote it before
+        // this read, or when an earlier read of the same predicate identity
+        // covered it. Other keys remain external and are resolved by the solver.
         history.getTransactions().forEach(txn -> {
             var txnEvents = txn.getEvents();
             var writtenKeyIds = new BitSet(predicateKeysById.size());
-            var predicateObservedKeyIds = new BitSet(predicateKeysById.size());
+            var predicateObservedKeyIdsByIdentity = new HashMap<Object, BitSet>();
             int coverageEpoch = 0;
             for (int i = 0; i < txnEvents.size(); i++) {
                 var ev = txnEvents.get(i);
@@ -291,14 +292,18 @@ public class KnownGraph<KeyType, ValueType> {
                 var coveredKeyIds = new BitSet(predicateKeysById.size());
                 var internalKeyIds = new BitSet(predicateKeysById.size());
                 var predicate = ev.getPredicate();
+                var predicateIdentity = predicate == null ? null : predicate.identity();
+                var previousSamePredicateKeyIds =
+                        predicateObservedKeyIdsByIdentity.get(predicateIdentity);
                 for (int keyId = 0; keyId < predicateKeysById.size(); keyId++) {
                     var key = predicateKeysById.get(keyId);
                     if (predicate != null && !predicate.scope().covers(key)) {
                         continue;
                     }
                     coveredKeyIds.set(keyId);
-                    if (coverageEpoch == 0
-                            && (predicateObservedKeyIds.get(keyId) || writtenKeyIds.get(keyId))) {
+                    if (writtenKeyIds.get(keyId)
+                            || previousSamePredicateKeyIds != null
+                                    && previousSamePredicateKeyIds.get(keyId)) {
                         internalKeyIds.set(keyId);
                     }
                 }
@@ -308,10 +313,11 @@ public class KnownGraph<KeyType, ValueType> {
                 if (!predicateKeysById.isEmpty()
                         && coveredKeyIds.cardinality() == predicateKeysById.size()) {
                     coverageEpoch++;
-                    predicateObservedKeyIds.clear();
-                } else if (coverageEpoch == 0) {
-                    predicateObservedKeyIds.or(coveredKeyIds);
                 }
+                predicateObservedKeyIdsByIdentity
+                        .computeIfAbsent(predicateIdentity,
+                                ignored -> new BitSet(predicateKeysById.size()))
+                        .or(coveredKeyIds);
             }
         });
     }

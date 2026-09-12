@@ -56,6 +56,9 @@ public final class PredicateFixtures {
                 VisibleState<KeyType, ValueType> state) {
             var inputs = new LinkedHashMap<KeyType, ValueType>();
             for (var row : state.rows()) {
+                if (row.value() == null) {
+                    continue;
+                }
                 if (covers(row.key()) && test(row.key(), row.value())) {
                     inputs.put(row.key(), row.value());
                 }

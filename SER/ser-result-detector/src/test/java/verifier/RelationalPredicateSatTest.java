@@ -147,7 +147,7 @@ class RelationalPredicateSatTest {
     }
 
     @Test
-    void gmwrBundlesCompetingWriterForRecordedJoinInput() throws Exception {
+    void gmwrUsesTypedFrontierForRecordedJoinInput() throws Exception {
         var writer = transaction(1, 11,
                 "{\"type\":\"w\",\"key\":\"inventory:i0\","
                         + "\"value\":{\"sku\":\"s0\",\"stock\":3}}");
@@ -163,10 +163,10 @@ class RelationalPredicateSatTest {
         profiler.clear();
 
         assertTrue(audit(history, SERVerifier.PredicateSolvingMode.GMWR));
-        assertEquals(1L, profiler.getCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT"));
-        assertEquals(1L, profiler.getCount("SER_GMWR_BUNDLES_COUNT"));
-        assertEquals(1L, profiler.getCount("SER_GMWR_RESOLVED_BUNDLES_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_GMWR_BUNDLES_COUNT"));
         assertEquals(0L, profiler.getCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT"));
+        assertTrue(profiler.getCount("SER_PRED_FRONTIERS_COUNT") > 0);
     }
 
     @Test
@@ -299,7 +299,8 @@ class RelationalPredicateSatTest {
     }
 
     private static String transaction(long session, long transaction, String operations) {
-        return "{\"session\":" + session + ",\"txn\":" + transaction
+        return "{\"session\":" + session + ",\"session_seq\":" + transaction
+                + ",\"txn\":" + transaction
                 + ",\"status\":\"commit\",\"ops\":[" + operations + "]}";
     }
 
@@ -311,11 +312,11 @@ class RelationalPredicateSatTest {
     }
 
     private static boolean audit(Path historyDirectory) {
-        return new SERVerifier<>(new PredicateHistoryLoader(historyDirectory)).audit();
+        return new SERVerifier<>(new PredicateHistoryLoader(historyDirectory)).audit() == SERVerifier.AuditResult.ACCEPT;
     }
 
     private static boolean audit(Path historyDirectory,
             SERVerifier.PredicateSolvingMode mode) {
-        return new SERVerifier<>(new PredicateHistoryLoader(historyDirectory), true, mode).audit();
+        return new SERVerifier<>(new PredicateHistoryLoader(historyDirectory), true, mode).audit() == SERVerifier.AuditResult.ACCEPT;
     }
 }

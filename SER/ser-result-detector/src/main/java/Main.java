@@ -15,8 +15,8 @@ import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
+import picocli.CommandLine.ITypeConverter;
 import util.Profiler;
-import verifier.Pruning;
 import verifier.SERVerifier;
 
 @Command(name = "ser-result-detector", mixinStandardHelpOptions = true, version = "ser-result-detector 0.1.0", subcommands = { Audit.class,
@@ -36,15 +36,26 @@ public class Main implements Callable<Integer> {
     }
 }
 
+enum WwPruningMode {
+    NONE,
+    REACHABILITY;
+
+    SERVerifier.PruningMode asVerifierMode() {
+        return this == NONE
+                ? SERVerifier.PruningMode.NONE
+                : SERVerifier.PruningMode.REACHABILITY;
+    }
+}
+
 @Command(name = "constraint-stat", mixinStandardHelpOptions = true,
         description = "Count SER constraints before and after pruning without solving")
 class ConstraintStat implements Callable<Integer> {
     @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
     private final HistoryType type = HistoryType.PRHIST;
 
-    @Option(names = { "--pruning-mode" }, required = true,
-            description = "WW/RW pruning mode: ${COMPLETION-CANDIDATES}")
-    private SERVerifier.PruningMode pruningMode;
+    @Option(names = { "--ww-pruning" },
+            description = "WW pruning: ${COMPLETION-CANDIDATES} (default: ${DEFAULT-VALUE})")
+    private WwPruningMode wwPruning = WwPruningMode.REACHABILITY;
 
     @Parameters(description = "history path")
     private Path path;
@@ -53,13 +64,13 @@ class ConstraintStat implements Callable<Integer> {
     public Integer call() {
         var loader = Utils.getLoader(type, path);
         var verifier = new SERVerifier<>(loader, false,
-                SERVerifier.PredicateSolvingMode.EAGER, pruningMode);
+                SERVerifier.PredicateSolvingMode.EAGER, wwPruning.asVerifierMode());
         var stats = verifier.analyzeConstraintsOnly();
         System.out.printf(
-                "CONSTRAINT_STATS pruning_mode=%s constraints_before=%d constraints_after=%d "
+                "CONSTRAINT_STATS ww_pruning=%s constraints_before=%d constraints_after=%d "
                         + "implications_before=%d implications_after=%d "
                         + "internally_consistent=%s pruning_inconsistent=%s%n",
-                pruningMode.name(),
+                wwPruning.name(),
                 stats.constraintsBefore,
                 stats.constraintsAfter,
                 stats.implicationsBefore,
@@ -72,16 +83,21 @@ class ConstraintStat implements Callable<Integer> {
 
 @Command(name = "audit", mixinStandardHelpOptions = true, description = "Verify a history")
 class Audit implements Callable<Integer> {
+    static final class SerPropagationModeConverter
+            implements ITypeConverter<SERVerifier.SerPropagationMode> {
+        @Override
+        public SERVerifier.SerPropagationMode convert(String value) {
+            return SERVerifier.SerPropagationMode.valueOf(
+                    value.trim().toUpperCase().replace('-', '_'));
+        }
+    }
+
     @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
     private final HistoryType type = HistoryType.PRHIST;
 
-    @Option(names = { "--no-pruning" }, description = "disable pruning")
-    private final Boolean noPruning = false;
-
-    @Option(names = { "--pruning-mode" },
-            description = "WW/RW pruning mode: ${COMPLETION-CANDIDATES}")
-    private SERVerifier.PruningMode pruningMode =
-            SERVerifier.PruningMode.REACHABILITY;
+    @Option(names = { "--ww-pruning" },
+            description = "WW pruning: ${COMPLETION-CANDIDATES} (default: ${DEFAULT-VALUE})")
+    private WwPruningMode wwPruning = WwPruningMode.REACHABILITY;
 
     @Option(names = { "--no-coalescing" }, description = "disable coalescing")
     private final Boolean noCoalescing = false;
@@ -95,17 +111,38 @@ class Audit implements Callable<Integer> {
     @Option(names = { "--solver" }, description = "SAT solver backend; only monosat is supported")
     private String solverKind = "monosat";
 
-    @Option(names = { "--solver-timeout-seconds" }, description = "SAT solver timeout in seconds; 0 disables backend timeout")
+    @Option(names = { "--solver-timeout-seconds" }, description = "SAT solver timeout in seconds measured from solve(); 0 disables backend timeout")
     private int solverTimeoutSeconds = 600;
 
     @Option(names = { "--solver-stats" },
             description = "print SAT backend and detailed predicate encoding statistics")
     private final Boolean solverStats = false;
 
-    @Option(names = { "--predicate-solving-mode" },
+    @Option(names = { "--predicate-mode" },
             description = "predicate solving mode: ${COMPLETION-CANDIDATES}")
     private SERVerifier.PredicateSolvingMode predicateSolvingMode =
             SERVerifier.PredicateSolvingMode.EAGER;
+
+    @Option(names = { "--ser-propagation-mode" },
+            converter = SerPropagationModeConverter.class,
+            description = "SER propagation mode: ww-only, ww-gmwr-oneway, or ww-gmwr")
+    private SERVerifier.SerPropagationMode serPropagationMode;
+
+    @Option(names = { "--gmwr-prepropagation" }, negatable = true,
+            description = "run GMWR simplification before SAT; default follows --predicate-mode. Does not control obligation construction")
+    private Boolean gmwrPrepropagation;
+
+    @Option(names = { "--predicate-witness-coalescing" }, negatable = true,
+            description = "coalesce same-endpoint predicate witnesses; default on")
+    private Boolean predicateWitnessCoalescing;
+
+    @Option(names = { "--graph-edge-interning" }, negatable = true,
+            description = "intern one MonoSAT theory-edge per (from,to); default on (E2 baseline)")
+    private Boolean graphEdgeInterning;
+
+    @Option(names = { "--verify-incremental-propagation" },
+            description = "compare incremental GMWR-WW notification against a full residual scan")
+    private final Boolean verifyIncrementalPropagation = false;
 
     @Parameters(description = "history path")
     private Path path;
@@ -116,11 +153,27 @@ class Audit implements Callable<Integer> {
     public Integer call() {
         var loader = Utils.getLoader(type, path);
 
-        var selectedPruningMode = noPruning
-                ? SERVerifier.PruningMode.NONE
-                : pruningMode;
-        Pruning.setEnablePruning(selectedPruningMode
-                == SERVerifier.PruningMode.REACHABILITY);
+        var selectedPruningMode = wwPruning.asVerifierMode();
+        var selectedPropagationMode = serPropagationMode != null
+                ? serPropagationMode
+                : predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR
+                        ? SERVerifier.SerPropagationMode.WW_GMWR
+                        : SERVerifier.SerPropagationMode.WW_ONLY;
+        var settings = SERVerifier.SolverSettings.forModes(
+                predicateSolvingMode, selectedPruningMode, selectedPropagationMode);
+        if (gmwrPrepropagation != null) {
+            settings.gmwrPrepropagation = gmwrPrepropagation;
+        }
+        if (predicateWitnessCoalescing != null) {
+            settings.predicateWitnessCoalescing = predicateWitnessCoalescing;
+        }
+        if (graphEdgeInterning != null) {
+            settings.graphEdgeInterning = graphEdgeInterning;
+        }
+        settings.verifyIncrementalPropagation = Boolean.TRUE.equals(
+                verifyIncrementalPropagation);
+        settings.solverTimeoutSeconds = solverTimeoutSeconds;
+        settings.detailedPredicateMetrics = solverStats;
         SERVerifier.setCoalesceConstraints(!noCoalescing);
         SERVerifier.setDotOutput(dotOutput);
         SERVerifier.setCompareDerivedPredicateEdges(compareDerivedPredicateEdges);
@@ -131,10 +184,8 @@ class Audit implements Callable<Integer> {
         }
 
         profiler.startTick("ENTIRE_EXPERIMENT");
-        var pass = true;
-        var verifier = new SERVerifier<>(loader, solverStats,
-                predicateSolvingMode, selectedPruningMode);
-        pass = verifier.audit();
+        var verifier = new SERVerifier<>(loader, settings, solverStats);
+        var result = verifier.audit();
         profiler.endTick("ENTIRE_EXPERIMENT");
 
         for (var p : profiler.getDurations()) {
@@ -145,18 +196,23 @@ class Audit implements Callable<Integer> {
         }
         if (solverStats) {
             System.err.println("[solver-stats] backend=monosat");
-            System.err.printf("[solver-stats] predicate-solving-mode=%s%n",
+            System.err.printf("[solver-stats] predicate-mode=%s%n",
                     predicateSolvingMode.name().toLowerCase());
+            System.err.printf("[solver-stats] ser-propagation-mode=%s%n",
+                    selectedPropagationMode.name().toLowerCase().replace('_', '-'));
+            System.err.printf("[solver-stats] gmwr-prepropagation=%s%n",
+                    settings.gmwrPrepropagation);
+            System.err.printf("[solver-stats] predicate-witness-coalescing=%s%n",
+                    settings.predicateWitnessCoalescing);
+            System.err.printf("[solver-stats] graph-edge-interning=%s%n",
+                    settings.graphEdgeInterning);
+            System.err.printf("[solver-stats] solver-timeout-seconds=%d%n",
+                    settings.solverTimeoutSeconds);
         }
         System.err.printf("Max memory: %s\n", Utils.formatMemory(profiler.getMaxMemory()));
 
-        if (pass) {
-            System.err.println("[[[[ ACCEPT ]]]]");
-            return 0;
-        } else {
-            System.err.println("[[[[ REJECT ]]]]");
-            return -1;
-        }
+        System.err.println(result.marker);
+        return result.exitCode;
     }
 }
 

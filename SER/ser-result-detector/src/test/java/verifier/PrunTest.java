@@ -33,7 +33,7 @@ class PrunTest {
                 SERVerifier.generateConstraintsSER(history, graph));
         assertEquals(1, constraints.size());
 
-        var result = Prun.prune(
+        var result = prun(history).prune(
                 history, graph, constraints);
 
         assertEquals(1, result.crossKeyForcedOrders);
@@ -57,7 +57,7 @@ class PrunTest {
         var graph = new KnownGraph<>(history);
         var constraints = new ArrayList<>(
                 SERVerifier.generateConstraintsSER(history, graph));
-        var result = Prun.pruneSnapshotOnly(history, graph, constraints);
+        var result = prun(history).pruneSnapshotOnly(history, graph, constraints);
 
         assertEquals(1, result.newForcedTransactionOrders);
         assertEquals(1, result.crossKeyForcedOrders);
@@ -84,14 +84,14 @@ class PrunTest {
                 SERVerifier.generateConstraintsSER(history, snapshotGraph));
         assertEquals(1, snapshotConstraints.size());
 
-        Prun.pruneSnapshotOnly(history, snapshotGraph, snapshotConstraints);
+        prun(history).pruneSnapshotOnly(history, snapshotGraph, snapshotConstraints);
 
         assertEquals(1, snapshotConstraints.size());
 
         var combinedGraph = new KnownGraph<>(history);
         var combinedConstraints = new ArrayList<>(
                 SERVerifier.generateConstraintsSER(history, combinedGraph));
-        Prun.prune(history, combinedGraph, combinedConstraints);
+        prun(history).prune(history, combinedGraph, combinedConstraints);
 
         assertTrue(combinedConstraints.isEmpty());
     }
@@ -120,7 +120,7 @@ class PrunTest {
         var graph = new KnownGraph<>(history);
         var constraints = new ArrayList<>(
                 SERVerifier.generateConstraintsSER(history, graph));
-        var result = Prun.prune(history, graph, constraints);
+        var result = prun(history).prune(history, graph, constraints);
 
         assertEquals(2, result.newForcedTransactionOrders);
         assertEquals(2, result.crossKeyForcedOrders);
@@ -146,7 +146,7 @@ class PrunTest {
         var graph = new KnownGraph<>(history);
         var constraints = new ArrayList<>(
                 SERVerifier.generateConstraintsSER(history, graph));
-        var result = Prun.prune(history, graph, constraints);
+        var result = prun(history).prune(history, graph, constraints);
 
         assertEquals(0, result.newForcedTransactionOrders);
         assertEquals(0, result.crossKeyForcedOrders);
@@ -162,6 +162,10 @@ class PrunTest {
             History<String, Integer> history, long id) {
         var session = history.addSession(id);
         return history.addTransaction(session, id);
+    }
+
+    private static Prun<String, Integer> prun(History<String, Integer> history) {
+        return new Prun<>(new PrecedenceOracle<>(history.getTransactions()));
     }
 
     private static void commitAll(History<?, ?> history) {

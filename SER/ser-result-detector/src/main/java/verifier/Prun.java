@@ -22,30 +22,41 @@ import java.util.Objects;
 import java.util.Set;
 
 /** Shared-snapshot fixed-point pruning for SER WW/RW constraints. */
-public final class Prun {
-    private Prun() {
+public final class Prun<KeyType, ValueType> {
+    private final PrecedenceOracle<Transaction<KeyType, ValueType>> precedence;
+
+    Prun(PrecedenceOracle<Transaction<KeyType, ValueType>> precedence) {
+        this.precedence = Objects.requireNonNull(precedence, "precedence");
     }
 
-    static <KeyType, ValueType> Result prune(
+    PrecedenceOracle<Transaction<KeyType, ValueType>> precedenceOracle() {
+        return precedence;
+    }
+
+    Result prune(
             History<KeyType, ValueType> history,
             KnownGraph<KeyType, ValueType> graph,
             Collection<SERConstraint<KeyType, ValueType>> constraints) {
         return prune(history, graph, constraints, true, "PRUN");
     }
 
-    static <KeyType, ValueType> Result pruneSnapshotOnly(
+    Result pruneSnapshotOnly(
             History<KeyType, ValueType> history,
             KnownGraph<KeyType, ValueType> graph,
             Collection<SERConstraint<KeyType, ValueType>> constraints) {
         return prune(history, graph, constraints, false, "SNAPSHOT");
     }
 
-    private static <KeyType, ValueType> Result prune(
+    private Result prune(
             History<KeyType, ValueType> history,
             KnownGraph<KeyType, ValueType> graph,
             Collection<SERConstraint<KeyType, ValueType>> constraints,
             boolean includeReachabilityPruning,
             String modeLabel) {
+        if (constraints.isEmpty()) {
+            return new Result(0, 0, 0, 0, 0, 0, 0, false);
+        }
+
         var txns = new ArrayList<>(history.getTransactions());
         txns.sort(Comparator
                 .comparingLong((Transaction<KeyType, ValueType> txn) -> txn.getSession().getId())
@@ -55,13 +66,15 @@ public final class Prun {
             txnIds.put(txns.get(i), i);
         }
 
-        var direct = emptyRows(txns.size());
-        addGraphEdges(graph.getKnownGraphA().edges(), graph.getKnownGraphA(), txnIds, direct);
-        addGraphEdges(graph.getKnownGraphB().edges(), graph.getKnownGraphB(), txnIds, direct);
-        int initialDependencyEdges = cardinality(direct);
-        var initialReachability = transitiveClosure(direct);
-        int existingGraphDerivedOrders = cardinality(initialReachability)
-                - initialDependencyEdges;
+        var order = precedence;
+        var initialEdges = new HashSet<Long>();
+        boolean inconsistent = addGraphEdges(
+                graph.getKnownGraphA().edges(), txnIds, order, initialEdges);
+        inconsistent |= addGraphEdges(
+                graph.getKnownGraphB().edges(), txnIds, order, initialEdges);
+        int initialDependencyEdges = initialEdges.size();
+        int initialRelationCount = order.relationCount();
+        int existingGraphDerivedOrders = initialRelationCount - initialDependencyEdges;
 
         var writesByKey = buildWritersByKey(graph, txnIds);
         var observations = buildFixedObservations(graph, txnIds);
@@ -72,25 +85,25 @@ public final class Prun {
         int crossSnapshotDerivedOrders = 0;
         int rounds = 0;
         int pruningPasses = 0;
-        boolean inconsistent = false;
-        BitSet[] reachability;
 
-        while (true) {
-            reachability = transitiveClosure(direct);
-            if (hasCycle(reachability)) {
-                inconsistent = true;
-                break;
-            }
+        while (!inconsistent) {
 
             pruningPasses++;
             System.err.printf("%s pruning round %d%n", modeLabel, pruningPasses);
-            if (includeReachabilityPruning && resolveReachableConstraints(
-                    graph, constraints, reachability, txnIds, direct) > 0) {
-                continue;
+            if (includeReachabilityPruning) {
+                int resolved = resolveReachableConstraints(
+                        graph, constraints, txns, txnIds, order);
+                if (resolved < 0) {
+                    inconsistent = true;
+                    break;
+                }
+                if (resolved > 0) {
+                    continue;
+                }
             }
 
             var sharedLowerBounds = buildSharedLowerBounds(
-                    txns.size(), observationsByReader, reachability);
+                    observationsByReader, txns, txnIds, order);
             var additions = new LinkedHashMap<Long, ForcedOrder>();
             var snapshotWriterOrders = new LinkedHashSet<Long>();
             for (var observation : observations) {
@@ -103,20 +116,20 @@ public final class Prun {
                     }
 
                     // The latest-visible disjunction is already settled.
-                    if (reachability[competitor].get(source)
-                            || reachability[reader].get(competitor)) {
+                    if (before(order, txns, competitor, source)
+                            || before(order, txns, reader, competitor)) {
                         continue;
                     }
 
                     boolean inside = sharedLowerBounds.get(reader).get(competitor);
                     if (inside) {
                         boolean crossKey = !isSingleKeyLowerBound(
-                                competitor, source, reachability)
+                                competitor, source, txns, order)
                                 && hasOtherKeyVisibilityWitness(competitor, reader,
-                                        observation.key, observationsByReader, reachability);
+                                        observation.key, observationsByReader, txns, order);
                         putForced(additions, competitor, source, crossKey);
                         snapshotWriterOrders.add(pairId(competitor, source));
-                    } else if (reachability[source].get(competitor)) {
+                    } else if (before(order, txns, source, competitor)) {
                         // C cannot be before the fixed source, so C must be after R.
                         putForced(additions, reader, competitor, false);
                         snapshotWriterOrders.add(pairId(source, competitor));
@@ -126,33 +139,44 @@ public final class Prun {
 
             if (additions.isEmpty()) {
                 if (!includeReachabilityPruning) {
-                    resolveSnapshotConstraints(graph, constraints,
-                            snapshotWriterOrders, txnIds, direct);
+                    inconsistent = resolveSnapshotConstraints(
+                            graph, constraints, snapshotWriterOrders,
+                            txns, txnIds, order) < 0;
                 }
                 break;
             }
             rounds++;
             for (var addition : additions.values()) {
-                if (!direct[addition.from].get(addition.to)) {
-                    direct[addition.from].set(addition.to);
-                    long pair = pairId(addition.from, addition.to);
-                    if (forcedPairs.add(pair) && addition.crossKey) {
-                        crossKeyForcedOrders++;
-                    }
-                    if (rounds > 1) {
-                        crossSnapshotDerivedOrders++;
-                    }
+                var from = txns.get(addition.from);
+                var to = txns.get(addition.to);
+                if (order.wouldCycle(from, to)) {
+                    inconsistent = true;
+                    break;
+                }
+                boolean newOrder = !order.before(from, to);
+                order.add(from, to);
+                if (!newOrder) {
+                    continue;
+                }
+                long pair = pairId(addition.from, addition.to);
+                if (forcedPairs.add(pair) && addition.crossKey) {
+                    crossKeyForcedOrders++;
+                }
+                if (rounds > 1) {
+                    crossSnapshotDerivedOrders++;
                 }
             }
             if (!includeReachabilityPruning) {
-                resolveSnapshotConstraints(graph, constraints,
-                        snapshotWriterOrders, txnIds, direct);
+                if (resolveSnapshotConstraints(graph, constraints,
+                        snapshotWriterOrders, txns, txnIds, order) < 0) {
+                    inconsistent = true;
+                    break;
+                }
             }
         }
 
-        reachability = transitiveClosure(direct);
-        int allOrdersCreatedBeyondInitialTc = countDifference(
-                reachability, initialReachability);
+        int allOrdersCreatedBeyondInitialTc = Math.max(0,
+                order.relationCount() - initialRelationCount);
         int reachabilityDerivedOrders = Math.max(0,
                 allOrdersCreatedBeyondInitialTc - forcedPairs.size());
         return new Result(
@@ -170,8 +194,9 @@ public final class Prun {
             KnownGraph<KeyType, ValueType> graph,
             Collection<SERConstraint<KeyType, ValueType>> constraints,
             Set<Long> snapshotWriterOrders,
+            List<Transaction<KeyType, ValueType>> txns,
             IdentityHashMap<Transaction<KeyType, ValueType>, Integer> txnIds,
-            BitSet[] direct) {
+            PrecedenceOracle<Transaction<KeyType, ValueType>> order) {
         int resolved = 0;
         int checked = 0;
         int total = constraints.size();
@@ -196,7 +221,10 @@ public final class Prun {
                     Integer from = txnIds.get(edge.getFrom());
                     Integer to = txnIds.get(edge.getTo());
                     if (from != null && to != null && !from.equals(to)) {
-                        direct[from].set(to);
+                        if (order.wouldCycle(txns.get(from), txns.get(to))) {
+                            return -1;
+                        }
+                        order.add(txns.get(from), txns.get(to));
                     }
                 }
                 iterator.remove();
@@ -211,9 +239,9 @@ public final class Prun {
     private static <KeyType, ValueType> int resolveReachableConstraints(
             KnownGraph<KeyType, ValueType> graph,
             Collection<SERConstraint<KeyType, ValueType>> constraints,
-            BitSet[] reachability,
+            List<Transaction<KeyType, ValueType>> txns,
             IdentityHashMap<Transaction<KeyType, ValueType>, Integer> txnIds,
-            BitSet[] direct) {
+            PrecedenceOracle<Transaction<KeyType, ValueType>> order) {
         int resolved = 0;
         int checked = 0;
         int total = constraints.size();
@@ -227,8 +255,8 @@ public final class Prun {
             var constraint = iterator.next();
             int first = txnIds.get(constraint.getWriteTransaction1());
             int second = txnIds.get(constraint.getWriteTransaction2());
-            boolean forward = reachability[first].get(second);
-            boolean backward = reachability[second].get(first);
+            boolean forward = before(order, txns, first, second);
+            boolean backward = before(order, txns, second, first);
             if (forward != backward) {
                 var selected = forward
                         ? constraint.getEdges1()
@@ -238,7 +266,10 @@ public final class Prun {
                     Integer from = txnIds.get(edge.getFrom());
                     Integer to = txnIds.get(edge.getTo());
                     if (from != null && to != null && !from.equals(to)) {
-                        direct[from].set(to);
+                        if (order.wouldCycle(txns.get(from), txns.get(to))) {
+                            return -1;
+                        }
+                        order.add(txns.get(from), txns.get(to));
                     }
                 }
                 iterator.remove();
@@ -251,35 +282,31 @@ public final class Prun {
     }
 
     private static final class ConstraintProgress {
-        private static final int BAR_WIDTH = 30;
+        private static final int BAR_WIDTH = 15;
 
         private final String label;
         private final int total;
-        private final boolean interactive;
-        private final int nonInteractiveStep;
+        private final int refreshStep;
 
         private ConstraintProgress(String label, int total) {
             this.label = label;
             this.total = total;
-            this.interactive = System.console() != null;
-            this.nonInteractiveStep = Math.max(1,
+            this.refreshStep = Math.max(1,
                     Math.min(100, Math.max(1, total / 100)));
         }
 
         private void refresh(int checked, int solved, boolean done) {
-            if (!interactive && !done && checked != 0
-                    && checked % nonInteractiveStep != 0) {
+            if (!done && checked != 0 && checked % refreshStep != 0) {
                 return;
             }
 
             var line = format(checked, solved);
-            if (interactive) {
-                System.err.print("\r" + line);
-                if (done) {
-                    System.err.println();
-                }
-            } else {
-                System.err.println(line);
+            // Carriage-return refresh is also used when stderr is redirected:
+            // captured logs keep one logical progress line instead of one
+            // physical line per update, while a terminal updates in place.
+            System.err.print("\r" + line);
+            if (done) {
+                System.err.println();
             }
             System.err.flush();
         }
@@ -295,7 +322,7 @@ public final class Prun {
                 bar.append(i < filled ? '=' : '-');
             }
             return String.format(
-                    "%s post-check [%s] %3d%% checked %d/%d, solved %d",
+                    "%s post-check [%s] %3d%% %d/%d solved=%d",
                     label, bar, percent, checked, total, solved);
         }
     }
@@ -317,19 +344,25 @@ public final class Prun {
         }
     }
 
-    private static <KeyType, ValueType> void addGraphEdges(
+    private static <KeyType, ValueType> boolean addGraphEdges(
             Set<com.google.common.graph.EndpointPair<Transaction<KeyType, ValueType>>> edges,
-            com.google.common.graph.ValueGraph<Transaction<KeyType, ValueType>,
-                    Collection<graph.Edge<KeyType>>> graph,
             IdentityHashMap<Transaction<KeyType, ValueType>, Integer> txnIds,
-            BitSet[] direct) {
+            PrecedenceOracle<Transaction<KeyType, ValueType>> order,
+            Set<Long> initialEdges) {
+        boolean inconsistent = false;
         for (var edge : edges) {
             var from = txnIds.get(edge.source());
             var to = txnIds.get(edge.target());
             if (from != null && to != null && !from.equals(to)) {
-                direct[from].set(to);
+                initialEdges.add(pairId(from, to));
+                if (order.wouldCycle(edge.source(), edge.target())) {
+                    inconsistent = true;
+                } else {
+                    order.add(edge.source(), edge.target());
+                }
             }
         }
+        return inconsistent;
     }
 
     private static <KeyType, ValueType> Map<KeyType, Set<Integer>> buildWritersByKey(
@@ -406,48 +439,69 @@ public final class Prun {
         }
     }
 
-    private static boolean isSingleKeyLowerBound(
-            int transaction, int source, BitSet[] reachability) {
-        return transaction == source || reachability[transaction].get(source);
+    private static <KeyType, ValueType> boolean isSingleKeyLowerBound(
+            int transaction,
+            int source,
+            List<Transaction<KeyType, ValueType>> txns,
+            PrecedenceOracle<Transaction<KeyType, ValueType>> order) {
+        return transaction == source || before(order, txns, transaction, source);
     }
 
-    private static <KeyType> Map<Integer, BitSet> buildSharedLowerBounds(
-            int transactionCount,
+    private static <KeyType, ValueType> Map<Integer, BitSet> buildSharedLowerBounds(
             Map<Integer, List<FixedObservation<KeyType>>> observationsByReader,
-            BitSet[] reachability) {
-        var predecessors = emptyRows(transactionCount);
-        for (int from = 0; from < transactionCount; from++) {
-            for (int to = reachability[from].nextSetBit(0); to >= 0;
-                    to = reachability[from].nextSetBit(to + 1)) {
-                predecessors[to].set(from);
-            }
-        }
-
+            List<Transaction<KeyType, ValueType>> txns,
+            IdentityHashMap<Transaction<KeyType, ValueType>, Integer> txnIds,
+            PrecedenceOracle<Transaction<KeyType, ValueType>> order) {
         var result = new LinkedHashMap<Integer, BitSet>();
         for (var readerEntry : observationsByReader.entrySet()) {
-            var lowerBound = (BitSet) predecessors[readerEntry.getKey()].clone();
+            var lowerBound = toBitSet(
+                    order.predecessor(txns.get(readerEntry.getKey())), txnIds);
             for (var observation : readerEntry.getValue()) {
                 lowerBound.set(observation.source);
-                lowerBound.or(predecessors[observation.source]);
+                lowerBound.or(toBitSet(
+                        order.predecessor(txns.get(observation.source)), txnIds));
             }
             result.put(readerEntry.getKey(), lowerBound);
         }
         return result;
     }
 
-    private static <KeyType> boolean hasOtherKeyVisibilityWitness(
+    private static <KeyType, ValueType> BitSet toBitSet(
+            Collection<Transaction<KeyType, ValueType>> transactions,
+            IdentityHashMap<Transaction<KeyType, ValueType>, Integer> txnIds) {
+        var result = new BitSet();
+        for (var transaction : transactions) {
+            var index = txnIds.get(transaction);
+            if (index != null) {
+                result.set(index);
+            }
+        }
+        return result;
+    }
+
+    private static <KeyType, ValueType> boolean hasOtherKeyVisibilityWitness(
             int transaction,
             int reader,
             KeyType targetKey,
             Map<Integer, List<FixedObservation<KeyType>>> observationsByReader,
-            BitSet[] reachability) {
+            List<Transaction<KeyType, ValueType>> txns,
+            PrecedenceOracle<Transaction<KeyType, ValueType>> order) {
         for (var observation : observationsByReader.getOrDefault(reader, Collections.emptyList())) {
             if (!Objects.equals(observation.key, targetKey)
-                    && isSingleKeyLowerBound(transaction, observation.source, reachability)) {
+                    && isSingleKeyLowerBound(
+                            transaction, observation.source, txns, order)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static <KeyType, ValueType> boolean before(
+            PrecedenceOracle<Transaction<KeyType, ValueType>> order,
+            List<Transaction<KeyType, ValueType>> txns,
+            int from,
+            int to) {
+        return order.before(txns.get(from), txns.get(to));
     }
 
     private static void putForced(
@@ -460,56 +514,6 @@ public final class Prun {
         if (previous == null || crossKey && !previous.crossKey) {
             additions.put(pair, new ForcedOrder(from, to, crossKey));
         }
-    }
-
-    private static BitSet[] transitiveClosure(BitSet[] direct) {
-        var reachability = new BitSet[direct.length];
-        for (int i = 0; i < direct.length; i++) {
-            reachability[i] = (BitSet) direct[i].clone();
-        }
-        for (int intermediate = 0; intermediate < reachability.length; intermediate++) {
-            for (int from = 0; from < reachability.length; from++) {
-                if (reachability[from].get(intermediate)) {
-                    reachability[from].or(reachability[intermediate]);
-                }
-            }
-        }
-        return reachability;
-    }
-
-    private static boolean hasCycle(BitSet[] reachability) {
-        for (int i = 0; i < reachability.length; i++) {
-            if (reachability[i].get(i)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static BitSet[] emptyRows(int size) {
-        var result = new BitSet[size];
-        for (int i = 0; i < size; i++) {
-            result[i] = new BitSet(size);
-        }
-        return result;
-    }
-
-    private static int cardinality(BitSet[] rows) {
-        int result = 0;
-        for (var row : rows) {
-            result += row.cardinality();
-        }
-        return result;
-    }
-
-    private static int countDifference(BitSet[] minuend, BitSet[] subtrahend) {
-        int result = 0;
-        for (int i = 0; i < minuend.length; i++) {
-            var difference = (BitSet) minuend[i].clone();
-            difference.andNot(subtrahend[i]);
-            result += difference.cardinality();
-        }
-        return result;
     }
 
     private static long pairId(int from, int to) {

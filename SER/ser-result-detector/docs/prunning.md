@@ -4,11 +4,9 @@
 
 ## 当前实现状态
 
-- SER 审计剪枝模式为 `NONE`、`REACHABILITY`、`SNAPSHOT`、`PRUN`，通过 `--pruning-mode` 选择，默认是 `REACHABILITY`。
-- 四种模式都直接用于实际 audit；`constraint-stat` 可以只统计剪枝前后约束而不构造 `SERSolverAR`、不运行 MonoSAT。
-- `REACHABILITY` 走 `Pruning.pruneConstraints`（PolySI：某分支加边是否成环）。`SNAPSHOT` 只跑 shared-snapshot 固定点，并只物化本轮 P3/P4 碰到的 writer 对。`PRUN` 在同一套 snapshot 规则上，每轮先按 writer 对的当前可达性消解约束。
-- 谓词求解模式为 `EAGER`、`GMWR`，通过 `--predicate-solving-mode` 选择，默认是 `EAGER`。剪枝在谓词 SAT 编码之前运行，与两种谓词模式正交。
-- 当前 SER 全量回归为 167 项测试、0 failure、0 error、2 skipped。
+- 本文记录的是已经退出生产调用链的历史 shared-snapshot 原型；`Prun.java` 暂留供第二阶段物理清理前核对。
+- 当前 `audit` 和 `constraint-stat` 只允许 `--ww-pruning=NONE|REACHABILITY`，默认 `REACHABILITY`；不会调用本文算法。
+- 谓词相关模式通过 `--predicate-mode=EAGER|GMWR` 选择，默认是 `EAGER`。
 
 ## 1. 输入
 
@@ -38,11 +36,11 @@ C < S  OR  R < C
 
 ## 2. 数据结构
 
-实现用事务下标上的 `BitSet[]`，由 `IncrementalOrder` 同时维护直接边和闭包：
+实现调用由 `SERVerifier`创建并注入的 `PrecedenceOracle<Transaction>`；BitSet闭包只封装在该primitive内，并与REACHABILITY、GMWR和solver known-order共享同一实例：
 
-- `direct[u]`：当前确定的直接顺序。
-- `reach[u]`：`u <* v` 的传递闭包。
-- `predecessors[v]`：`reach` 的反方向，即能到达 `v` 的事务。
+- `before(u,v)`：当前是否已有 `u <* v`。
+- `successor(u)` / `predecessor(v)`：传递后继与传递前驱。
+- `wouldCycle(u,v)`：加入 `u -> v` 是否闭环。
 - `writersByKey[k]`：写过 key `k` 的事务。
 - `observationsByReader[R]`：reader `R` 的全部固定 external observation。
 
@@ -52,7 +50,11 @@ C < S  OR  R < C
 LB(R) = Pred(R) ∪ {S | fixedObservation(R, *, S)} ∪ Pred(S)
 ```
 
-`Pred(T)` 是当前 `predecessors[T]`，即已确定的 `A <* T`。实现不保存 `UB(R)`，也不生成 `LB(R) × UB(R)` 边。
+`Pred(T)` 来自 `PrecedenceOracle.predecessor(T)`，即已确定的 `A <* T`。实现不保存 `UB(R)`，也不生成 `LB(R) × UB(R)` 边。
+
+`PrecedenceOracle.add(from,to)` 使用 `Pred(from) ∪ {from}` 和 `Succ(to) ∪ {to}` 的直积增量更新统一闭包。因此 P3/P4 新边和已物化约束的 WW/RW 边会立即对后续推理可见，无需每轮重算。
+
+oracle只保存deterministic order facts。尚未选择的residual WW方向、predicate frontier selection和MonoSAT order decision literal不进入oracle。
 
 `Pred(R)` 必须进入 `LB(R)`：若竞争 writer 已经排在 reader 之前，则 `R < C` 不可能，latest-visible 只剩 `C < S`。
 
@@ -66,10 +68,10 @@ LB(R) = Pred(R) ∪ {S | fixedObservation(R, *, S)} ∪ Pred(S)
 
 ```text
 loop:
-  若 reach 存在自环 → 不一致，结束
-  若当前是 PRUN，且至少一条 WW 约束已被 reach 唯一决定方向
+  若新增顺序 wouldCycle → 不一致，结束
+  若当前是 PRUN，且至少一条 WW 约束已被 before 唯一决定方向
       → 物化该分支，本轮不做 P3/P4，继续 loop
-  按当前 predecessors 重算每个 reader 的 LB(R)
+  按当前 predecessor() 重算每个 reader 的 LB(R)
   对每个 fixedObservation(R, k, S) 与每个写过 k 的 C（C ≠ S, C ≠ R）：
       若 C <* S 或 R <* C：二选一已成立，跳过
       否则若 C ∈ LB(R)：强制 C < S          （P3）
@@ -77,11 +79,11 @@ loop:
   若没有新顺序：
       SNAPSHOT：物化本轮 snapshotWriterOrders 中的 WW 约束
       结束
-  把新顺序写入 IncrementalOrder（更新 direct / reach / predecessors）
+  把新顺序写入 PrecedenceOracle
   SNAPSHOT：物化本轮 snapshotWriterOrders 中的 WW 约束
 ```
 
-`PRUN` 不在 P3/P4 之后立刻按 snapshot writer 对物化约束。P3/P4 的新边先进入 `reach`，下一轮开头的 writer 对可达性消解再物化对应 `SERConstraint`。
+`PRUN` 不在 P3/P4 之后立刻按 snapshot writer 对物化约束。P3/P4 的新边先进入 oracle，下一轮开头的 writer 对可达性消解再物化对应 `SERConstraint`。
 
 ### 3.2 P3：snapshot 内的竞争 writer 必须在 source 之前
 
@@ -121,15 +123,15 @@ W1 ->WW W2
 R  ->RW W2
 ```
 
-物化时把选中分支的 WW/RW 写入 `KnownGraph`（`PR_RW` 不写回图），并把端点顺序加入 `IncrementalOrder`，然后删除该约束。
+物化时把选中分支的 WW/RW 写入 `KnownGraph`（`PR_RW` 不写回图），并把端点顺序加入 `PrecedenceOracle`，然后删除该约束。
 
 两种模式的判定条件不同：
 
 | 模式 | 何时物化一条约束 |
 | --- | --- |
-| `PRUN` | 当前 `reach` 中恰好一个方向成立：`W1 <* W2` 或 `W2 <* W1` |
+| `PRUN` | `before(W1,W2)` 与 `before(W2,W1)` 中恰好一个成立 |
 | `SNAPSHOT` | 本轮 P3/P4 把该 writer 对写入了 `snapshotWriterOrders` |
-| 两边都未知，或两个方向同时出现 | 本轮不删约束；若 `reach` 已有自环，整次剪枝判定不一致 |
+| 两边都未知 | 本轮不删约束；新增关系若 `wouldCycle`，整次剪枝判定不一致 |
 
 `PRUN` 这里看的是 writer 对是否已经有确定顺序，不是 `Pruning.java` 的「某一分支加边是否成环」。竞争 writer 已经位于 reader 之前、因而 RW 方向会成环的情况，由 `Pred(R) ⊆ LB(R)` 加 P3 推出 `C < S`，再在下一轮被 writer 对可达性消解。
 
@@ -159,7 +161,7 @@ T2 写过 x，且 T2 ∈ LB(R)，T2 ≠ T1
 
 ## 6. 对比（初始约束相同，看剪枝后剩余）
 
-下表来自当前保留的 30 份 KV 历史结果文件；该文件生成于四策略脚本加入 `PRUN` 统计之前，因此只列出 NONE、POLYSI（`REACHABILITY`）和 SNAPSHOT。重新运行当前 `tools/run_pruning_constraint_comparison.py` 会同时输出 `POLYSI_SNAPSHOT`（`PRUN`）。
+下表是原型阶段保留的历史结果，不代表当前 runner 配置。当前 `tools/run_pruning_constraint_comparison.py` 只输出 `NONE` 与 `REACHABILITY`。
 
 
 | 策略       | 历史数 | 原始 Constraints | 剩余 Constraints | Constraints 剪枝率 | 原始 Implications | 剩余 Implications | Implications 剪枝率 |
@@ -181,445 +183,96 @@ T2 写过 x，且 T2 ∈ LB(R)，T2 ≠ T1
 
 
 
-## 7. GMWR 谓词求解优化
+## 7. GMWR 当前实现
 
-`EAGER` 是默认谓词模式，在首次 MonoSAT 求解前显式建立全部 row-local reader-key 约束。`GMWR` 与 EAGER 并列，负责压缩这些提前建立的谓词义务；它与前述 WW/RW 选择剪枝不是同一层算法。
+`GMWR` 通过 `--predicate-mode=GMWR` 启用。当前实现位于
+`src/main/java/verifier/SERSolverAR.java`，只包含以下四条谓词剪枝规则。
 
-GMWR 不增加新的可串行化语义，也不能得出 MonoSAT 无法得出的结论。差别不在「GMWR 会推、MonoSAT 不会推」，而在：同一类单位后果，GMWR 在建 SAT 对象之前就算完，并据此停掉后续物化。它是针对谓词 item 结构的预处理器：
+### 7.1 规则一：PR_WR source 可达性剪枝
 
-```text
-mandatory AR 可达性
-+ item 公式常量折叠
-+ 公式单位传播（repair 全假 ⇒ R < B）
-+ 新强制顺序回写闭包
-+ 固定点迭代
-```
+对候选谓词读依赖 `PR_WR(A,R,k)`，如果 mandatory dependency closure
+已经存在 `R ->* A`，激活 `A -> R` 会形成环，因此删除该 source
+alternative。
 
-如果已经实现了“用可达性化简 `R < B OR (B < A AND A < R)`、提取唯一剩余分支、把新顺序加回闭包并迭代到固定点”，就已经实现了 GMWR 的主要逻辑功能。Bundle、去重和 repair-set 包含消减只减少重复处理和约束物化，不是额外判定能力。MonoSAT 如何传播同一公式、以及为何大量约束不必进求解器，见 8.4、8.5。
+如果一个 key 剪枝后只剩一个合法 source，求解器固定该 source，并将对应
+`PR_WR` 作为已知谓词依赖加入后续编码。
 
-对于谓词读事务 `R`，如果事务 `B` 写入了可能改变 `R` 查询结果的数据，则每条 item 约束形如：
+对应指标：
 
-```text
-R < B
-或存在某个 repair A ∈ Repairs：B < A < R
-```
+- `SER_PRED_PR_WR_SOURCE_ALTERNATIVES_COUNT`
+- `SER_PRED_PR_WR_REACHABILITY_PRUNED_COUNT`
+- `SER_PRED_PR_WR_REACHABILITY_FORCED_COUNT`
 
-其中 `Repairs` 是集合，不是单个 writer：
+### 7.2 规则二：固定 WW 导致的 PR_RW 环剪枝
 
-- 已返回 item：repair 是记录 source；
-- 未返回 item：repair 是所有对该行没有贡献的 writer。
+设 `A` 是候选 source，`B` 是同 key 的后续 writer。仅当下面三个条件
+同时成立时删除 `PR_WR(A,R,k)` source alternative：
 
-相同 `(R, B)` 的 item 组成一个 bundle，共享 outside 分支 `R < B`。repair 集合更小的 item 会吞并更大的集合（更弱的子句不必保留）。
+1. `WW(A,B,k)` 已经确定；
+2. `B` 相对 `A` 会改变谓词结果；
+3. mandatory dependency closure 已经存在 `B ->* R`。
 
-固定点只根据 mandatory AR 闭包做必然推导：
+选择 `A` 后会产生 `PR_RW(R,B,k)`，与已有 `B ->* R` 构成环。该规则
+只读取已经确定的 WW，不推断或固定未决 WW choice。
 
-- 已有 `R < B`：整个 bundle 满足，删除；
-- 某条 item 已有 `B < A < R`：该 item 满足；
-- 没有任何 repair 能插在 `B` 与 `R` 之间：强制 `R < B`，整个 bundle 随之满足；
-- 已有 `B < R` 且只剩唯一可行 repair：强制 `B < A < R`；
-- 已有 `B < R` 且没有可行 repair：矛盾。
+对应指标：`SER_PRED_PR_WR_PR_RW_CYCLE_PRUNED_COUNT`。
 
-闭包只回答某个 AR 原子是否已经必真或必假。`R < B` 并不是闭包自己长出来的边，而是 item 公式在 repair 全假时的单位后果。不能提前消解的 bundle 才编码成残余 SAT clause：`R < B` 或各个可行的 `B < A < R`。
+### 7.3 规则三：无 recorded source 的 frontier 区间剪枝
 
-### 7.1 GMWR 补足 PolySI 的什么局限
+对没有 recorded source 的 external key，只保留仍可能成为 reader 的
+AR-max frontier 的 writer：
 
-这里的“局限”不是指 PolySI 的可达性推理不正确，也不是指 GMWR 获得了更强的判定能力。原始 PolySI 本身不支持 predicate reads；它的 generalized polygraph 约束主要表示同 key writer 的两个 WW/RW edge-set 分支。当前 SER 中的 PolySI 风格 `REACHABILITY` 剪枝也只消解已经生成的 `SERConstraint`：
+- 已知位于 reader 之后的 writer 被删除；
+- 已知位于 reader 之前、但又被另一个已知可见的同 key writer 支配的 writer
+  被删除；
+- 已有真实 writer 确定在 reader 之前时，bottom 初始版本被删除；
+- 与 reader 或其他 writer 的顺序仍未确定时保留候选。
 
-```text
-branch 1: W1 < W2，以及该方向激活的 RW edges
-OR
-branch 2: W2 < W1，以及该方向激活的 RW edges
-```
+该规则依据 fixed WW 和已确定 typed dependency/order 工作，不猜测未决 WW
+方向。被删除的 writer 不再产生 frontier candidate 或相应的谓词义务。
 
-它会在某一分支加入 mandatory graph 后成环时强制另一分支，并把两边都仍可行的残余选择交给 MonoSAT。这一点与 GMWR 的“先传播、再求解残余”架构相同。
+对应指标：`SER_GMWR_INTERVAL_CANDIDATES_PRUNED_COUNT`。
 
-PolySI 风格剪枝无法直接压缩当前谓词路径，原因在于它的输入对象和公式形状不同：
+### 7.4 规则四：物理谓词依赖边合并
 
-1. **谓词覆盖局限**：原始 PolySI 没有 predicate observation、bad writer 和 repair 集合的语义，不会生成 `R < B OR repairs`。
-2. **约束形状局限**：`SERConstraint` 是两个 edge set 的二选一；谓词 item 可以有多个 repair，形如 `R < B OR X1 OR X2 ...`，而且多个 item 会共享同一个 outside literal `R < B`。现有二分支剪枝不知道这个 bundle 结构。
-3. **物化边界局限**：PolySI 风格 WW/RW 剪枝在谓词 SAT 编码之前运行，它看不到稍后才在 `SERSolverAR` 中构造的 reader-key-bad-writer 义务。即使某些谓词子句可由同一套 mandatory 可达性立即化简，单独的 PolySI 剪枝阶段也无从访问它们。
-4. **共享分支物化成本**：如果按 EAGER 把每个 key 的 item 独立展开，PolySI 已经完成的 WW/RW 剪枝不会阻止这些谓词公式创建 AR literal、repair AND、OR clause 和 JNI 调用。
+谓词编码先保留逐 key 的 typed witness。多个 witness 如果具有相同的
+`(from,to,type)`，其中 `type` 为 `PR_WR` 或 `PR_RW`，则在
+唯一的 MonoSAT `serializationGraph` 中只物化一条端点物理边；该边的 guard 是所有 witness
+guard 的逻辑 OR，witness key 集合仍保留用于语义和诊断。
 
-GMWR 补足的就是这个“谓词专用预处理层”：
+对应指标：
 
-```text
-PolySI-style REACHABILITY
-    处理已物化的 WW/RW 二分支 SERConstraint
+- `SER_PRED_DEPENDENCY_CANDIDATES_COUNT`
+- `SER_PRED_DEPENDENCY_PHYSICAL_EDGES_COUNT`
+- `SER_PRED_DEPENDENCY_COALESCED_COUNT`
+- `SER_PRED_DEPENDENCY_PHYSICAL_PR_WR_EDGES_COUNT`
+- `SER_PRED_DEPENDENCY_PHYSICAL_PR_RW_EDGES_COUNT`
 
-GMWR
-    处理谓词 R < B OR repairs
-    按 (reader,bad-writer) 共享 R < B
-    删除重复或被包含的 repair set
-    用 mandatory closure 化简并传播强制顺序
-    只把残余 clause 交给 MonoSAT
-```
+### 7.5 与 PolySI REACHABILITY 的关系
 
-单 repair 的 `R < B OR B < A < R` 理论上可以改写为类似 PolySI 的两个 edge-set 分支；如果再给 PolySI 预处理器增加多 repair、bundle 共享、去重、包含消减和谓词物化前固定点，它也可以实现与 GMWR 相同的功能。因此，GMWR 解决的是 PolySI 原有适用范围不覆盖谓词、现有 WW/RW 剪枝无法利用谓词公式共享结构所导致的工程扩展性问题，而不是 PolySI 的正确性缺陷。
+两者处理不同对象，可以正交组合：
 
-这两层可以正交组合。PolySI 风格剪枝后仍未决的 WW/RW 分支会进入 MonoSAT；GMWR 固定点后仍未决的 `R < B OR repairs` 也会进入同一求解器。GMWR 不保证消除所有谓词约束，当前某组实验中 `residual clauses = 0` 只是该历史的实测结果。
+- `REACHABILITY` 剪枝处理已经生成的 WW/RW 二分支 `SERConstraint`；
+- `GMWR` 的四条规则处理谓词 source、frontier 和物理谓词依赖边。
 
-当前实现覆盖两类输入：
+因此评估 GMWR 时应固定相同的 `--ww-pruning` 比较 `EAGER` 与
+`GMWR`。不能把 `GMWR + NONE` 和 `EAGER + REACHABILITY` 的时间差
+全部归因于 GMWR。
 
-- row-local 查询：按上式建立 bundle；internal key 不进 bundle，只做事务内一致性检查。
-- 非 DISTINCT 的单调 `Scan/Filter/INNER JOIN`（`QueryPlan.isMonotone()`）：已记录的 external source 复用 bundle；未记录 key 仍走完整快照 refinement。候选快照多出结果时，只用该结果的实际贡献输入、减去已记录输入，形成多 key witness。
-
-`DISTINCT`、非单调查询和不能用上述规则表达的剩余部分继续走完整快照 refinement。
-
-## 8. GMWR 例子
-
-先看一个抽象的三 item 例子。假设谓词读 `R` 没有看到事务 `B` 对三个 key 写入的会改变查询结果的版本，并产生：
-
-```text
-k1: R < B  OR  B < A1 < R
-k2: R < B  OR  B < A2 < R
-k3: R < B  OR  B < A3 < R
-```
-
-这里 `B < Ai < R` 是一个 repair term，实际上是 `(B < Ai) AND (Ai < R)`。三个 item 是合取关系：
-
-```text
-(R < B OR B < A1 < R)
-AND
-(R < B OR B < A2 < R)
-AND
-(R < B OR B < A3 < R)
-```
-
-它们共享 outside literal `R < B`，因此按 `(reader,bad-writer)=(R,B)` 组成：
-
-```text
-Bundle(R, B)
- ├─ k1: Repairs={A1}
- ├─ k2: Repairs={A2}
- └─ k3: Repairs={A3}
-```
-
-这不等价于把三个 repair 改成一个更弱的析取。如果 `R < B` 最终为假，每个尚未消解的 item 都必须分别找到成立的 repair，不是 `A1/A2/A3` 中任意一个成立就足够。
-
-### 8.1 使用当前真实历史的 bundle
-
-以下数据直接来自：
-
-```text
-predicateHistories/kvpredicate/test/
-20_100_15_10000_0.2_uniform/hist-00000/history.prhist.jsonl
-```
-
-读事务为：
-
-```text
-R = txn 6878909
-session = 0
-session_seq = 53
-```
-
-`R` 的 `op_index=8` 执行谓词：
-
-```sql
-SELECT k, value FROM kv WHERE value > 10242
-```
-
-该次读没有返回下列五个 key：
-
-```text
-kv:6007  kv:4894  kv:115  kv:9325  kv:6514
-```
-
-在同一个事务中，`op_index=3` 的 `value > 2019` 读记录了这五个 key 当时的可见值：
-
-| key | `R` 记录的可见值 | 是否满足 `value > 10242` |
-| --- | ---: | --- |
-| `kv:6007` | 6007 | 否 |
-| `kv:4894` | 4894 | 否 |
-| `kv:115` | 10237 | 否 |
-| `kv:9325` | 9325 | 否 |
-| `kv:6514` | 6514 | 否 |
-
-事务 `B=6926663` 在一个事务中写入了这五个 key：
-
-```text
-B = txn 6926663
-session = 7
-session_seq = 1630
-```
-
-| key | `B` 写入的值 | 是否满足 `value > 10242` |
-| --- | ---: | --- |
-| `kv:6007` | 21392 | 是 |
-| `kv:4894` | 21393 | 是 |
-| `kv:115` | 21394 | 是 |
-| `kv:9325` | 21395 | 是 |
-| `kv:6514` | 21396 | 是 |
-
-如果 `B` 成为 `R` 之前这些 key 的 latest-visible writer，五个 key 都应出现在 `R` 的结果中，与历史记录矛盾。因此同一个 `(R,B)` 产生五个 item 义务：
-
-```text
-Bundle(R=6878909, B=6926663)
- ├─ kv:6007
- ├─ kv:4894
- ├─ kv:115
- ├─ kv:9325
- └─ kv:6514
-```
-
-实现会在流式构建期立即消解已经能够确定的 item，所以这五个逻辑义务不一定同时作为五个物化对象驻留在 `gmwrBundles` 中。
-
-### 8.2 repair 从哪里来
-
-对未返回的 key，`B` 是单行执行会产生非空贡献的 bad writer；repair 候选是同一 key 上单行执行不产生贡献的 writer。repair 不是从事务号或物理时间猜出来的，而是对候选版本实际执行谓词后分类得到的。
-
-以 `kv:115` 为例：
-
-```text
-A = txn 6877388
-A writes kv:115 = 10237
-A: session=7, session_seq=19
-
-B = txn 6926663
-B writes kv:115 = 21394
-B: session=7, session_seq=1630
-```
-
-`10237 > 10242` 为假，所以 `A` 是 repair 候选；`21394 > 10242` 为真，所以 `B` 是 bad writer。对应 item 是：
-
-```text
-R < B  OR  B < A < R
-```
-
-代入真实事务号：
-
-```text
-6878909 < 6926663
-OR
-6926663 < 6877388 < 6878909
-```
-
-初始版本 `T⊥` 的值 `115` 也不产生谓词贡献，但 `T⊥` 固定在所有真实事务之前，不可能满足 `B < T⊥ < R`。
-
-### 8.3 mandatory order 如何消解这个真实 bundle
-
-`A=6877388` 与 `B=6926663` 属于同一 session，且 session sequence 分别是 19 和 1630，因此 mandatory session order 已经确定：
-
-```text
-A < B
-```
-
-但 `kv:115` 的 repair term 要求 `B < A < R`，其中 `B < A` 与已知 `A < B` 冲突。所以 `A` 不是 feasible repair；`T⊥` 也不可行，该 item 退化为：
-
-```text
-R < B OR false
-= R < B
-```
-
-其他四个 key 上，历史中的其他非初始写值也都大于 10242，它们同样会产生谓词贡献，不是 repair。唯一不贡献的初始版本又不能放在 `B` 之后，因此这些 item 也没有 feasible repair。
-
-固定点处理分两种情况：
-
-1. mandatory closure 已有 `R < B`：整个 bundle 直接满足并删除。
-2. `R < B` 尚未确定：任意一个“无 feasible repair”的 item 都会将它自身化简为 `R < B`，因而强制加入 `6878909 < 6926663`。该共享分支随后一次满足所有兄弟 item。
-
-概念上的五个约束因此都退化为同一个方向：
-
-```text
-kv:6007: R < B
-kv:4894: R < B
-kv:115:  R < B
-kv:9325: R < B
-kv:6514: R < B
-```
-
-最终只需保留强制顺序：
-
-```text
-6878909 < 6926663
-```
-
-整个 bundle 标记为 resolved，不生成残余谓词 clause。
-
-### 8.4 这些子句在 MonoSAT 里怎么传播
-
-上述真实 bundle 能在预处理中完全消解，进不了 MonoSAT。对一个无法完全消解的一般 bundle，GMWR 只保留没有被已知顺序证真或证伪的部分。例如：
-
-```text
-k1: R < B OR B < A1 < R       // 已知 B < A1 < R，整条删除
-k2: R < B OR B < A2 < R       // A2 仍可行，保留
-k3: R < B OR B < A3 < R       // 已知 A3 < B，repair 删除
-```
-
-如果 `R < B` 仍未确定，`k3` 没有其他 repair，它会强制 `R < B`，进而消解整个 bundle。只有 outside 分支和至少一个 repair 都仍可行时，才编码残余：
-
-```text
-R < B OR (B < A2 AND A2 < R)
-```
-
-`gmwrOrderLiteral` 把闭包已定方向折成 `true/false`，只有未决方向才创建 MonoSAT literal。EAGER 对每个 item 都建等价公式，不经这一步过滤。
-
-进求解器之后，**没有特殊的 bundle 传播器**。共享的 `R < B` 只是同一个 Boolean literal 出现在多条子句里。真正互相推的是三件事：子句单位传播（BCP）、方向 XOR、图无环理论。
-
-记 `O = ar(R,B)`，即直接边 `R → B`。`B < Ai < R` 不是一条边，而是合取，先建成辅助变量：
-
-```text
-X1  ↔  ar(B,A1) ∧ ar(A1,R)
-X2  ↔  ar(B,A2) ∧ ar(A2,R)
-
-(O ∨ X1) ∧ (O ∨ X2)
-```
-
-每个被公式碰到的事务对还有 `ar(U,V) XOR ar(V,U)`，再加上 `arGraph.acyclic()`。`ar(U,V)` 是**直接边变量**，不是传递闭包变量。传递性只作用在已经建了 XOR 的那一对上：路上已有 `U ↝ V` 时，反向边会成环，无环理论把 `ar(V,U)` 推成 false，XOR 再把 `ar(U,V)` 推成 true。
-
-GMWR 残余的 `assertOr([O, and(B<A1, A1<R)])` 就是这个形状。EAGER 的 blocking clause 写的是 `¬(B<R) ∨ ∨(A<R ∧ B<A)`，由 XOR 得到 `¬(B<R) = O`，同一组式子。
-
-对上面两条 item：
-
-- **某条 repair 被证伪 → 推出 `R < B`，另一条自动满足。** 例如已有 `A1 < B`，则 `X1` 为假，`O ∨ X1` 变成单位子句 `O`。`O` 一真，`O ∨ X2` 直接满足，不必再给 A2 赋值。这就是共享 outside 在 MonoSAT 里的传播：普通 watched-literal BCP。`X1` 为假也可以来自 XOR（`ar(A1,B)` 已真）或无环（路上已有 `A1 ↝ B`）。
-- **`R < B` 为假 → 两条 repair 都被强制。** `O = false` 时 XOR 给出 `B < R`。两条子句都变成单位：`B → A1 → R` 且 `B → A2 → R`，与 `B → R` 共存，无环。含义是 B 对 R 可见，每个 key 都必须被夹在中间的非贡献写盖住。
-- **`R < B` 为真 → repair 被无环理论禁掉。** `O` 是边 `R → B`。若再让 `X1` 为真，则 `R → B → A1 → R` 成环。子句只要至少一个，图论保证不能两个都真，合起来这条 item 是互斥二选一。`O = true` 时 k2 已被满足，不必为 A2 建新子句。
-- **两条 repair 都可行，`O` 也未定。** BCP 推不动。求解器要决策：试 `O`，或试某个 `Xi`。这才是残余 SAT 还在的原因。
-
-共享 literal 只会在 `R < B` 被赋值或某条 repair 被证伪时，把另一条 item 一起带走。它**不会**因此推出 `A1 < A2` 之类新的跨 key 顺序。
-
-### 8.5 GMWR 与 MonoSAT 后续推断的差别
-
-GMWR 只用当前必真的 AR 闭包（SO/WR/剪枝后的 WW/RW，加上它自己强制进去的边）去读 item 公式。规则是保守的：只有「所有满足该 item 的全序都必须含这条边」时才 `gmwrForceOrder`。它不做猜测，不学冲突子句，也不看尚未赋值的 WW 选择。
-
-MonoSAT 在公式建完之后能力更强：
-
-| | GMWR | MonoSAT |
-|---|---|---|
-| 输入 | 必真闭包 + item 公式 | 全部已物化的 clause + 图边 |
-| 猜测 | 无 | CDCL 决策：试 `R<B` 或试某条 repair |
-| 传播 | BitSet 可达 + 公式化简 | BCP + XOR + `acyclic()` |
-| 交互 | 只在谓词 item / bundle 之间 | 谓词、WW/RW、SO/WR 全混在一张图里 |
-| 学习 | 无 | 冲突分析、lemma |
-| 结果 | 强制边，或留下残余 `OR` | 一个完整可满足偏序，或 UNSAT |
-
-后续 MonoSAT 并不是在重复 GMWR。GMWR 消不掉的残余、未决 WW/RW、无环扩展，仍归它。很多历史上 `residual clauses = 0`，于是它几乎只剩「把强制边和已知序收成一个 DAG」。
-
-EAGER 对每个 item 大致会做：两个方向的图边和 XOR、repair 的 AND 门、OR clause、JNI，同 key 全体 writer 还往往两两 `ensureComparable`。那份 `0.2_uniform` 历史上有 1336 万个 item。绝大部分在必真序下已经恒真或已经单位推出 `R<B`，但 EAGER 仍先建完再让 MonoSAT 做 BCP。贵的是建公式，不是推理更强。
-
-GMWR 对同一个 item 先问闭包三件事（BitSet，不建 literal）：
-
-1. 已有 `R < B`？整条（整个 bundle）扔掉。
-2. 已有某个 `B < A < R`？这条 item 扔掉。
-3. 所有 repair 都插不进？强制 `R < B`，兄弟 item 一起丢。
-
-只有 1、2、3 都不成立，才 `assertOr`。那次实验里 229 万个 bundle 全部在这一步消掉，进 MonoSAT 的谓词 clause 是 0，只留下 3136 条 `assertTrue(ar(...))`。这些就是 MonoSAT 本会用单位传播得到的后果；提前拿到它们，后面的 item 会看到更大的闭包，继续被 1/3 消掉。这是固定点，不是新语义。
-
-用 8.4 的两条 item 看何时不必进求解器：
-
-- **Session 已有 `A1 < B`。** k1 退化成 `O`。GMWR 直接写入 `R < B`，k2 因 `O` 为真删除。MonoSAT 侧：零个子句、零个 AND、A2 的边也不建。EAGER 仍会为 k1、k2 各建一套，再靠 BCP 发现 `X1=false ⇒ O`。
-- **闭包里已有 `R < B`。** 两条都不用建。
-- **`A1`、`A2` 都能插在 `B` 与 `R` 之间，且 `R ? B` 未定。** 这才留给 MonoSAT。GMWR 停手；MonoSAT 开始决策、成环剪枝、和 WW 选择互相推。
-
-三件结构差异放大了「提前单位传播」的收益：
-
-1. **Bundle 共享 `O`。** EAGER 按 key 展开；GMWR 一个 `(R,B)` 只留一份 `O`，任一 item 强制 `O`，其余连对象都不建。
-2. **流式消解。** 先处理到的 item 一旦强制新边，立刻扩大闭包，后面的 item 只查 BitSet。EAGER 必须先全部 `addEdge`/`assertOr`，求解器才能开始推。
-3. **不为只是查询的序建变量。** 判断 `A1` 能否插在中间，GMWR 看三条反向可达是否存在。EAGER 往往还要为该 key 全体 writer 两两建 XOR 边。
-
-因此 GMWR 没有替代 MonoSAT 的后续推断，只把「闭包已经决定的谓词义务」从 SAT 里拿掉。后续仍负责未决 WW/RW、残余谓词 `OR`、以及整张 AR 图无环。大量约束进不去，是因为它们对必真偏序已经是恒真或单位后果，不值得先变成图边和 clause。
-
-### 8.6 当前约 3× 加速实际省在哪里
-
-对上述 `20_100_15_10000_0.2_uniform/hist-00000`，已保存的五次对比结果中位数为：
-
-| 阶段 | EAGER | GMWR | 直接变化 |
-| --- | ---: | ---: | ---: |
-| 完整实验 | 324.405 s | 108.837 s | 约 2.98× |
-| 谓词 AR 编码 | 236.009 s | 51.553 s | 约 4.58× |
-| MonoSAT solve | 28.534 s | 0.019 s | 约 1502× |
-| GMWR build | — | 50.290 s | 包含在 GMWR 谓词编码内 |
-
-完整运行减少约 215.6 秒。其中谓词编码减少约 184.5 秒，MonoSAT solve 减少约 28.5 秒。约 3× 不是同一条传递推导在 Java 里比 MonoSAT 快 3 倍，而是 8.5 所说：大量公式没有走完整物化路径。
-
-该历史的 GMWR 规模指标为：
-
-```text
-item obligations       = 13,358,765
-bundles                = 2,294,390
-resolved bundles       = 2,294,390
-residual bundles       = 0
-residual clauses       = 0
-forced orders          = 3,136
-```
-
-GMWR 仍需约 50.3 秒遍历、分类和聚合约 1336 万个 item；这 50.3 秒已包含在上面的 51.6 秒谓词编码里。`residual clauses = 0` 时，MonoSAT 几乎只消化 3136 条强制边，所以 solve 从 28.5s 降到 0.019s。如果 MonoSAT 原生接受同样的 compact bundle 并在 native 内做相同预处理，也可能获得类似收益。
-
-### 8.7 Bundle 多 key 与 multi-key witness 不是一件事
-
-Bundle 中的多 key 只是共享 outside literal。对：
-
-```text
-k1: O OR X1
-k2: O OR X2
-k3: O OR X3
-```
-
-其中 `O = R < B`，整体语义是：
-
-```text
-(O OR X1) AND (O OR X2) AND (O OR X3)
-= O OR (X1 AND X2 AND X3)
-```
-
-因此 `O` 成立时可批量删除所有 item；`O` 不成立时，每个 key 仍须分别满足自己的 repair。Bundle 不会产生 `A1 < A2` 之类新的跨 key 顺序，也不能把三个 repair 改成 `O OR X1 OR X2 OR X3`。它是公共子式提取和批量消除，不是新的多 key 一致性规则。
-
-真正的 multi-key witness 出现在 JOIN 等单调多表查询中。例如一条历史外的额外 JOIN 结果同时依赖：
-
-```text
-Visible(R, orders:o1@Wo)
-AND
-Visible(R, items:i1@Wi)
-```
-
-单独禁止 `Wo` 或 `Wi` 可见都会过度约束，因为单个输入版本未必产生该 JOIN 结果。正确的 no-good 只禁止当前联合组合：
-
-```text
-NOT (
-    Visible(R, orders:o1@Wo)
-    AND
-    Visible(R, items:i1@Wi)
-)
-```
-
-即：
-
-```text
-NOT Visible(R, orders:o1@Wo)
-OR
-NOT Visible(R, items:i1@Wi)
-```
-
-因此：
-
-- Bundle 多 key：多个独立 item 共享 `R < B`，属于公共分支聚合。
-- Multi-key witness：一个额外查询结果同时依赖多个输入 key，阻断的是它们的联合可见组合。
-- 当前 KV 单表 scan/filter 历史中的五 key bundle 属于前者，不是 JOIN 型 multi-key witness。
-
-### 8.8 EAGER/GMWR 汇总对比
-
-| Predicate ratio | 有效配对 | EAGER 总时间中位数 | GMWR 总时间中位数 | 时间降幅中位数 | 加速中位数 | MonoSAT 降幅中位数 | 内存降幅中位数 | Bundle reduction |
-| --------------- | ---- | ------------ | ----------- | ------- | ----- | ------------- | ------- | ---------------- |
-| 0               | 5/5  | 0.829 s      | 0.837 s     | -0.74%  | 0.99× | 1.08%         | 0.00%   | —                |
-| 0.005           | 5/5  | 10.982 s     | 5.550 s     | 49.46%  | 1.98× | 98.74%        | 38.33%  | 85.29%           |
-| 0.010           | 5/5  | 17.403 s     | 6.936 s     | 58.59%  | 2.41× | 99.58%        | 38.21%  | 85.08%           |
-| 0.05            | 5/5  | 91.061 s     | 25.784 s    | 71.93%  | 3.56× | 99.94%        | 12.90%  | 84.72%           |
-| 0.1             | 5/5  | 148.692 s    | 51.160 s    | 66.52%  | 2.99× | 99.95%        | 26.42%  | 84.01%           |
-| 0.2             | 4/5  | 305.122 s    | 107.601 s   | 64.62%  | 2.83× | 99.93%        | 23.75%  | 82.80%           |
-
-
-## 9. 运行与复现
+## 8. 运行与复现
 
 实际审计：
 
 ```bash
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit --pruning-mode=PRUN --predicate-solving-mode=GMWR \
+  audit --predicate-mode=GMWR \
+  --ser-propagation-mode=ww-gmwr \
+  --gmwr-prepropagation \
   /absolute/path/to/hist-00000
 ```
 
-只比较四种剪枝策略的约束规模：
+比较 WW reachability 开启与关闭时的约束规模：
 
 ```bash
 ./gradlew installDist
@@ -630,5 +283,5 @@ python3 tools/run_pruning_constraint_comparison.py /path/to/history/root
 
 ```bash
 python3 tools/run_gmwr_comparison.py /path/to/history/root \
-  --pruning-mode PRUN --repeats 5
+  --ww-pruning REACHABILITY --repeats 5
 ```

@@ -38,6 +38,79 @@ public class SERVerifier<KeyType, ValueType> {
         PRUN
     }
 
+    public enum SerPropagationMode {
+        WW_ONLY,
+        WW_GMWR_ONEWAY,
+        WW_GMWR
+    }
+
+    public enum AuditResult {
+        ACCEPT(0, "[[[[ ACCEPT ]]]]"),
+        REJECT(-1, "[[[[ REJECT ]]]]"),
+        TIMEOUT(124, "[[[[ TIMEOUT ]]]]"),
+        INVALID_HISTORY(2, "[[[[ INVALID_HISTORY ]]]]");
+
+        public final int exitCode;
+        public final String marker;
+
+        AuditResult(int exitCode, String marker) {
+            this.exitCode = exitCode;
+            this.marker = marker;
+        }
+    }
+
+    /**
+     * Injectable SAT backend used by {@link SERSolverAR}. Tests supply a mock
+     * that returns empty to simulate timeout without calling MonoSAT.
+     */
+    @FunctionalInterface
+    public interface SatSolveBackend {
+        /**
+         * @param remainingSeconds {@code <= 0} means unlimited
+         * @param assumptions logical obligations enabled for this solve
+         * @return {@code Optional.of(true)} SAT, {@code Optional.of(false)} UNSAT,
+         *         empty TIMEOUT
+         */
+        java.util.Optional<Boolean> solve(
+                monosat.Solver solver,
+                int remainingSeconds,
+                Collection<monosat.Lit> assumptions);
+    }
+
+    /**
+     * Independent solver knobs. Predicate encoding, GMWR pre-propagation,
+     * WW feedback, witness coalescing and graph-edge interning are not
+     * implied by each other.
+     */
+    public static final class SolverSettings {
+        public PredicateSolvingMode predicateSolvingMode = PredicateSolvingMode.EAGER;
+        public PruningMode pruningMode = PruningMode.REACHABILITY;
+        public SerPropagationMode serPropagationMode = SerPropagationMode.WW_ONLY;
+        public boolean gmwrPrepropagation;
+        public boolean predicateWitnessCoalescing;
+        public boolean graphEdgeInterning;
+        public boolean verifyIncrementalPropagation;
+        public int solverTimeoutSeconds;
+        public boolean detailedPredicateMetrics;
+        public SatSolveBackend satSolveBackend;
+
+        public static SolverSettings forModes(PredicateSolvingMode predicate,
+                                              PruningMode pruning,
+                                              SerPropagationMode propagation) {
+            var settings = new SolverSettings();
+            settings.predicateSolvingMode = Objects.requireNonNull(
+                    predicate, "predicateSolvingMode");
+            settings.pruningMode = Objects.requireNonNull(pruning, "pruningMode");
+            settings.serPropagationMode = Objects.requireNonNull(
+                    propagation, "serPropagationMode");
+            boolean gmwr = predicate == PredicateSolvingMode.GMWR;
+            settings.gmwrPrepropagation = gmwr;
+            settings.predicateWitnessCoalescing = true;
+            settings.graphEdgeInterning = true;
+            return settings;
+        }
+    }
+
     public static final class ConstraintStats {
         public final boolean internallyConsistent;
         public final boolean pruningInconsistent;
@@ -62,6 +135,8 @@ public class SERVerifier<KeyType, ValueType> {
     private final boolean detailedPredicateMetrics;
     private final PredicateSolvingMode predicateSolvingMode;
     private final PruningMode pruningMode;
+    private final SerPropagationMode serPropagationMode;
+    private final SolverSettings solverSettings;
 
     @Getter
     @Setter
@@ -76,64 +151,90 @@ public class SERVerifier<KeyType, ValueType> {
     private static boolean compareDerivedPredicateEdges = false;
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader) {
-        this(loader, false, PredicateSolvingMode.EAGER, PruningMode.REACHABILITY);
+        this(loader, false, PredicateSolvingMode.EAGER,
+                PruningMode.REACHABILITY, SerPropagationMode.WW_ONLY);
     }
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
             boolean detailedPredicateMetrics) {
         this(loader, detailedPredicateMetrics, PredicateSolvingMode.EAGER,
-                PruningMode.REACHABILITY);
+                PruningMode.REACHABILITY, SerPropagationMode.WW_ONLY);
     }
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
             boolean detailedPredicateMetrics,
             PredicateSolvingMode predicateSolvingMode) {
         this(loader, detailedPredicateMetrics, predicateSolvingMode,
-                PruningMode.REACHABILITY);
+                PruningMode.REACHABILITY,
+                predicateSolvingMode == PredicateSolvingMode.GMWR
+                        ? SerPropagationMode.WW_GMWR
+                        : SerPropagationMode.WW_ONLY);
     }
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
             boolean detailedPredicateMetrics,
             PredicateSolvingMode predicateSolvingMode,
             PruningMode pruningMode) {
+        this(loader, detailedPredicateMetrics, predicateSolvingMode, pruningMode,
+                predicateSolvingMode == PredicateSolvingMode.GMWR
+                        ? SerPropagationMode.WW_GMWR
+                        : SerPropagationMode.WW_ONLY);
+    }
+
+    public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
+            boolean detailedPredicateMetrics,
+            PredicateSolvingMode predicateSolvingMode,
+            PruningMode pruningMode,
+            SerPropagationMode serPropagationMode) {
+        this(loader, SolverSettings.forModes(predicateSolvingMode, pruningMode,
+                serPropagationMode), detailedPredicateMetrics);
+    }
+
+    public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
+            SolverSettings solverSettings,
+            boolean detailedPredicateMetrics) {
         history = loader.loadHistory();
+        this.solverSettings = Objects.requireNonNull(solverSettings, "solverSettings");
+        this.solverSettings.detailedPredicateMetrics = detailedPredicateMetrics;
         this.detailedPredicateMetrics = detailedPredicateMetrics;
         this.predicateSolvingMode = Objects.requireNonNull(
-                predicateSolvingMode, "predicateSolvingMode");
-        this.pruningMode = Objects.requireNonNull(pruningMode, "pruningMode");
+                solverSettings.predicateSolvingMode, "predicateSolvingMode");
+        this.pruningMode = Objects.requireNonNull(solverSettings.pruningMode, "pruningMode");
+        this.serPropagationMode = Objects.requireNonNull(
+                solverSettings.serPropagationMode, "serPropagationMode");
         System.err.printf("Sessions count: %d\nTransactions count: %d\nEvents count: %d\n",
                 history.getClientSessions().size(), history.getClientTransactions().size(), history.getEvents().size());
     }
 
-    public boolean audit() {
+    public AuditResult audit() {
         var profiler = Profiler.getInstance();
+        long checkerStartedNanos = System.nanoTime();
 
         profiler.startTick("ONESHOT_CONS");
         profiler.startTick("SER_VERIFY_INT");
         boolean satisfy_int = Utils.verifyInternalConsistency(history);
         profiler.endTick("SER_VERIFY_INT");
         if (!satisfy_int) {
-            return false;
+            return AuditResult.REJECT;
         }
 
         profiler.startTick("SER_GEN_PREC_GRAPH");
         var graph = new KnownGraph<>(history);
+        var precedence = createPrecedenceOracle(history);
+        var reachabilityPruning = new Pruning<KeyType, ValueType>(precedence);
         profiler.endTick("SER_GEN_PREC_GRAPH");
         System.err.printf("Mandatory known precedence edges: %d\n",
                 graph.getKnownGraphA().edges().size() + graph.getKnownGraphB().edges().size());
 
-        // ===== SER MODE (Snapshot Isolation with predicates) =====
-        // SER path: solve one strict total arbitration order (AR). Known
-        // precedence and WW/RW choices are encoded as AR constraints; predicate
-        // reads are encoded directly in SAT instead of trusting materialized
-        // PR_* graph edges.
-        System.err.printf("Mode: SER, solving strict total AR with SAT predicate constraints\n");
+        // ===== SER MODE (logical dependencies -> serialization graph) =====
+        // Typed SO/WR/WW/RW/PR_WR/PR_RW metadata remains in Java; MonoSAT sees
+        // one endpoint-only serialization constraint graph.
+        System.err.println("Mode: SER, solving serialization constraint graph with logical dependency metadata");
 
         profiler.startTick("SER_GEN_CONSTRAINTS");
         var constraints = generateConstraintsSER(history, graph);
         profiler.endTick("SER_GEN_CONSTRAINTS");
-        System.err.printf("Unresolved WW choices: %d\nConditional AR implications: %d\n", constraints.size(),
-                constraints.stream().map(c -> c.getEdges1().size() + c.getEdges2().size()).reduce(0, Integer::sum));
+        System.err.printf("Unresolved WW choices: %d\n", constraints.size());
 
         if (compareDerivedPredicateEdges) {
             profiler.startTick("SER_DERIVED_PREDICATE_COMPARE");
@@ -146,24 +247,31 @@ public class SERVerifier<KeyType, ValueType> {
                     countEdgesOfType(derivedPredicateGraph.getKnownGraphB(), EdgeType.PR_RW));
         }
 
+        int wwInitialConstraints = constraints.size();
+        profiler.addCount("WW_INITIAL_CHOICES", wwInitialConstraints);
         boolean pruningRejected;
-        switch (pruningMode) {
-        case NONE:
-            pruningRejected = false;
-            break;
-        case PRUN:
-            pruningRejected = Prun.prune(
-                    history, graph, constraints).inconsistent;
-            break;
-        case SNAPSHOT:
-            pruningRejected = Prun.pruneSnapshotOnly(
-                    history, graph, constraints).inconsistent;
-            break;
-        case REACHABILITY:
-        default:
-            pruningRejected = Pruning.pruneConstraints(graph, constraints, history);
-            break;
+        profiler.startTick("WW_REACHABILITY_PRUNE_MS");
+        try {
+            switch (pruningMode) {
+            case NONE:
+                pruningRejected = false;
+                break;
+            case REACHABILITY:
+                pruningRejected = reachabilityPruning.pruneConstraints(
+                        graph, constraints);
+                break;
+            case SNAPSHOT:
+            case PRUN:
+            default:
+                throw new IllegalArgumentException(
+                        "audit supports only NONE or REACHABILITY WW pruning");
+            }
+        } finally {
+            profiler.endTick("WW_REACHABILITY_PRUNE_MS");
         }
+        profiler.addCount("WW_REACHABILITY_FORCED",
+                wwInitialConstraints - constraints.size());
+        profiler.addCount("WW_AFTER_REACHABILITY", constraints.size());
 
         if (pruningRejected) {
             profiler.endTick("ONESHOT_CONS");
@@ -172,8 +280,9 @@ public class SERVerifier<KeyType, ValueType> {
                     : Pair.<Collection<Pair<com.google.common.graph.EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>,
                             Collection<SERConstraint<KeyType, ValueType>>>of(
                                     Collections.emptyList(), Collections.emptyList());
-            emitRejectDiagnostics(graph, constraints, conflicts);
-            return false;
+            emitRejectDiagnostics(
+                    graph, constraints, conflicts, Collections.emptyList());
+            return AuditResult.REJECT;
         }
         profiler.endTick("ONESHOT_CONS");
 
@@ -182,25 +291,51 @@ public class SERVerifier<KeyType, ValueType> {
         profiler.startTick("SER_AR_ENCODE");
         try {
             solver = new SERSolverAR<>(history, graph, constraints,
-                    true, detailedPredicateMetrics, predicateSolvingMode);
+                    true, detailedPredicateMetrics, solverSettings, precedence);
         } finally {
             profiler.endTick("SER_AR_ENCODE");
         }
+        System.err.printf("Predicate source constraints: %d\n",
+                solver.getPredicateSourceConstraintCount());
 
         profiler.startTick("SER_AR_SOLVE");
-        boolean accepted;
+        SolveStatus status;
         try {
-            accepted = solver.solve();
+            status = solver.solve();
         } finally {
             profiler.endTick("SER_AR_SOLVE");
         }
         profiler.endTick("ONESHOT_SOLVE");
 
-        if (!accepted) {
-            emitRejectDiagnostics(graph, constraints, solver.getConflicts());
+        if (status == SolveStatus.TIMEOUT) {
+            printTimeoutTimes(checkerStartedNanos);
+            return AuditResult.TIMEOUT;
         }
+        if (status == SolveStatus.UNSAT) {
+            emitRejectDiagnostics(
+                    graph, constraints, solver.getConflicts(),
+                    solver.getConflictReasons());
+            return AuditResult.REJECT;
+        }
+        return AuditResult.ACCEPT;
+    }
 
-        return accepted;
+    private void printTimeoutTimes(long checkerStartedNanos) {
+        var profiler = Profiler.getInstance();
+        System.err.printf(
+                "[SER] timeout-scope=solver checker_ms=%d encode_ms=%s solve_ms=%s monosat_ms=%s%n",
+                (System.nanoTime() - checkerStartedNanos) / 1_000_000L,
+                metricOrDash(profiler, "SER_AR_ENCODE"),
+                metricOrDash(profiler, "SER_AR_SOLVE"),
+                metricOrDash(profiler, "SER_MONOSAT_SOLVE"));
+    }
+
+    private static String metricOrDash(Profiler profiler, String tag) {
+        try {
+            return Long.toString(profiler.getTime(tag));
+        } catch (RuntimeException ignored) {
+            return "-";
+        }
     }
 
     public ConstraintStats analyzeConstraintsOnly() {
@@ -209,6 +344,8 @@ public class SERVerifier<KeyType, ValueType> {
         }
 
         var graph = new KnownGraph<>(history);
+        var precedence = createPrecedenceOracle(history);
+        var reachabilityPruning = new Pruning<KeyType, ValueType>(precedence);
         var constraints = generateConstraintsSER(history, graph);
         int constraintsBefore = constraints.size();
         int implicationsBefore = countConstraintImplications(constraints);
@@ -218,17 +355,15 @@ public class SERVerifier<KeyType, ValueType> {
         case NONE:
             pruningInconsistent = false;
             break;
-        case PRUN:
-            pruningInconsistent = Prun.prune(history, graph, constraints).inconsistent;
+        case REACHABILITY:
+            pruningInconsistent = reachabilityPruning.pruneConstraints(
+                    graph, constraints);
             break;
         case SNAPSHOT:
-            pruningInconsistent = Prun.pruneSnapshotOnly(
-                    history, graph, constraints).inconsistent;
-            break;
-        case REACHABILITY:
+        case PRUN:
         default:
-            pruningInconsistent = Pruning.pruneConstraints(graph, constraints, history);
-            break;
+            throw new IllegalArgumentException(
+                    "constraint analysis supports only NONE or REACHABILITY WW pruning");
         }
 
         return new ConstraintStats(
@@ -248,14 +383,21 @@ public class SERVerifier<KeyType, ValueType> {
                 .sum();
     }
 
+    static <KeyType, ValueType> PrecedenceOracle<Transaction<KeyType, ValueType>>
+            createPrecedenceOracle(History<KeyType, ValueType> history) {
+        return new PrecedenceOracle<>(history.getTransactions());
+    }
+
     private void emitRejectDiagnostics(
             KnownGraph<KeyType, ValueType> graph,
             Collection<SERConstraint<KeyType, ValueType>> constraints,
             Pair<Collection<Pair<com.google.common.graph.EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>,
-                    Collection<SERConstraint<KeyType, ValueType>>> conflicts) {
+                    Collection<SERConstraint<KeyType, ValueType>>> conflicts,
+            Collection<SERSolverAR.AssumptionReason<KeyType, ValueType>> conflictReasons) {
         var txns = conflictTransactions(conflicts);
         var cycleWitness = buildCycleWitness(graph, constraints, txns);
-        printRejectReason(graph, constraints, conflicts, cycleWitness);
+        printRejectReason(
+                graph, constraints, conflicts, conflictReasons, cycleWitness);
 
         if (dotOutput) {
             cycleWitness.ifPresent(cycle -> System.err.print(formatCycleWitness(cycle)));
@@ -295,21 +437,29 @@ public class SERVerifier<KeyType, ValueType> {
             Collection<SERConstraint<KeyType, ValueType>> constraints,
             Pair<Collection<Pair<com.google.common.graph.EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>,
                     Collection<SERConstraint<KeyType, ValueType>>> conflicts,
+            Collection<SERSolverAR.AssumptionReason<KeyType, ValueType>> conflictReasons,
             Optional<List<CycleEdge<KeyType, ValueType>>> cycleWitness) {
         int knownEdges = graph.getKnownGraphA().edges().size() + graph.getKnownGraphB().edges().size();
-        int conditionalEdges = constraints.stream()
-                .map(c -> c.getEdges1().size() + c.getEdges2().size())
-                .reduce(0, Integer::sum);
-        System.err.println("[SER] Reject reason: strict total AR constraints are UNSAT.");
+        System.err.println("[SER] Reject reason: Adya typed dependency constraints are UNSAT.");
         System.err.printf(
-                "[SER] Diagnostic counts: knownEdges=%d, unresolvedWWChoices=%d, conditionalARImplications=%d, predicateReads=%d\n",
-                knownEdges, constraints.size(), conditionalEdges, graph.getPredicateObservations().size());
+                "[SER] Diagnostic counts: knownEdges=%d, unresolvedWWChoices=%d, predicateReads=%d\n",
+                knownEdges, constraints.size(), graph.getPredicateObservations().size());
         cycleWitness.ifPresentOrElse(
                 cycle -> System.err.printf("[SER] Cycle witness: %d edges explain the contradiction.\n", cycle.size()),
                 () -> System.err.println("[SER] Cycle witness: not available from current mandatory/forced edges."));
 
-        if (conflicts.getLeft().isEmpty() && conflicts.getRight().isEmpty()) {
-            System.err.println("[SER] No compact conflict core was extracted; the contradiction may come from SAT-derived RW or predicate-visibility constraints.");
+        if (!conflictReasons.isEmpty()) {
+            System.err.printf("[SER] Conflict clause: %s%n",
+                    conflictReasons.stream()
+                            .map(reason -> "!" + reason.assumptionId())
+                            .collect(Collectors.joining(" | ")));
+            System.err.println("[SER]   |");
+            for (var reason : conflictReasons) {
+                System.err.printf("[SER]   +-- %s [%s] %s%n",
+                        reason.assumptionId(), reason.getKind(), reason.getReason());
+            }
+        } else if (conflicts.getLeft().isEmpty() && conflicts.getRight().isEmpty()) {
+            System.err.println("[SER] No assumption conflict clause was produced; the contradiction is in deterministic graph or pruning facts.");
         } else {
             System.err.printf("[SER] Conflict core: knownEdges=%d, wwChoices=%d\n",
                     conflicts.getLeft().size(), conflicts.getRight().size());
@@ -1221,6 +1371,9 @@ public class SERVerifier<KeyType, ValueType> {
             KnownGraph.WriteRef<KeyType, ValueType> writeRef,
             Event<KeyType, ValueType> predicateReadEvent) {
         var ev = writeRef.getEvent();
+        if (ev.getValue() == null) {
+            return false;
+        }
         var predicate = predicateReadEvent.getPredicate();
         var relations = predicate.scope().relations();
         try {

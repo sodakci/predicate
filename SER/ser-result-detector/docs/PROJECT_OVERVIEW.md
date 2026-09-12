@@ -1,1226 +1,669 @@
-# SER 项目介绍
+# SER 项目概览：逻辑依赖与串行化约束图
 
-本文档面向第一次接触本项目的人，说明 SER detector 的整体框架、核心流程、主要模块和关键文件。日常运行命令见 `SER/README.md`。
+本文档说明当前代码如何保留 Adya typed logical dependency，并将其投影到唯一的 MonoSAT serialization constraint graph：
 
-## 项目定位
+1. `SO/WR/WW/RW/PR_WR/PR_RW` 的 type/key/guard 元数据在哪一层保留。
+2. 逻辑依赖如何转换成 serialization order 约束。
+3. MonoSAT 为何只需要一张 endpoint-only `serializationGraph`。
 
-SER detector 是一个谓词感知的可串行化结果检测器。它的输入是一段事务历史，输出是：
+日常构建和运行命令见 `SER/README.md`，WW/RW pruning 细节见 `docs/prunning.md`。
+
+## 1. 先给出结论
+
+当前实现有三层对象，必须分开理解：
+
+| 层次 | 对象 | 是否保留 type/key | 合并规则 |
+| --- | --- | --- | --- |
+| 语义 witness 层 | `SEREdge(from,to,type,key)` | 保留 | 完全相同的 witness/guard 去重 |
+| 谓词物理边层 | 合并后的 predicate `SEREdge` | 保留 type，并保留全部 keys | 相同 `(from,to,type)` 合并，guard 取 OR |
+| MonoSAT native 图层 | `serializationGraph` 中的 theory edge | 不携带 type/key | 默认相同 `(from,to)` 共用一条 serialization edge |
+
+所以，用户给出的两个例子对应两个不同层次：
+
+```text
+(a,b,PR_WR,k1) + (a,b,PR_WR,k2)
+```
+
+在谓词物理边层会合并为：
+
+```text
+(a,b,PR_WR,{k1,k2})
+guard = guard(k1) OR guard(k2)
+```
+
+这是“相同类型、相同方向、不同 key”的平行 witness 合并。
+
+而：
+
+```text
+(a,b,PR_WR,k1) + (a,b,WR,k1)
+```
+
+不会在语义层或谓词合并层被改写成同一种依赖。Java 层仍分别保留 `PR_WR` 和 `WR`；它们只在投影到 `serializationGraph` 时可共用同一条 `(a,b)` native edge，因为无环性只取决于端点和方向。该行为由 `--[no-]graph-edge-interning` 控制。
+
+因此准确答案不是二选一，而是：
+
+- 谓词 witness coalescing 做的是第一个例子。
+- MonoSAT graph-edge interning 在更低一层也会让第二个例子的两条语义边共用同一条 native edge。
+- 第二种情况不是把 `PR_WR` 的语义“变成”`WR`，也不是删除谓词读约束；只是把相同方向的图论邻接关系复用。
+- 上述两层物理合并不会删除一条能带来新端点方向或新可达关系的 Adya 边。被复用的是对判环没有额外作用的同向平行边。
+
+## 2. 项目判定目标
+
+SER detector 读取一段 PRHIST 事务历史，判断是否存在一个能够解释全部点读、写和谓词读的串行执行。输出为：
 
 ```text
 [[[[ ACCEPT ]]]]
-```
-
-或：
-
-```text
 [[[[ REJECT ]]]]
+[[[[ TIMEOUT ]]]]
 ```
 
-含义如下：
-
-- `ACCEPT`：存在某个事务串行顺序，可以解释所有点读、写入和谓词读。
-- `REJECT`：不存在这样的串行顺序，历史在当前模型下不可串行化。
-
-与只检查点读写的检测器不同，本项目把谓词读也放进求解模型。谓词读不仅要求“结果里有哪些行”正确，还要求“结果外的行为什么没有出现”也能被某个串行顺序解释。
-
-## 核心判定目标
-
-检测器要回答的问题不是“输入记录的提交顺序是否串行”，而是：
-
-> 是否存在一个覆盖全部已提交客户端事务的严格事务顺序 `AR`，使每个点读和谓词读都恰好等于在该顺序中执行到读事务时能够看到的数据库状态？
-
-初始状态被建模为特殊 bottom transaction `T⊥`。`T⊥` 不进入真实事务的 MonoSAT AR graph，但在顺序比较中固定满足：
+当前实现使用定理 33 对应的 Adya 风格依赖关系：
 
 ```text
-T⊥ <AR T       对任意真实事务 T
-T <AR T⊥       恒为 false
+D = SO ∪ WR ∪ WW ∪ RW ∪ PR_WR ∪ PR_RW
 ```
 
-对真实事务，合法解释必须同时满足：
-
-1. `AR` 是严格顺序：无自环、无环；公式实际比较到的事务对必须二选一。
-2. `AR` 尊重 session order：同一 session 先出现的事务必须在后出现的事务之前。
-3. `AR` 尊重点读来源：写出被读版本的事务必须在 reader 之前。
-4. 同一 key 的不同写事务在 `AR` 中形成唯一先后顺序。
-5. 点读读到的版本必须是 reader 之前该 key 的最新可观察版本。
-6. 谓词读必须能从 reader 之前每个相关 key 的 latest-visible frontier 组成一个可见状态；执行结构化查询后，`inputs` 和投影后的 `values` 必须与历史完全一致。
-
-因此最终 verdict 可以写成：
+对某个 SAT 模型，所有被 guard 激活的关系组成依赖图 `D`。合法结果要求：
 
 ```text
-ACCEPT
-    ⇔ 存在满足上述全部条件的 AR
-
-REJECT
-    ⇔ 内部一致性已直接矛盾
-       或已知依赖/被迫 WW 分支形成环
-       或 SAT 中不存在能解释所有点读和谓词读的 AR
+acyclic(D)
 ```
 
-## 总体框架
+其中代码中的 `PR_WR`、`PR_RW` 分别对应论文记号 `Pred-WR`、`Pred-RW`。
+
+### 2.1 六类边
+
+设 `A/B/C` 为事务，`k` 为 key：
+
+| 类型 | 方向 | 当前实现中的含义 |
+| --- | --- | --- |
+| `SO(A,B)` | `A -> B` | 同一 session 中 `A` 先于 `B` |
+| `WR(A,B,k)` | `A -> B` | `B` 的点读读取了 `A` 写出的 `k` 版本 |
+| `WW(A,C,k)` | `A -> C` | 对同一 key 的两个 writer，选择 `A` 的版本先于 `C` |
+| `RW(B,C,k)` | `B -> C` | `B` 读自 `A`，且 `A ->WW C`，因此 `C` 必须位于 `B` 后面 |
+| `PR_WR(A,B,k)` | `A -> B` | `A` 是谓词读 `B` 在 `k` 上的 latest-visible source |
+| `PR_RW(B,C,k)` | `B -> C` | `C` 位于谓词 source 之后，且 `C` 会改变该谓词 observation |
+
+逻辑层不是只有 `AR` 边，也不是只检查 `knownGraphA`。`knownGraphA` 与 `knownGraphB` 只是构建期分区：
 
 ```text
-PRHIST history
-  -> PredicateHistoryLoader
-  -> History / Session / Transaction / Event
-  -> KnownGraph
-       fixed SO / WR edges
-       read-from index
-       write index
-       predicate observations
-  -> SERVerifier
-       internal consistency
-       unresolved WW choices
-       pruning
-       optional coalescing
-  -> SERSolverAR
-       SAT literals over arbitration order
-       WW / RW / predicate visibility constraints
-       MonoSAT acyclicity
-  -> ACCEPT / REJECT
+knownGraphA: SO, WR, WW, PR_WR
+knownGraphB: RW, PR_RW
+
+logicalDependencies = active(knownGraphA ∪ knownGraphB ∪ 动态依赖)
 ```
 
-项目核心思想是：不要先枚举所有可能串行顺序，而是把公式实际需要判断的“事务 A 是否在事务 B 之前”编码成 SAT literal。MonoSAT 负责维护被选择的 arbitration graph 必须无环；如果公式可满足，就说明有一个可扩展成串行顺序的偏序。
+## 3. 当前代码中的唯一 MonoSAT 图
 
-完整控制流程与 `SERVerifier.audit()` 一致：
+`SERSolverAR` 只建立一张物理图：
 
 ```text
-load PRHIST
-  |
-  v
-verifyInternalConsistency
-  | false
-  +---------------------------> REJECT
-  |
-  v
-KnownGraph(SO, WR, writes, predicate observations)
-  |
-  v
-generate WW choices and ordinary RW implications
-  |
-  v
-prune branches that immediately close a cycle
-  | both branches impossible
-  +---------------------------> REJECT
-  |
-  v
-build SERSolverAR
-  - mandatory known order
-  - remaining WW/RW choices
-  - predicate frontier constraints
-  - AR acyclicity
-  |
-  v
-solve one SAT model
-  | UNSAT
-  +---------------------------> REJECT
-  |
-  v
-evaluate full-query predicate snapshots
-  | mismatch: add no-good clause and solve again
-  |
-  + no mismatch ----------------> ACCEPT
+serializationGraph    endpoint-only serialization constraints
 ```
 
-## 输入模型
-
-当前活跃输入类型是 `PRHIST`。命令行入口 `audit` 默认使用它：
-
-```bash
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit /path/to/hist-00000
-```
-
-`hist-00000` 至少包含：
+最终公式只断言：
 
 ```text
-initial_state.json
-history.prhist.jsonl
-manifest.json
+serializationGraph.acyclic()
 ```
 
-Java loader 实际读取前两个文件。`manifest.json` 是生成器和实验脚本使用的元数据。
-
-### 初始版本
-
-`initial_state.json` 是 JSON 数组：
-
-```json
-[
-  {"key": "kv:0", "value": 0},
-  {"key": "kv:1", "value": 1}
-]
-```
-
-loader 会把它变成内部初始事务：
+每条激活的逻辑依赖都满足：
 
 ```text
-session = -1
-txn     = -1
+guard(edge) -> serialization(edge.from, edge.to)
 ```
 
-这个 bottom transaction 写出每个 key 的初始版本。后续所有读都可以像读取普通事务写一样读取它。
-
-### 事务
-
-`history.prhist.jsonl` 每行是一个事务：
-
-```json
-{"session":0,"session_seq":1,"txn":1001,"status":"commit","ops":[{"type":"w","key":"kv:0","value":10}]}
-```
-
-当前 loader 要求：
-
-- `status` 必须是 `commit`。
-- `session` 和 `txn` 是整数。
-- `ops` 是操作数组。
-- 事务 id 全局唯一。
-
-### 操作
-
-点读：
-
-```json
-{"type":"r","key":"kv:0","value":10}
-```
-
-写：
-
-```json
-{"type":"w","key":"kv:0","value":11}
-```
-
-谓词读：
-
-```json
-{
-  "type": "pr",
-  "query": {
-    "select": {"distinct": false, "columns": ["k", "value"]},
-    "from": {"relation": "kv"},
-    "where": ["value < 10"]
-  },
-  "result": {
-    "values": [{"k": "0", "value": 0}],
-    "inputs": [{"key": "kv:0", "value": 0}]
-  }
-}
-```
-
-当前 `PredicateHistoryLoader` 把结构化 `query` 编译为 `QueryPlan`：
-
-```text
-from
-    一个必填 relation，可带 alias。
-
-joins
-    零个或多个 INNER JOIN，每个 join 带 on 条件。
-
-where
-    可选条件数组，数组元素按 AND 连接。
-
-select.columns
-    一个或多个字段路径或带 AS 的表达式。
-
-select.distinct
-    可选布尔值，默认 false。
-```
-
-表达式支持字段路径、整数/字符串/布尔/null 字面量、`=`、`>`、`<`、`%`、`AND` 和括号。单表 KV 的 `value < 10` 等条件是该结构化查询的简单子集；多关系对象值可以使用 `alias.value.field` 访问。
-
-`result.inputs` 是本次谓词读结果实际依赖的可见版本集合。检测器用这些 `(key,value)` 找到对应 source write；`result.values` 保存投影后的业务结果，并按多重集匹配。结构化结果只做相等性比较，`<`、`>` 只接受可排序的标量。
-
-## 核心概念
-
-### Session Order
-
-同一个 client/session 中的事务按出现顺序形成 session order，简称 SO。SO 是强制依赖边：
-
-```text
-T1 --SO--> T2
-```
-
-### Write-Read
-
-如果事务 `T2` 点读了 key `x` 的版本，而这个版本由 `T1` 写出，则形成 WR：
-
-```text
-T1 --WR(x)--> T2
-```
-
-WR 也是强制依赖边。
-
-### Write-Write Choice
-
-同一个 key 上的两个不同事务写入，如果历史本身没有决定谁先谁后，检测器会生成二选一的 WW choice：
-
-```text
-T1 --WW(x)--> T2
-或
-T2 --WW(x)--> T1
-```
-
-当这个事务对首次进入公式时，`ensureComparable` 会用互斥的两个 AR 方向保证二选一。选择某个方向后，还会激活对应的 RW implications；如果已知序已经确定方向，则直接使用常量，不再创建选择变量。
-
-### Read-Write
-
-普通点读的 RW 可以从 WR 和 WW 关系推出：
-
-```text
-Tsource --WR(x)--> Treader
-Tsource --WW(x)--> Twriter
---------------------------------
-Treader --RW(x)--> Twriter
-```
-
-直觉是：如果 reader 读到的是 source 写出的版本，而另一个 writer 写在 source 后面，那么 reader 必须排在这个后续 writer 前面，否则它应该看到后续版本。
-
-### Predicate Frontier
-
-谓词读不能只看结果集合中的 key。对于谓词读事务 `S` 和每个 key `x`，检测器定义：
-
-```text
-frontier_x(S) = S 之前在 arbitration order 中对 x 的最新可见写
-```
-
-谓词读约束检查这个 frontier 的行是否满足谓词，以及是否与 `result.inputs` 一致。
-
-谓词相关依赖可理解为：
-
-```text
-PR_WR(T, S, x)
-    T 是 frontier_x(S) 的写事务。
-
-PR_RW(S, U, x)
-    U 在 frontier_x(S) 后面又写了 x，
-    且 U 的写会改变该 key 在谓词结果中的成员关系或结果值。
-```
-
-当前实现不会把所有 PR_WR / PR_RW 预先物化成固定边再求解，而是在 SAT 中直接编码谓词可见性。`--compare-derived-predicate-edges` 只用于诊断对比。
-
-谓词 observation 还按 key 区分：
-
-- `EXTERNAL`：需要在 AR 中选择事务外部的 latest-visible frontier。
-- `INTERNAL`：当前谓词读之前，本事务已经写过该 key，或更早谓词读已经覆盖该 key；主求解不再为它新建外部 frontier，而是使用最后本地写或当前记录的内部输入。相同谓词继承和本地写矛盾由内部一致性预检负责。
-
-对于单表 `Scan/Filter`、`distinct=false` 且投影表达式也只依赖单行的 `QueryPlan`，结果是各行贡献的 bag union，求解器会使用 row-local 快路径逐 key 编码。`JOIN`、`DISTINCT` 和自定义非逐行 AST 继续使用完整快照求值。
-
-### 内部一致性预检
-
-`SERVerifier.audit()` 在构造 `KnownGraph` 和启动 MonoSAT 前调用 `Utils.verifyInternalConsistency(history)`。该预检只处理能由历史记录和事务内 program order 直接确定的矛盾；返回 `false` 时 audit 立即 `REJECT`，不会进入 pruning 或 SAT/AR 求解。
-
-对当前紧凑 PRHIST，预检使用两类有效索引：
-
-```text
-writesByKeyValue
-    (key,value) -> 候选写事件列表。
-
-txnWrites
-    (transaction,key) -> 该事务对 key 的写事件下标列表。
-```
-
-当前 `PredicateHistoryLoader` 拒绝 `write_id`、`source_write_id`、`source_txn` 和 `source_op_index`，`Utils.verifyInternalConsistency` 也不再保留按 id 查找的兼容分支。点读和谓词输入一律通过 `(key,value)` 反查来源写；找不到对应写或存在多个候选写都会失败。
-
-#### 点读规则
-
-对每个 `r(key,value)`：
-
-- 读到的 `(key,value)` 必须在整段历史中恰好对应一个写事件；不存在或对应多个写事件都会失败。
-- 来源在当前事务内时，不能来自读事件之后；读之前如果还有更晚的同 key 本地写，读取旧本地版本会失败。
-- 来源在其他事务时，必须是来源事务对该 key 的最后一次写；当前事务在该点读之前不能已经写过同一 key，否则违反 read-your-writes。
-
-外部事务之间谁先谁后并不由预检决定，仍由后续 AR 求解。
-
-#### 谓词结果基础规则
-
-对每个 `pr`：
-
-- `predicate` 和结果集合不能为 null。
-- `result.inputs` 中同一个 key 只能出现一次。
-- 每个 `(key,value)` 必须能解析到唯一来源写，来源事务必须已提交，且 key 必须属于 query scope。
-- 外部来源必须是来源事务对该 key 的最后一次写；如果当前事务在谓词读之前已经写过该 key，则不能忽略该本地写而使用外部来源。
-- 内部来源必须是谓词读之前当前事务对该 key 的最后一次写，不能引用未来写或较旧本地写。
-- 如果事件同时保存了结构化 `recordedPredicateResult`，其 `inputs` 必须与解析后的 `result.inputs` 完全一致。
-
-这些检查确认输入版本的来源与事务内顺序合法；完整 JOIN、投影、`DISTINCT` 和 `result.values` 是否能由某个外部可见快照解释，仍由 `SERSolverAR` 校验。
-
-#### 相同谓词读与本地写规则
-
-预检按 `predicate.identity()` 在每个事务内分别跟踪最近一次相同谓词读。对 query scope 覆盖且历史中存在写版本的每个 key：
-
-- 若当前谓词读之前没有比前一次相同谓词读更新的本地写，当前结果必须逐 key 继承前一次结果；key 的存在性和值都不能改变。
-- 若当前谓词读之前存在更新的本地写，则以 program order 中最后一次本地写为准。检测器在单行本地状态上求值：该写满足谓词时，结果必须包含相同 key/value；不满足时，结果不得包含该 key。
-- 第一次谓词读之前已有本地写时，同样由最后一次本地写决定结果，不需要先有前一次谓词读。
-- 没有本地写且没有前一次相同谓词读作为依据的 key 属于外部可见性问题，预检不猜测其版本，交给 VIS/AR frontier 求解。
-
-因此预检拒绝的是事务自身已经能证明的矛盾，例如读未来本地写、忽略最新本地写、重复谓词 key、相同谓词无中间写却改变结果；外部版本选择和完整关系查询结果不在此阶段提前固定。
-
-## 核心流程
-
-### 1. 命令行解析
-
-文件：
-
-```text
-src/main/java/Main.java
-```
-
-`picocli` 定义了三个子命令：
-
-- `audit`：验证历史并输出 ACCEPT/REJECT。
-- `stat`：打印历史规模。
-- `dump`：打印解析后的事务和事件。
-
-`audit` 会设置 pruning、coalescing、DOT 输出、诊断参数，然后创建 `SERVerifier`。
-
-### 2. 加载 PRHIST
-
-文件：
-
-```text
-src/main/java/history/loaders/PredicateHistoryLoader.java
-```
-
-职责：
-
-- 识别输入是目录还是 `history.prhist.jsonl` 文件。
-- 加载相邻的 `initial_state.json`。
-- 创建内部 bottom transaction。
-- 把 JSONL 事务转换为 `History`、`Session`、`Transaction`、`Event`。
-- 校验 commit status、操作字段、谓词格式和 value 类型。
-
-当前 loader 不接受显式 source provenance；检测器只通过唯一 `(key,value)` 写版本解析读来源。因此生成器必须保证写版本唯一。
-
-### 3. 内部历史结构
-
-关键文件：
-
-```text
-src/main/java/history/History.java
-src/main/java/history/Session.java
-src/main/java/history/Transaction.java
-src/main/java/history/Event.java
-```
-
-内部对象关系：
+`WR/WW/RW/PR_WR/PR_RW` 的 type/key/guard 留在 logical dependency layer，用于 explanation、debugging 和 paper description；MonoSAT 只维护 `serializationGraph`。
 
 ```text
 History
-  -> Session
-     -> Transaction
-        -> Event
+  -> Logical Dependency Layer
+  -> Serialization Constraint Graph
+  -> MonoSAT acyclic
 ```
 
-`Event` 有三类：
-
-- `READ`
-- `WRITE`
-- `PREDICATE_READ`
-
-`PREDICATE_READ` 不绑定单个 key，而是保存一个谓词求值函数和本次观察到的结果版本集合。
-
-### 4. 构造 KnownGraph
-
-文件：
+初始状态事务 `T⊥` 不建立 MonoSAT 节点。顺序比较直接返回常量：
 
 ```text
-src/main/java/graph/KnownGraph.java
+T⊥ < T    = true
+T < T⊥    = false
 ```
 
-`KnownGraph` 把不需要 SAT 猜测的信息整理为已知依赖和索引。
+因此 bottom 写仍参与版本来源和 frontier 语义，但不会向真实事务图增加一个普通节点。
 
-#### 4.1 建立 SO
+## 4. “OR 序列”到底指什么
 
-对每个 session，按事务出现顺序只加入相邻 SO 边：
+当前代码中没有名为 `OR` 的第三种 Adya 依赖关系。这个说法可能指两种对象，影响也不同。
+
+### 4.1 如果 OR 指 order/AR 顺序
+
+本文统一称为 serialization order。它会影响哪些条件依赖被激活，并承载所有激活依赖的端点方向。
+
+它的影响包括：
+
+1. 决定同 key writer 的 `WW` 方向。
+2. WW decision 分支同时激活该方向的 `WW` 和由固定 `WR` 产生的普通 `RW`。
+3. 决定谓词读之前哪些 writer 可见，以及哪个 writer 是 AR-max frontier。
+4. 决定对应 `PR_WR/PR_RW` guard 是否成立。
+5. 要求每条已经激活的 typed dependency 与同一个 order 方向一致。
+
+它不做的事情是：
+
+- 不因为两个原本无依赖的事务在某个拓扑序中有先后，就凭空生成 Adya 边。
+- 不预先构造完整的 `n(n-1)` 全序边集。
+
+`orderLiteral(A,B)` 只在公式确实需要比较 `A/B` 时调用。对尚未由已知闭包确定方向的事务对，`ensureComparable` 加入：
 
 ```text
-T1 ->SO T2 ->SO T3
+order(A,B) XOR order(B,A)
 ```
 
-不必显式加入 `T1 -> T3`，后续 `KnownOrder` 会计算传递闭包。
+再由 `serializationGraph.acyclic()` 保证这些局部选择能够共同扩展成严格全序。已知依赖先计算闭包；已知顺序只物化传递约简边，闭包中已经确定的比较直接返回 `true/false`。
 
-#### 4.2 解析点读并建立 WR
+结论是：逻辑层保留 typed dependency 语义，物理层只检查其 serialization endpoint 约束。
 
-当前 PRHIST 没有 source id。对于 `r(x,v)`，通过唯一 `(x,v)` 找到写事件 `w`：
+### 4.2 如果 OR 指逻辑 OR 子句
+
+逻辑 OR 主要出现在两处：
+
+- 多个谓词 witness 合并时，物理边 guard 为所有 witness guard 的 OR。
+- GMWR/EAGER 的结果合法性约束中，用 OR 表达“bad writer 在 reader 后，或者存在一个更晚的 good writer 覆盖它”等替代方案。
+
+OR 子句会影响哪个候选模型、哪个 guarded dependency 能被激活，但不会修改依赖类型。例如 `PR_WR` 不会因为与 `WR` 共用端点就被重新标成 `WR`。
+
+## 5. 求解核心：分阶段 MonoSAT/typeedge 编码与 Adya 图构建
+
+当前主流程是：
 
 ```text
-w 属于事务 Tw，读属于事务 Tr
-
-Tw != Tr  =>  Tw ->WR(x) Tr
-Tw == Tr  =>  不建立跨事务 WR；事务内合法性已由预检确认
+PRHIST
+  -> PredicateHistoryLoader
+  -> History
+  -> verifyInternalConsistency
+  -> KnownGraph
+  -> generateConstraintsSER
+  -> WW reachability（默认；实验可设 NONE）
+  -> SERSolverAR
+       SETUP
+       KNOWN_EDGES
+       WW
+       RW
+       PREDICATE
+       DEPENDENCIES
+       TOTAL_ORDER
+  -> solve / predicate refinement
+  -> ACCEPT、REJECT 或 TIMEOUT
 ```
 
-`readFrom` 单独保存 WR，普通 RW 推导需要知道“reader 具体读自哪个 writer”；同一条 WR 同时进入 `knownGraphA`，成为强制 AR 方向。
+### 5.1 `KnownGraph`：收集确定事实
 
-#### 4.3 建立写索引
+`KnownGraph` 在加载后完成以下工作：
 
-每个写被保存为：
+- 为历史中的事务建立节点。
+- 对每个 session 只加入相邻事务的 `SO`；传递关系由图可达性表达。
+- 根据点读的 `(key,value)` 找到唯一 source write，建立 `WR`。
+- 建立 `readFrom`、全部 write、按 `(key,value)` 的 source 索引。
+- 保存谓词 observation，并按 key 区分 `EXTERNAL` 与 `INTERNAL`。
+
+`readFrom` 单独保留点读来源，是因为后续普通 `RW` 推导必须知道 reader 具体读自哪个 writer。
+
+### 5.2 `SERConstraint`：生成 WW 二选一和普通 RW implication
+
+对于写过同一 key 的事务 `A/C`，必须选择一个 WW 方向：
 
 ```text
-WriteRef = (transaction, write event, event index)
+branch 1: A ->WW C
+branch 2: C ->WW A
 ```
 
-`allWrites` 保存所有写，`writesByKeyValue` 用于来源解析，`txnWrites[(T,x)]` 保存事务 `T` 对 key `x` 的 program-order 写位置。`SERSolverAR` 还会从 `allWrites` 构造 `writesByKey[x]`，用于枚举同 key writer 和谓词 frontier。
-
-#### 4.4 收集并分类谓词 observation
-
-每个谓词事件被转换为：
+如果 `B` 从 `A` 读取这个 key，则选择 `A ->WW C` 时还会激活：
 
 ```text
-PredicateObservation
-  reader transaction
-  predicate event
-  event index in reader
-  result tuple -> source WriteRef
-  every covered key -> INTERNAL or EXTERNAL
+B ->RW C
 ```
 
-分类在同一事务内按事件顺序进行。对 query scope 覆盖的 key：
+默认 constraint coalescing 会让同一 writer 事务对跨 key 共用一个方向选择，因为全局串行顺序中不可能在 `k1` 上要求 `A<C`、同时在 `k2` 上要求 `C<A`。这里合并的是“选择变量”，分支内部的各个 `WW/RW/type/key` 边仍保留。
+
+pruning 只提前物化已经被已知可达性或 shared-snapshot 规则唯一决定的分支；未决分支继续进入 SAT。
+
+### 5.3 `SERSolverAR`：编码已知边、WW 和 RW
+
+构造器按以下顺序编码：
+
+| 阶段 | 方法 | 作用 |
+| --- | --- | --- |
+| SETUP | 构造函数前半段 | 建唯一 `serializationGraph`、写索引、传播状态和已知闭包 |
+| KNOWN_EDGES | `encodeKnownEdges` | 保留已知 typed metadata，并将已知顺序的传递约简加入 serialization graph |
+| WW/RW | `encodeRemainingWwChoices` | 每个残余 `SERConstraint` 建一个正反 WW decision literal，选中分支同时激活其 `WW` 和 `RW` |
+| PREDICATE | `encodePredicateConstraints` | 建 frontier、结果约束以及 guarded `PR_WR/PR_RW` |
+| DEPENDENCIES | `encodeDependencyEdges` | 保留 typed edge metadata，将其 guard 绑定到 serialization edge |
+| ACYCLIC | `encodeSerializationAcyclicity` | 对唯一 serialization graph 断言无环 |
+
+`encodeKnownTypedEdges` 会把 `SO/WR/WW/RW/PR_WR/PR_RW` 保留为 logical dependency metadata，它们的端点方向与已知顺序的传递约简共同进入 `serializationGraph`。
+
+Java checker侧的确定性precedence查询统一由 `PrecedenceOracle`提供：`before(a,b)`、`successor(a)`、`predecessor(b)`、`wouldCycle(a,b)`。`SERVerifier`为每次audit创建唯一实例，并通过constructor injection传给WW reachability、solver、GMWR propagation与GMWR-WW bridge；任一阶段加入deterministic fact后，所有阶段看到同一 `before relation`。MonoSAT的residual WW、frontier和order decision variables不进入oracle。
+
+### 5.4 谓词边如何产生
+
+对谓词读事务 `R` 和 external key `k`，统一 primitive `LatestVisibleChecker` 接收 `(reader, key, candidate writers, serialization order)`，返回每个候选 writer 的 visible literal 和 latest-writer validity。EAGER 直接传完整候选集；GMWR 先按已有 source/reachability/PR_RW-cycle/known interval 规则减少候选，再调用同一个 checker。
+
+候选 source `S` 的选择条件可以概括为：
 
 ```text
-INTERNAL
-    当前谓词读之前，本事务已经写过该 key；
-    或本事务更早的任意谓词读已经覆盖过该 key。
-
-EXTERNAL
-    当前读之前既没有本地写，也没有更早谓词 observation 覆盖该 key。
+selected(S,R,k)
+  = S 在 R 前可见
+    AND 不存在另一个在 S 后、同时仍位于 R 前的同 key writer
 ```
 
-`INTERNAL` 表示主求解不再为该 key 选择新的外部 frontier：有本地写时使用事件前最后本地写，否则使用当前谓词记录中已经解析的内部输入；相同谓词继承和本地写矛盾由 `verifyInternalConsistency` 检查。`EXTERNAL` 才需要在 AR 中选择外部可见 frontier。
-
-内部维护的主要索引：
+当 `S` 被选为 source 时：
 
 ```text
-readFrom
-    记录 WR 来源。
-
-knownGraphA
-    放 SO、WR、WW、PR_WR 等正向依赖。
-
-knownGraphB
-    放 RW、PR_RW 等反向依赖。
-
-writesByKeyValue
-    通过唯一 (key,value) 查写来源，是当前 PRHIST 的有效来源索引。
-
-allWrites
-    所有写版本。
-
-predicateObservations
-    每个谓词读及其结果版本来源。
+selected(S,R,k) -> PR_WR(S,R,k)
 ```
 
-当前紧凑 PRHIST 只走 `(key,value)` 唯一解析路径；`write_id/source_write_id/source_txn/source_op_index` 会被 loader 拒绝。
-
-### 5. 生成 SER 约束
-
-文件：
+对同 key 的另一个 writer `U`，若 `S ->WW U` 且 `U` 会改变记录的谓词 observation，则：
 
 ```text
-src/main/java/verifier/SERVerifier.java
+selected(S,R,k) AND beforeWrite(S,U)
+    -> PR_RW(R,U,k)
 ```
 
-主要步骤：
+这里的“改变 observation”由 `writeChangesPredicateResult` 判断：包括匹配/不匹配发生变化，以及两边都匹配但输入或投影贡献不同。不会改变谓词结果的写不产生额外 `PR_RW`。
 
-1. `Utils.verifyInternalConsistency(history)` 检查点读、写和上述事务内谓词继承/本地写一致性。
-2. 创建 `KnownGraph`。
-3. `generateConstraintsSER` 生成未定 WW choice 和对应 implications。
-4. `Pruning.pruneConstraints` 尝试把会立即形成环的分支剪掉。
-5. 创建 `SERSolverAR`。
-6. 求解 SAT。
-7. 若 UNSAT，输出冲突诊断和可选 cycle witness。
+row-local 查询可以逐 key 预编码。JOIN、DISTINCT 或其他 general query 会在 SAT 给出候选 frontier 后执行完整 `QueryPlan`；若模型结果与记录不一致，则加入 no-good 后继续求解。refinement 改变的是 frontier 组合的合法性，不会在模型验证阶段临时发明新的边类型。
 
-这里的 `SERConstraint` 表示一次写写顺序二选一：
+## 6. 边的收集、合并和最终物化
+
+### 6.1 语义对象：`SEREdge`
+
+编码期的边对象包含：
 
 ```text
-writeTransaction1 before writeTransaction2
-或
-writeTransaction2 before writeTransaction1
+from
+to
+type
+keys
 ```
 
-#### 5.1 WW 为什么必须二选一
+普通边初始通常只有一个 key。谓词 coalescing 后，同一个 `SEREdge` 可以保存多个 witness key。
 
-若事务 `A` 和 `C` 都写 key `x`，串行解释中只能有：
+非谓词依赖按同一个 guard 下的完整 `SEREdge` 去重。谓词依赖先用 `(from,to,type,key,guard identity)` 去掉完全重复的 witness，再进入 predicate candidate 队列。
+
+### 6.2 谓词 witness coalescing：按 `(from,to,type)`
+
+`prunePredicateDependencies` 的分组键明确包含 `type`：
 
 ```text
-A <AR C    对应 WW(A,C,x)
+PredicateTransactionEdgeKey = (from, to, type)
 ```
 
-或：
+因此：
 
 ```text
-C <AR A    对应 WW(C,A,x)
+(a,b,PR_WR,k1,g1)
+(a,b,PR_WR,k2,g2)
 ```
 
-`SERConstraint` 的 `edges1/edges2` 分别保存选择两个方向时必须同时激活的边。
-
-#### 5.2 普通 RW 如何保证读到最新版本
-
-假设 `B` 读取 `A` 写出的 `x`，即：
+会变成：
 
 ```text
-A ->WR(x) B
+edge  = (a,b,PR_WR,{k1,k2})
+guard = g1 OR g2
 ```
 
-另一个事务 `C` 也写 `x`。如果选择 `A <AR C`，为了让 `B` 仍读到 `A` 的版本，`B` 必须位于 `C` 之前：
+但：
 
 ```text
-A <AR C  =>  B <AR C
+(a,b,PR_WR,k1)
+(a,b,PR_RW,k1)
 ```
 
-代码把它记录为同一 WW 分支中的两条边：
+不会在这一层合并，因为 type 不同。`PR_WR` 与 `WR` 也不会在这一层合并，因为该过程只处理 predicate candidates，而且分组键仍包含 type。
+
+这个开关是 `--predicate-witness-coalescing`，当前默认开启，并不等同于 `--no-coalescing` 所控制的 WW constraint coalescing。
+
+### 6.3 Serialization graph-edge interning：按 `(from,to)`
+
+`encodeDependencyEdge` 最终把 typed edge 投影到 MonoSAT：
 
 ```text
-WW(A,C,x)
-RW(B,C,x)
+SEREdge(from,to,type,keys) -> serializationGraph.addEdge(fromNode,toNode)
 ```
 
-反方向 `C <AR A` 不需要 `B <AR C`，因为 `C` 的版本位于 `A` 之前，`B` 读取 `A` 仍然是合法的 latest-visible 结果。
-
-因此对每组 `A ->WR(x) B` 和第三方 writer `C`，核心公式是：
+默认开启 `graphEdgeInterning` 时，cache key 只有：
 
 ```text
-ar(A,C) -> ar(B,C)
+(from,to)
 ```
 
-这正是普通读“不能跨过一个更新版本仍读取旧值”的判断逻辑。
-
-#### 5.3 Coalescing
-
-默认开启 coalescing。同一事务对可能共同写多个 key，也可能由多个读产生重复 RW implication；检测器把相同事务对的方向选择合并为一个 `SERConstraint`：
+因此所有相同端点、相同方向的语义依赖会共用一条 MonoSAT theory edge，不论它们的 type 或 key 是否相同。每个原始 guard 仍分别蕴含这条共享 edge：
 
 ```text
-选择 A <AR C
-    同时激活该事务对在所有相关 key 上的 WW/RW 边
-
-选择 C <AR A
-    同时激活反方向对应的全部边
+g1 -> E(a,b)
+g2 -> E(a,b)
+...
 ```
 
-关闭 coalescing 只改变约束组织方式，不改变合法串行解释的集合。
-
-### 6. Pruning
-
-文件：
+这对可满足性等价于：
 
 ```text
-src/main/java/verifier/Pruning.java
+(g1 OR g2 OR ...) -> E(a,b)
 ```
 
-pruning 的目标是提前处理明显被迫的 WW choice。如果某个 choice 的反方向会让当前已知图立刻成环，则可以直接选择另一个方向。这样能减少进入 SAT 的待定分支数量。
+代码没有额外断言 `E(a,b) -> (g1 OR g2 OR ...)`。这不会产生错误的 ACCEPT：没有 witness 激活时，SAT 可以令 `E(a,b)=false`；无缘由地令它为 true 只会让无环约束更严格，不会帮助模型满足公式。
 
-pruning 不改变可满足性：它只提交那些反方向已经不可能成立的 choice。
+每条 Java 语义边及其 guard 仍记录在 `logicalDependenciesByEndpoint[(from,to)]` 中，其 `SEREdge` 可通过 `getLogicalDependencies()` 用于 explanation 和 debugging。MonoSAT native edge 自身不保存 type/key，论文描述中的依赖类型以该 logical layer 为准。
 
-对一个二选一约束 `C = (branch1, branch2)`：
+<a id="711-紧凑编码的设计范围与处理范围"></a>
+
+### 6.4 为什么这种“省边”不改变判环
+
+对一个 SAT 模型 `M`，定义激活的语义依赖：
 
 ```text
-canAdd(branch1) = false
-canAdd(branch2) = false
-    => 两边都成环，立即 REJECT
-
-canAdd(branch1) = false
-canAdd(branch2) = true
-    => branch2 被迫成立，写入 KnownGraph，移除 C
-
-canAdd(branch1) = true
-canAdd(branch2) = false
-    => branch1 被迫成立，写入 KnownGraph，移除 C
-
-两边都可加入
-    => 保留 C，交给 SAT
+D_M = {(u,v,type,key) | 对应 guard 在 M 中为 true}
 ```
 
-`ReachabilityOracle` 以当前 `knownGraphA + knownGraphB` 的传递闭包为基础判断新增边是否会闭环。被迫分支写回 KnownGraph 后会影响后续约束，所以 pruning 按轮执行；一轮解决的约束太少或已无剩余约束时停止。
-
-当前环检查不会为每个候选分支复制完整事务可达矩阵：
-
-- SER 常见的同目标 WW/RW 分支直接在基础传递闭包上逐边检查。
-- 混合目标分支只构造候选边端点的局部闭包图，同时保留经非端点事务形成环的判断。
-- 每轮是否继续按当前剩余约束数判断。
-
-### 7. SAT/AR 编码
-
-文件：
+MonoSAT 实际检查的是端点投影：
 
 ```text
-src/main/java/verifier/SERSolverAR.java
+π(D_M) = {(u,v) | 存在某个 type/key，使 (u,v,type,key) 属于 D_M}
 ```
 
-`SERSolverAR` 把可串行化问题编码成 SAT：
-
-- `ar(T1,T2)` literal 表示 `T1` 在 arbitration order 中早于 `T2`。
-- 已知 SO/WR/依赖序先计算传递闭包；已确定的 AR 方向直接常量化，MonoSAT 只接收传递约简边。
-- 每个公式可见的未定事务对通过 `ensureComparable` 保证两个 AR 方向恰选其一。
-- 普通 RW 由 WR 和 WW 顺序推出。
-- row-local 谓词逐 key 编码 recorded source 和未返回行约束；仅当后续写改变该行对谓词结果的成员关系或改变已匹配行的值时，才建立对应 `PR_RW`。
-- JOIN、DISTINCT 等通用谓词根据具体 SAT 模型构造完整可见快照；结果不匹配时加入该快照的 no-good 子句并继续求解。
-- MonoSAT graph acyclicity 保证被选择的 AR 边无环。
-
-实现细节：
-
-- AR graph 节点对应真实事务，不包含 bottom init transaction。
-- AR literal 是按需创建的，不为所有事务对一次性生成。
-- 已知序能推出的方向返回 `true/false` 常量，不创建 MonoSAT edge。
-- 对公式中需要比较的事务对，`ensureComparable` 会保证方向可比较。
-- 同一个 key 的 writer pair 比较只初始化一次，可被多个谓词读复用。
-- 固定 recorded frontier 同样只排除会改变谓词结果的后续写；谓词前后均不匹配时不会产生多余的 AR/`PR_RW` 限制。
-- 条件依赖按 guard/edge 去重，恒假 guard、恒真 target 和重复 implication 不进入最终公式。
-- 大型动态谓词阻断子句通过 `assertOr` 提交，避免固定 JNI clause 缓冲边界。
-- 无环偏序可以扩展成严格全序，因此只要 SAT 可满足，就存在合法串行解释。
-
-#### 7.1 已知顺序与 AR literal
-
-`SERSolverAR` 先把 pruning 后的非谓词已知边合并为 mandatory precedence。这里两类图在 SER 中最终都要求相同的 AR 方向：
+有：
 
 ```text
-A-side: SO, WR, pruning 已确定的 WW
-B-side: pruning 已确定的 RW
-
-任意边 T1 -> T2
-    都要求 ar(T1,T2) = true
+D_M 有有向环  <=>  π(D_M) 有有向环
 ```
 
-`buildKnownOrder()` 明确跳过 `PR_WR/PR_RW`，因为主路径的谓词边要等 frontier SAT 条件建立后由 `addDependencyEdge` 单独编码；`--compare-derived-predicate-edges` 生成的诊断边也不会反向影响 verdict。
+原因是平行边的数量和标签不会改变可达性；环只需要每一步存在对应方向的至少一条边。
 
-对上述非谓词已知边，`buildKnownOrder()`：
+所以：
 
-1. 检查是否已有环或指向 bottom 的非法边；有则直接令公式 UNSAT。
-2. 计算传递闭包 `reachable`。
-3. 计算传递约简，只把保持同一可达关系所需的最少已知边提交给 MonoSAT。
+- 同向、同端点、不同 key 的边对判环是平行边。
+- 同向、同端点、不同 type 的边对 native 判环同样是平行边。
+- 反方向不能合并。例如 `(a,b,PR_WR,...)` 与 `(b,a,PR_RW,...)` 会保留为两条相反方向的 native edge，并可能形成二环。
+- 不同端点不能合并，即使 type/key 相同也必须保留各自方向。
 
-之后调用 `ar(A,B)` 时：
+从 Adya 的语义记录看，typed witness 没有被改写；从 MonoSAT 的图论判环看，只需要每个激活的 `(from,to)` 一条边。这就是当前压缩成立的边界。
+
+## 7. 哪些边会被真正跳过
+
+除了平行边复用，当前代码还会跳过以下不需要物化的候选：
+
+| 情况 | 原因 |
+| --- | --- |
+| guard 恒假 | 该依赖不可能在任何当前模型中激活 |
+| self edge | 事务内依赖由 program order/内部一致性处理，不建立事务级自环 |
+| bottom 为端点 | bottom 顺序由常量处理，不进入真实事务 MonoSAT 图 |
+| 完全重复的 witness | type、key、端点和 guard 都相同，没有新增约束 |
+| `PR_WR` source 已知在 reader 后 | 激活会立即与已知 order 冲突 |
+| `PR_WR` source 已被确定可见的后继 writer 遮蔽 | 它不可能成为 AR-max source |
+| GMWR 证明某个 source 会强制 `PR_RW` 环 | 该 source alternative 不属于任何合法模型 |
+
+这些情况中，后几项属于“删除已证明不可激活或不可满足的候选分支”，不是把一条仍可能在合法模型中独立生效的必要方向当作平行边删除。
+
+已知顺序的传递约简进入 `serializationGraph`。所有已知 typed dependencies 仍经过 `encodeKnownTypedEdges` 保留元数据并施加同方向的 serialization 约束；传递约简不会删除 logical dependency metadata。
+
+## 8. 当前开关、默认值和各自解决的问题
+
+本节的“默认值”指 `audit` 命令的实际默认路径。CLI 会调用 `SolverSettings.forModes(...)`，而不是直接使用一个未初始化的裸 `SolverSettings` 对象。若测试或外部调用方自行 `new SolverSettings()` 且不再赋值，Java 的 boolean 字段初值是 `false`；这不是 `audit` CLI 的默认配置。
+
+### 8.1 不传任何可选参数时的实际配置
 
 ```text
-knownOrder 已知 A 可达 B  => true 常量
-knownOrder 已知 B 可达 A  => false 常量
-A 或 B 是 bottom          => 固定常量
-否则                       => 按需创建 MonoSAT edge literal
+history type                    PRHIST
+pruning mode                   REACHABILITY
+predicate solving mode         EAGER
+SER propagation mode           WW_ONLY
+GMWR prepropagation            false
+WW constraint coalescing       true
+predicate witness coalescing   true
+graph-edge interning           true
+solver                         monosat
+solver timeout                 600 seconds
+detailed solver stats          false
 ```
 
-第一次需要比较未定事务对 `{A,B}` 时，`ensureComparable` 加入：
+按当前实验命名，这个无参数组合属于 `E2`：`EAGER + WW_ONLY + graph-edge interning`。`E1` 的主要区别是关闭 graph-edge interning。
+
+如果只增加：
 
 ```text
-xor(ar(A,B), ar(B,A))
+--predicate-mode=GMWR
 ```
 
-所以公式涉及的事务对必定二选一。没有被任何约束查询的事务对不创建变量；最终无环偏序可以任意拓扑扩展成全序。
-
-#### 7.2 WW 分支与普通 RW implication
-
-pruning 后剩余的每个 `SERConstraint` 被编码为两个相反 AR literal。方向 literal 作为 guard，控制该分支携带的 WW/RW：
+则模式相关默认值变为：
 
 ```text
-ar(A,C) -> ar(edge.from, edge.to)
+predicate solving mode         GMWR
+SER propagation mode           WW_GMWR
+GMWR prepropagation            true
 ```
 
-求解器还直接遍历 `readFrom` 再编码一次普通 RW 语义：
+其他三种 coalescing/interning 默认仍为开启。
+
+### 8.2 三个最容易混淆的压缩开关
+
+| CLI | 内部设置 | 默认 | 解决的问题 | 关闭后的直接变化 |
+| --- | --- | --- | --- | --- |
+| `--no-coalescing` | `SERVerifier.coalesceConstraints` | 开启 | 同一 writer 事务对可能在多个 key 上重复产生 WW 二选一；全局事务顺序只需要一个方向变量 | 每个 key/读关系可以生成独立 `SERConstraint`，SAT 分支和重复 implication 增多 |
+| `--[no-]predicate-witness-coalescing` | `predicateWitnessCoalescing` | 开启 | 多个 key 产生相同 `(from,to,type)` 的 `PR_WR/PR_RW` witness | 不再把 keys 和 guards 合并，每个 predicate witness 单独进入依赖队列 |
+| `--[no-]graph-edge-interning` | `graphEdgeInterning` | 开启 | 不同 type/key 最终可能产生相同 `(from,to)` 的 MonoSAT serialization edge | 每个送入 `encodeDependencyEdge` 的 Java typed edge各建一条 serialization edge |
+
+三者处理的不是同一个对象：
 
 ```text
-A ->WR(x) B
-C writes x
+SERConstraint choice
+    --no-coalescing 控制
 
-ar(A,C) -> ar(B,C)
+PR_WR/PR_RW typed witnesses
+    --[no-]predicate-witness-coalescing 控制
+
+MonoSAT serializationGraph edge
+    --[no-]graph-edge-interning 控制
 ```
 
-这一直接编码保证即使约束经过 coalescing/pruning，普通读 latest-visible 语义仍完整存在。相同 guard/edge 会去重；guard 恒假时不创建目标 AR literal，guard 恒真时直接断言目标。
+它们都以保持 ACCEPT/REJECT 等价为目标，改变的是公式规模和物理表示，不改变六类 Adya relation 的定义。
 
-#### 7.2.1 依赖边的建立与 SAT 编码
+#### `PR_WR(a,b)` 与 `WR(a,b)` 共用 native edge 是否由开关控制
 
-求解器先用带语义的边描述依赖，再把依赖转换成 AR 约束。单条语义边使用：
+是，直接由 `graphEdgeInterning` 控制。
+
+`SolverSettings.forModes(...)` 无条件设置：
 
 ```text
-SEREdge(from, to, type, key)
+predicateWitnessCoalescing = true
+graphEdgeInterning         = true
 ```
 
-其中 `type` 可以是 `SO`、`WR`、`WW`、`RW`、`PR_WR` 或 `PR_RW`。边表达的是：只要这条依赖生效，事务顺序必须满足：
+随后 `Main.Audit.call()` 只在用户显式传入正向或负向参数时覆盖对应值。`encodeDependencyEdge` 的分支为：
 
 ```text
-from <AR to
+graphEdgeInterning = false
+    每条 logical dependency 调用 serializationGraph.addEdge(from,to)
+
+graphEdgeInterning = true
+    复用 serializationEdgeCache[(from,to)]
 ```
 
-可能依赖 WW 方向或 frontier 选择的边还带有一个 Boolean guard：
+因此：
 
 ```text
-GuardedDependencyEdge {
-    edge  = SEREdge(from,to,type,key)
-    guard = 该依赖生效的条件
-}
+# 默认：PR_WR(a,b) 与 WR(a,b) 共用 E(a,b)
+audit history
 
-guard -> ar(from,to)
+# 关闭：二者各自创建一条 MonoSAT native edge
+audit --no-graph-edge-interning history
+
+# 显式开启，与默认相同
+audit --graph-edge-interning history
 ```
 
-各类边的来源和 guard 如下：
+关闭后，Java 语义层没有变化，只是 MonoSAT 中重新出现同向平行边；预期 verdict 不变，native edge 数量和求解成本可能增大。
 
-| 边 | 建立依据 | guard | 要求的 AR 方向 |
-|---|---|---|---|
-| `SO(A,B)` | 同一 session 中 `A` 先于 `B` | `true` | `A <AR B` |
-| `WR(A,B,x)` | `B` 的普通读读取 `A` 写出的 `x` | `true` | `A <AR B` |
-| `WW(A,C,x)` | 同 key writer 选择 `A` 在 `C` 前 | `ar(A,C)` | `A <AR C` |
-| `RW(B,C,x)` | `A --WR(x)--> B` 且选择 `A --WW(x)--> C` | `ar(A,C)` | `B <AR C` |
-| `PR_WR(A,B,x)` | `A` 是谓词读 `B` 在 `x` 上的 latest-visible source | 固定 source 时为 `true`；待选 source 时为 `selected(A,B,x)` | `A <AR B` |
-| `PR_RW(B,C,x)` | source `A` 在 `C` 前，且 `C` 的写满足 Δ | 固定 source 时为 `beforeWrite(A,C)`；待选 source 时为 `selected(A,B,x) ∧ beforeWrite(A,C)` | `B <AR C` |
+### 8.3 WW/RW pruning 开关
 
-`addDependencyEdge(edge,guard)` 的处理顺序是：
+| CLI | 默认 | 解决的问题 | 对 Adya 图的影响 |
+| --- | --- | --- | --- |
+| `--ww-pruning=NONE` | 否 | 保留全部未决 WW 分支，作为无剪枝实验基线 | 不预先物化分支，全部交给 SAT |
+| `--ww-pruning=REACHABILITY` | 是 | 删除会立即与已知依赖闭包成环的 WW/RW 分支 | 只提前固定被可达性唯一决定的 typed edges |
 
-1. `guard=false` 时依赖永不生效，直接丢弃。
-2. 以 `(guard,edge)` 去重，避免同一 implication 重复进入公式。
-3. 计算目标 `target=ar(edge.from,edge.to)`。
-4. 若 `target=true`，或 `guard` 与 `target` 是同一个 literal，则该 implication 是恒真式，不再建立待编码的 `GuardedDependencyEdge`。
-5. 其余依赖保存完整 `SEREdge` 和 guard；`SO/WR/WW/PR_WR` 放入 A-side，`RW/PR_RW` 放入 B-side。
-6. `encodeDependencyEdges()` 统一编码 `guard -> target`，随后清空临时待编码集合。
+这些开关发生在 `SERSolverAR` 构造之前，主要减少残余 `SERConstraint`。它们不会把某种 typed edge 改成另一种类型。
 
-第 4 步只是一项公式优化。例如只有一个 source 候选时：
+### 8.4 谓词编码模式
+
+| CLI | 默认 | 解决的问题 | 保留的语义 |
+| --- | --- | --- | --- |
+| `--predicate-mode=EAGER` | 是 | row-local 谓词逐 key 直接生成结果合法性 clause；实现路径直接 | 仍构造 source-aware `PR_WR/PR_RW`，general query 仍做模型 refinement |
+| `--predicate-mode=GMWR` | 否 | 合并 `(reader,badWriter)` obligations、剪除不可能 source/frontier，并减少残余 clause | 不改变 recorded source、`PR_WR/PR_RW` 定义或完整查询结果校验 |
+
+`--predicate-mode` 选择完整 predicate solving mode，不是 WW pruning 开关。
+
+`predicateWitnessCoalescing` 与该模式独立，CLI 默认在 EAGER 和 GMWR 下都开启；不要把“选择 GMWR”误解为“才会开启 `(from,to,type)` witness 合并”。
+
+### 8.5 GMWR prepropagation 与 WW feedback
+
+`--[no-]gmwr-prepropagation` 控制是否在 SAT 编码前运行 GMWR 化简：
+
+| 当前 predicate mode | 默认 | 行为 |
+| --- | --- | --- |
+| EAGER | 关 | `propagateBeforeEncoding` 直接返回；即使手动打开该开关，当前 EAGER 路径也不执行 GMWR propagation |
+| GMWR | 开 | 先传播确定事实、消解已经满足或冲突的 GMWR obligations，再编码残余部分 |
+
+关闭 prepropagation 不会关闭 GMWR obligation 构造，也不会退回 EAGER；它只是不在 SAT 前化简这些 obligations。
+
+`--ser-propagation-mode` 控制 GMWR 信息是否反向固定残余 WW choice：
+
+| 值 | 默认条件 | 当前作用 |
+| --- | --- | --- |
+| `ww-only` | EAGER 默认 | 不运行 GMWR-to-WW bridge |
+| `ww-gmwr-oneway` | 非默认实验值 | 允许既有 WW/known facts 参与 GMWR 化简，但不把 GMWR 结果反馈成 WW 分支 |
+| `ww-gmwr` | GMWR 默认 | 运行 `propagateGmwrToWwFixpoint`，用 GMWR definite facts 检查并固定只能取一侧的 WW constraint，再把新 WW 同步回传播状态 |
+
+当前 `SERSolverAR` 中只有 `WW_GMWR` 会进入 `GmwrWwBridge`；`WW_ONLY` 和 `WW_GMWR_ONEWAY` 都不会反向物化 WW。并且只有 `predicate mode=GMWR` 时才会构造 GMWR propagation state。
+
+`--verify-incremental-propagation` 默认关闭。它在 GMWR-WW 增量 bridge 中把 affected-only 扫描与 full residual scan 做一致性核对，解决的是实现正确性验证问题，不是新的求解语义；开启会增加诊断开销。
+
+### 8.6 诊断和运行控制开关
+
+| CLI | 默认 | 作用 | 是否进入正常 Adya verdict 语义 |
+| --- | --- | --- | --- |
+| `--solver-timeout-seconds=600` | 600 秒 | 从 `solve()` 开始限制 MonoSAT 时间；`0` 表示不设 backend timeout | 不改变公式，但可能返回 `TIMEOUT` 而不是等到 SAT/UNSAT |
+| `--solver-stats` | 关 | 输出 SAT、GMWR、coalescing 和 native edge 统计 | 否，只增加统计 |
+| `--compare-derived-predicate-edges` | 关 | 额外运行旧的 derived `PR_*` 图路径作比较 | 否，派生结果明确不送入主 AR SAT solver |
+| `--dot-output` | 关 | 把冲突输出改为 DOT 格式 | 否，只改变输出格式 |
+| `--solver=monosat` | `monosat` | 选择 SAT backend | 当前只接受 MonoSAT，其他值直接报参数错误 |
+| `-t/--type=PRHIST` | `PRHIST` | 选择历史 loader | 当前枚举只有 PRHIST |
+
+### 8.7 如何单独验证某个压缩开关
+
+若只想确认 `PR_WR/WR` 的 native edge 共享是否影响结果，应保持其他参数不变，只切换 graph-edge interning：
+
+```bash
+audit --graph-edge-interning /path/to/history
+audit --no-graph-edge-interning /path/to/history
+```
+
+若要得到三层压缩都关闭的物理展开基线：
+
+```bash
+audit \
+  --no-coalescing \
+  --no-predicate-witness-coalescing \
+  --no-graph-edge-interning \
+  /path/to/history
+```
+
+前一组只隔离 `(from,to)` native edge 复用；后一组会同时扩大 WW constraints、predicate witness 队列和 MonoSAT native 图，不能把性能差异只归因于 graph-edge interning。
+
+## 9. 完整例子
+
+假设事务 `A` 同时写 `k1/k2`，事务 `B` 的谓词读在两个 key 上都选择 `A` 为 source，并且 `B` 还有一个点读也读自 `A`：
 
 ```text
-selected(A,B,x) = visible(A,B) = ar(A,B)
-
-PR_WR implication:
-ar(A,B) -> ar(A,B)
+语义 witnesses:
+  (A,B,PR_WR,k1,g1)
+  (A,B,PR_WR,k2,g2)
+  (A,B,WR,k1,true)
 ```
 
-省略这个恒真 implication 不改变 SAT 模型和最终 `ACCEPT/REJECT`。但这种边只隐含在 source 的可见条件中，不会产生一个待编码的 `GuardedDependencyEdge`。因此当前显式条件对象是编码期对象，不是求解结束后永久保存的完整依赖图；诊断派生图与主 SAT verdict 也彼此独立。
-
-##### 谓词 source 的选择 guard
-
-对 external key `x`，每个事务只保留它对 `x` 的最后一次写。候选写 `ws` 对 reader `R` 可见的条件为：
+谓词 witness coalescing 后：
 
 ```text
-visible(ws,R) = ar(writer(ws),R)
+  (A,B,PR_WR,{k1,k2}, g1 OR g2)
+  (A,B,WR,k1,true)
 ```
 
-`ws` 被选为 latest-visible source 还要求不存在一个在 `ws` 之后、同时也位于 reader 之前的候选写：
+graph-edge interning 后，MonoSAT `serializationGraph` 只有一个方向 edge：
 
 ```text
-laterVisible(ws,wu,R)
-    = visible(wu,R) ∧ beforeWrite(ws,wu)
-
-selected(ws,R,x)
-    = visible(ws,R)
-      ∧ ∧wu!=ws ¬laterVisible(ws,wu,R)
+E(A,B)
 ```
 
-这里必须包含 `¬laterVisible`。仅有 `visible(ws,R)` 只能证明 `ws` 在 reader 前，不能证明它是 reader 前的最后版本；若还存在 `ws <AR wu <AR R`，真正 source 应当是 `wu`。
-
-待选 source 的谓词边按同一个 `selected` guard 建立：
+约束为：
 
 ```text
-selected(ws,R,x)
-    -> PR_WR(writer(ws),R,x)
-
-selected(ws,R,x)
-∧ beforeWrite(ws,wu)
-∧ Δ(ws,wu)
-    -> PR_RW(R,writer(wu),x)
+(g1 OR g2) -> E(A,B)
+true       -> E(A,B)
 ```
 
-代码区分两个 writer 集合：
+由于 `WR` 已经是强制边，`E(A,B)` 必须为 true。两个 `PR_WR` witness 仍用于谓词 source 语义和 provenance，但再增加两条同方向 native edge 不会改变任何环。
+
+如果同时存在：
 
 ```text
-externalWrites
-    该 key 的完整外部最终写集合；每个 writer transaction 至多一个写。
-
-frontier.candidates
-    可以成为 visible source 的候选；已知位于 reader 之后的写会被过滤。
+(B,A,PR_RW,k3,g3)
 ```
 
-PR_WR 的 source 只从 `frontier.candidates` 中选择。PR_RW 的 `later` 必须遍历完整 `externalWrites`：即使 `wu` 已知位于 reader 后面、因而不能成为 source，形式上仍要根据 `ws WW wu ∧ Δ` 建立 `R PR_RW wu`。当前 recorded-source 和待选-source 两条路径都使用完整 external writer 集合派生 PR_RW。
-
-##### Row-local 未返回 key
-
-row-local 谓词对未返回的 EXTERNAL key 仍先建立 `KeyFrontier`，选择 latest-visible source 并建立上述 PR_WR/PR_RW。之后才根据单行求值区分：
+则必须另建 `E(B,A)`，并编码：
 
 ```text
-存在会产生结果的版本
-    加入阻断条件，禁止这种版本成为最终 frontier，除非其后存在更晚的不匹配可见版本。
-
-所有版本都不产生结果
-    不需要结果阻断条件，但仍保留 frontier 选择和 PR_WR 建模；不能跳过该 key。
+g3 -> E(B,A)
 ```
 
-INTERNAL key 不建立新的外部 PR_WR；其结果由事务内最后本地写或内部一致性依据决定。
+当 `g3=true` 时，`E(A,B)` 与 `E(B,A)` 构成二环，`serializationGraph.acyclic()` 会使该模型 UNSAT。这说明实现省掉的是平行表示，不是相反方向或新的可达关系。
 
-#### 7.3 谓词 key 的 frontier 候选
+## 10. ACCEPT / REJECT 的准确含义
 
-对谓词读事务 `R` 和 scope 内 key `x`，若 `R` 在谓词事件之前已经本地写 `x`：
+`ACCEPT` 表示存在一个 SAT 模型，使得：
+
+1. 内部一致性检查通过。
+2. 每个同 key writer 对有一致的 WW 方向。
+3. 点读的 WR/RW latest-visible 约束成立。
+4. 谓词 source、PR_WR、PR_RW 和记录结果约束成立。
+5. 所有激活 typed dependency 与 frontier/order 选择投影到同一张无环 `serializationGraph`。
+6. general query 的完整模型校验不再发现不匹配快照。
+
+任何有限无环偏序都可以拓扑扩展成严格全序，因此这样的模型对应一个合法串行解释。
+
+`REJECT` 表示内部一致性直接矛盾、pruning 已证明冲突，或者不存在同时满足上述条件的模型。`TIMEOUT` 与 `REJECT` 分开返回，不会把求解超时误报为不可串行化。
+
+## 11. 关键实现位置
+
+| 文件 | 与 Adya 图相关的职责 |
+| --- | --- |
+| `src/main/java/graph/EdgeType.java` | 定义六类 typed edge |
+| `src/main/java/graph/KnownGraph.java` | 收集 SO、WR、write/source 索引和 predicate observations |
+| `src/main/java/verifier/SEREdge.java` | 编码期 typed edge，保存 from/to/type/keys |
+| `src/main/java/verifier/SERConstraint.java` | 表示 writer 事务对的两个 WW/RW 分支 |
+| `src/main/java/verifier/PrecedenceOracle.java` | 每次audit唯一的deterministic precedence state，提供before/successor/predecessor/wouldCycle并由各模块共享 |
+| `src/main/java/verifier/LatestVisibleChecker.java` | 统一计算 candidate writer 的 latest-visible validity |
+| `src/main/java/verifier/SERVerifier.java` | 内部一致性、约束生成、pruning、求解入口 |
+| `src/main/java/verifier/SERSolverAR.java` | logical dependency metadata、唯一 serialization graph、edge guard、frontier、coalescing、interning 和判环 |
+
+阅读 `SERSolverAR.java` 时，最直接的调用链是：
 
 ```text
-frontier_x(R) = R 在该事件之前对 x 的最后一次本地写
+addDependencyEdge
+  -> predicate candidates / exact dedup
+  -> prunePredicateDependencies（可选，按 from/to/type 合并）
+  -> queueGuardedDependency
+  -> encodeDependencyEdges
+  -> encodeDependencyEdge
+       -> orderLiteral
+       -> serializationGraph edge（可选，按 from/to intern）
 ```
 
-它是固定 INTERNAL frontier，不需要外部 AR 选择。
-
-否则，每个外部 writer 只保留该事务对 `x` 的最后一次写作为候选，因为同一事务的中间写不可能成为事务外可见版本。候选 `w` 的可见 guard 是：
-
-```text
-visible(w,R) = ar(writer(w), R)
-```
-
-若某个候选是当前 SAT 模型下所有可见候选中写顺序最晚的一个，它就是该 key 的 selected frontier。若所有候选 writer 都在 `R` 之后，则该 key 在这个模型中没有外部可见写。
-
-历史结果中已出现 key `x` 时，记录的 `(x,value)` 会解析为固定 source：
-
-```text
-source writer <AR R                         对应 PR_WR
-source 后任何会改变结果的同 key writer U
-    必须满足 R <AR U                        对应 PR_RW
-```
-
-PR_RW 的后续 writer 从完整 external writer 集合中枚举，不只检查仍可能对 reader 可见的 frontier candidates。这保证已知位于 reader 后面的 writer 也具有完整的显式 PR_RW 派生。若一个后续写在谓词前后都不匹配，它不会改变可观察结果，因此无需强制排在 reader 之后。代码还防御性处理“两个写的 key/value 完全相同”的等价情况，但当前紧凑 PRHIST 要求 `(key,value)` 全局唯一，不会通过 loader 产生这种输入。
-
-#### 7.4 Row-local 谓词快路径
-
-以下 QueryPlan 被视为 row-local：
-
-```text
-单表 Scan/Filter
-distinct = false
-投影只依赖当前单行
-```
-
-这类查询的完整结果是每个 key 单行贡献的 bag union，可以逐 key 编码：
-
-1. `result.inputs` 的 key 集必须等于已解析 tuple source 的 key 集。
-2. 在只包含记录输入的状态上执行查询，投影结果必须与记录结果一致。
-3. 返回的 EXTERNAL key：固定 recorded source，并建立必要 `PR_WR/PR_RW`。
-4. 未返回的 EXTERNAL key：无论所有版本是否匹配，都先建立 frontier 和 PR_WR/PR_RW；再找出单行执行会产生非空贡献的候选写，禁止这些写成为 reader 的 latest-visible frontier。所有版本均不匹配时不需要结果阻断子句，但不能跳过该 key 的 frontier。
-5. INTERNAL key：必须使用谓词事件之前的最后本地写或已经继承的内部 source；若该行会产生结果却被遗漏，公式直接 UNSAT。
-6. 结果中的 key 若超出 scope 或历史中不存在写版本，公式直接 UNSAT。
-
-未返回 key 的阻断逻辑不是简单要求“这个 writer 在 reader 后面”。如果一个会返回结果的旧写位于 reader 前，但其后还有一个不产生结果的更新写也位于 reader 前，那么后者可以成为 frontier，空结果仍合法。
-
-#### 7.5 JOIN、DISTINCT 与完整快照路径
-
-JOIN、`DISTINCT`、多行相关投影等查询不能逐 key 独立判断，走完整快照 refinement：
-
-1. 对每个 EXTERNAL scoped key 建立 `KeyFrontier`。
-2. 将 INTERNAL key 的最后本地写/已继承 source 放入 `fixedSnapshot`。
-3. SAT 先给出一个候选 AR 模型。
-4. 从模型中为每个 frontier 选择 latest-visible candidate，组成：
-
-```text
-snapshot = fixedSnapshot ∪ selectedExternalFrontiers
-```
-
-5. 用 `RelationResolver` 把 `table:key` 映射到 relation，在 `MapVisibleState` 上执行完整 `QueryPlan`。
-6. 将求值结果与历史记录比较：
-
-```text
-有 recordedPredicateResult
-    使用 QueryEvaluation.canonicalEquals
-    同时比较 inputs 和 values 的规范化多重集
-
-只有旧式 predResults
-    比较 inputs map
-```
-
-如果结果不一致，不会立刻整体 REJECT，而是只禁止当前这组 frontier 选择。
-
-#### 7.6 No-good refinement
-
-假设当前模型为某次谓词读选择：
-
-```text
-x -> wx
-y -> wy
-z -> ABSENT
-```
-
-但执行查询得到的结果与历史不一致。`appendNegatedSelection` 构造一个 no-good clause，表达“下一次求解至少改变一个 key 的 frontier”：
-
-```text
-not(select(x,wx))
-or not(select(y,wy))
-or not(select(z,ABSENT))
-```
-
-其中：
-
-- `select(x,wx)` 表示 `wx` 对 reader 可见，且不存在一个在 `wx` 之后、reader 之前的更晚可见候选。
-- `select(z,ABSENT)` 表示所有 `z` 候选 writer 都位于 reader 之后。
-- 已由记录 source 固定的 frontier 不加入 clause，因为它不能在后续模型中改变。
-
-如果不匹配查询的全部 frontier 都已固定，blocking clause 为空，说明没有其他可见快照可尝试，公式直接变为 UNSAT。
-
-求解循环是：
-
-```text
-while SAT:
-    从模型构造所有完整查询快照
-    if 每个谓词结果都匹配:
-        ACCEPT
-    对每个不匹配快照加入 no-good clause
-
-没有新 SAT 模型:
-    REJECT
-```
-
-该过程等价于预先枚举所有 frontier 笛卡尔积并为错误组合加约束，但只探索 SAT 实际产生的组合。
-
-#### 7.7 `PR_RW` 的“结果变化”条件
-
-对同 key 的 source 写 `ws` 和 source 后的写 `wu`，只有以下情况认为 `wu` 改变谓词结果：
-
-```text
-ws 匹配，wu 不匹配
-ws 不匹配，wu 匹配
-两者都匹配，但输出行的 key/value 不同
-```
-
-以下情况不产生额外 `PR_RW`：
-
-```text
-两者都不匹配
-```
-
-内部求解代码还把“两者都匹配且 key/value 完全相同”视为结果不变；这是通用事件模型中的防御分支。当前紧凑 PRHIST 依赖 `(key,value)` 全局唯一，因此两个不同写不能通过该格式表达为相同 key/value。
-
-这是结果可检测性规则：SER detector 约束历史中可观察到的查询结果，不用当前输入中不存在的版本 provenance 改变判断。
-
-#### 7.8 最终 ACCEPT/REJECT
-
-`SERSolverAR.solve()` 返回 `true` 的条件是：
-
-```text
-MonoSAT 找到无环 AR 模型
-AND
-该模型下所有 row-local 谓词约束成立
-AND
-所有完整快照查询结果匹配
-AND
-没有新的 no-good refinement 需要加入
-```
-
-返回 `false` 表示 mandatory edge、WW/RW implication、谓词可见性和所有已发现 no-good clause 的合取不可满足。外层随后尝试提取已知边环或缩减 WW constraint core，用于解释 REJECT；诊断是否完整不影响 verdict。
-
-### 8. MonoSAT 集成
-
-相关位置：
-
-```text
-build.gradle
-monosat/
-src/main/java/verifier/SERSolverAR.java
-```
-
-Gradle 在编译 Java 前会先编译 MonoSAT：
-
-```text
-configureMonoSAT -> buildMonoSAT -> compileJava / jar
-```
-
-运行时必须提供 native library：
-
-```text
--Djava.library.path=build/monosat
-```
-
-否则 JVM 找不到 `libmonosat.so`。
-
-## 两个完整判断示例
-
-### 示例一：点读旧版本为什么会形成矛盾
-
-同一 session 依次提交：
-
-```text
-T1: W(x,1)
-T2: W(x,2)
-T3: R(x,1)
-```
-
-已知关系：
-
-```text
-SO: T1 <AR T2 <AR T3
-WR: T1 <AR T3
-```
-
-`T1` 与 `T2` 都写 `x`，SO 已确定 `WW(T1,T2,x)`。由于 `T3` 读取 `T1` 的版本，普通 RW 规则推出：
-
-```text
-T1 <AR T2  =>  T3 <AR T2
-```
-
-但 SO 已要求 `T2 <AR T3`，于是：
-
-```text
-T2 <AR T3 <AR T2
-```
-
-mandatory AR 成环，历史 `REJECT`。若没有 `T2 <AR T3` 的已知约束，求解器可以选择 `T1 <AR T3 <AR T2`，此时该点读是可解释的。
-
-### 示例二：谓词结果如何限制后续写
-
-假设谓词是 `value > 5`：
-
-```text
-T1: W(x,10)
-T3: W(x,3)
-T2: PR(value > 5) -> {(x,10)}
-```
-
-记录结果把 `T1` 的写固定为 `x` 的 observable frontier：
-
-```text
-T1 <AR T2                    PR_WR
-```
-
-`T3` 把 `x` 从匹配值 `10` 改成不匹配值 `3`，会改变谓词结果，所以：
-
-```text
-T1 <AR T3  =>  T2 <AR T3    PR_RW
-```
-
-若其他已知关系要求 `T1 <AR T3 <AR T2`，则 `T2` 应看到 `x=3` 并返回空集，与记录结果冲突；`PR_RW` 要求的 `T2 <AR T3` 和已知 `T3 <AR T2` 成环，最终 `REJECT`。
-
-## 主要模块和关键文件
-
-### CLI
-
-```text
-src/main/java/Main.java
-```
-
-命令行入口。定义 `audit`、`stat`、`dump`，负责把输入路径和参数传给 loader/verifier。
-
-### History 模型
-
-```text
-src/main/java/history/History.java
-src/main/java/history/Session.java
-src/main/java/history/Transaction.java
-src/main/java/history/Event.java
-src/main/java/history/InvalidHistoryError.java
-```
-
-保存 detector 内部统一历史表示。所有后续图构建和 SAT 编码都只看这些对象。
-
-### PRHIST Loader
-
-```text
-src/main/java/history/loaders/PredicateHistoryLoader.java
-```
-
-当前最重要的输入适配层。它定义了本 detector 现在实际接受的 PRHIST 子集。
-
-### Graph
-
-```text
-src/main/java/graph/Edge.java
-src/main/java/graph/EdgeType.java
-src/main/java/graph/KnownGraph.java
-src/main/java/graph/MatrixGraph.java
-```
-
-`KnownGraph` 是主路径。`MatrixGraph` 主要用于图算法或测试辅助。
-
-### Verifier
-
-```text
-src/main/java/verifier/SERVerifier.java
-src/main/java/verifier/SERSolverAR.java
-src/main/java/verifier/SERConstraint.java
-src/main/java/verifier/SEREdge.java
-src/main/java/verifier/Pruning.java
-src/main/java/verifier/Utils.java
-```
-
-这里是核心验证逻辑：
-
-- `SERVerifier` 组织整个验证流程。
-- `SERConstraint` / `SEREdge` 表达 WW choice 和条件边。
-- `Pruning` 做分支剪枝。
-- `SERSolverAR` 生成 SAT/MonoSAT 约束并求解。
-
-### Tools
-
-```text
-tools/audit-prhist.sh
-tools/run_catalog_experiment.py
-tools/validate_prhist_suite.py
-```
-
-用途：
-
-- `audit-prhist.sh`：递归批量审计 `history.prhist.jsonl`。
-- `run_catalog_experiment.py`：按 catalog 跑可复现实验，保存日志、CSV、summary 和机器信息。
-- `validate_prhist_suite.py`：校验带 oracle 的 PRHIST suite。
-
-### Tests
-
-```text
-src/test/java/TestPredicateHistoryLoader.java
-src/test/java/TestVerifier.java
-src/test/java/BlackBoxSERAuditTest.java
-src/test/java/verifier/
-```
-
-覆盖 loader、基础 verifier、事务内谓词继承与本地写一致性、SAT encoding、仅结果变化写触发的 `PR_RW`、row-local 与 JOIN/DISTINCT fallback、剪枝可达性、小历史 differential 检查和 CLI 行为。
-
-## 正确性直觉
-
-### Soundness
-
-如果 solver 返回 SAT，则：
-
-1. 内部一致性已经确认所有读取来源和事务内 program order 没有直接矛盾。
-2. 所有 SO/WR 和 pruning 后被迫的 WW/RW 已知依赖都被放进 AR。
-3. 每个公式涉及的未定 writer pair 都选择了唯一方向。
-4. 对每个普通读，`WR + WW => RW` 保证 reader 位于所有 source 后续 writer 之前，因此读到的 source 是合法 latest-visible 版本。
-5. row-local 谓词已逐 key 排除错误 frontier；完整查询路径已经在最终 SAT 模型上实际执行 QueryPlan 并匹配 `inputs/values`。
-6. MonoSAT 保证选中的 AR graph 无环。
-7. 没有进入公式的事务对可以按任意拓扑扩展补全，不破坏已有依赖。
-
-任何有限无环偏序都能扩展成严格全序，所以存在一个串行顺序解释该历史。
-
-### Completeness
-
-如果真实存在某个合法串行解释，则可以按这个串行顺序给所有 `ar(T1,T2)` literal 赋值。这个赋值会满足：
-
-- SO/WR 已知边。
-- 每个 key 上的 WW 顺序。
-- 普通读的 latest-visible 约束。
-- 谓词读的 frontier 和结果集合约束。
-- AR 无环约束。
-
-对于完整查询路径，真实解释对应的 frontier 组合执行 QueryPlan 必然与历史一致，因此不会被 no-good clause 排除。每条 no-good 只排除一个已经实际求值为错误的组合，不会移除合法解释。因此 solver 不应返回 UNSAT。
-
-### Pruning 和 Coalescing
-
-pruning 只提交反方向已经立即成环的 choice，因此保持可满足性。
-
-coalescing 把同一事务对上的重复 choices 合并，因为严格事务级串行顺序里，同一事务对的先后关系必须一致。
-
-refinement 的 frontier 组合数量有限；每次 mismatch 至少排除当前模型的一组选择，所以循环最终会找到合法组合或耗尽全部可满足组合并返回 UNSAT。
-
-## 当前边界
-
-当前 detector 的稳定路径是：
-
-```text
-compact PRHIST + structured QueryPlan predicates + MonoSAT AR solver
-```
-
-已明确的边界：
-
-- Java loader 当前只接受 `query/result` 形态的 predicate read。
-- query 支持单表扫描、多个 INNER JOIN、AND 条件、字段投影和 DISTINCT；不支持其他 JOIN 类型或任意 SQL 语法。
-- value 不接受 null、数组和非整数数字；结果投影可以是结构化 JSON，但结构化值只支持相等性。
-- 当前紧凑格式依赖 `(key,value)` 写版本唯一性。
-- `write_id/source_write_id/source_txn/source_op_index` provenance 字段会被 loader 拒绝。
-- TPC-C 多表 SQL-shaped predicate 必须先转换为当前结构化 query，才能被完整验证。
-- abort/retry attempt 不进入 `history.prhist.jsonl`；它们应保留在 raw trace 或 manifest 中。
-
-## 新人阅读路径
-
-建议按这个顺序理解代码：
-
-1. `SER/README.md`：先跑通构建和单个 history audit。
-2. `src/main/java/Main.java`：看命令行如何进入 verifier。
-3. `src/main/java/history/loaders/PredicateHistoryLoader.java`：理解输入 JSON 如何变成内部历史。
-4. `src/main/java/history/History.java` 和 `Event.java`：理解内部数据模型。
-5. `src/main/java/graph/KnownGraph.java`：看 SO/WR 和 predicate observation 如何建立。
-6. `src/main/java/verifier/SERVerifier.java`：看验证流程的总控。
-7. `src/main/java/verifier/SERSolverAR.java`：看 SAT/AR 编码。
-8. `src/test/java/verifier/`：用小测试理解边界情况和预期行为。
+这条调用链也给出了本文核心问题的最终答案：type/key 在前面的语义层保留，最后进入 MonoSAT 无环图时才投影为事务端点方向。

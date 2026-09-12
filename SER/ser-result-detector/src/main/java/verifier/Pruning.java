@@ -1,7 +1,6 @@
 package verifier;
 
 import graph.KnownGraph;
-import history.History;
 import history.Transaction;
 import util.Profiler;
 import graph.Edge;
@@ -16,7 +15,7 @@ import org.apache.commons.lang3.tuple.Pair;
 import lombok.Getter;
 import lombok.Setter;
 
-public class Pruning {
+public class Pruning<KeyType, ValueType> {
     @Getter
     @Setter
     private static boolean enablePruning = true;
@@ -27,22 +26,37 @@ public class Pruning {
 
     private static Pair<?, ?> lastConflicts = emptyConflicts();
 
-    static <KeyType, ValueType> boolean pruneConstraints(KnownGraph<KeyType, ValueType> knownGraph,
-            Collection<SERConstraint<KeyType, ValueType>> constraints, History<KeyType, ValueType> history) {
+    private final PrecedenceOracle<Transaction<KeyType, ValueType>> precedence;
+
+    Pruning(PrecedenceOracle<Transaction<KeyType, ValueType>> precedence) {
+        this.precedence = Objects.requireNonNull(precedence, "precedence");
+    }
+
+    PrecedenceOracle<Transaction<KeyType, ValueType>> precedenceOracle() {
+        return precedence;
+    }
+
+    boolean pruneConstraints(KnownGraph<KeyType, ValueType> knownGraph,
+            Collection<SERConstraint<KeyType, ValueType>> constraints) {
         if (!enablePruning) {
             return false;
         }
 
         lastConflicts = emptyConflicts();
+        if (constraints.isEmpty()) {
+            return false;
+        }
 
         var profiler = Profiler.getInstance();
         profiler.startTick("SER_PRUNE");
+        addKnownEdges(precedence, knownGraph.getKnownGraphA());
+        addKnownEdges(precedence, knownGraph.getKnownGraphB());
 
         int rounds = 1, solvedConstraints = 0, totalConstraints = constraints.size();
         boolean hasCycle = false;
         while (!hasCycle) {
             System.err.printf("Pruning round %d\n", rounds);
-            var result = pruneConstraintsWithPostChecking(knownGraph, constraints, history);
+            var result = pruneConstraintsWithPostChecking(knownGraph, constraints);
 
             hasCycle = result.getRight();
             solvedConstraints += result.getLeft();
@@ -62,9 +76,9 @@ public class Pruning {
         return hasCycle;
     }
 
-    private static <KeyType, ValueType> Pair<Integer, Boolean> pruneConstraintsWithPostChecking(
-            KnownGraph<KeyType, ValueType> knownGraph, Collection<SERConstraint<KeyType, ValueType>> constraints,
-            History<KeyType, ValueType> history) {
+    private Pair<Integer, Boolean> pruneConstraintsWithPostChecking(
+            KnownGraph<KeyType, ValueType> knownGraph,
+            Collection<SERConstraint<KeyType, ValueType>> constraints) {
         var profiler = Profiler.getInstance();
 
         var solvedConstraints = new ArrayList<SERConstraint<KeyType, ValueType>>();
@@ -72,15 +86,14 @@ public class Pruning {
         profiler.startTick("SER_PRUNE_POST_CHECK");
         int checked = 0;
         int total = constraints.size();
-        var oracle = new ReachabilityOracle<>(history, knownGraph);
         var progress = new PostCheckProgress(total);
         progress.refresh(checked, solvedConstraints.size(), false);
         if (total == 0) {
             progress.refresh(checked, solvedConstraints.size(), true);
         }
         for (var c : constraints) {
-            boolean okEither = oracle.canAddAll(c.getEdges1());
-            boolean okOr = oracle.canAddAll(c.getEdges2());
+            boolean okEither = !wouldCycle(precedence, c.getEdges1());
+            boolean okOr = !wouldCycle(precedence, c.getEdges2());
             checked++;
 
             if (!okEither && !okOr) {
@@ -91,11 +104,11 @@ public class Pruning {
             }
 
             if (!okEither) {
-                oracle.addAll(c.getEdges2());
+                addAll(precedence, c.getEdges2());
                 addToKnownGraph(knownGraph, c.getEdges2());
                 solvedConstraints.add(c);
             } else if (!okOr) {
-                oracle.addAll(c.getEdges1());
+                addAll(precedence, c.getEdges1());
                 addToKnownGraph(knownGraph, c.getEdges1());
                 solvedConstraints.add(c);
             }
@@ -111,31 +124,25 @@ public class Pruning {
     }
 
     private static final class PostCheckProgress {
-        private static final int BAR_WIDTH = 30;
+        private static final int BAR_WIDTH = 15;
 
         private final int total;
-        private final boolean interactive;
-        private final int nonInteractiveStep;
+        private final int refreshStep;
 
         private PostCheckProgress(int total) {
             this.total = total;
-            this.interactive = System.console() != null;
-            this.nonInteractiveStep = Math.max(1, Math.min(100, Math.max(1, total / 100)));
+            this.refreshStep = Math.max(1, Math.min(100, Math.max(1, total / 100)));
         }
 
         private void refresh(int checked, int solved, boolean done) {
-            if (!interactive && !done && checked != 0 && checked % nonInteractiveStep != 0) {
+            if (!done && checked != 0 && checked % refreshStep != 0) {
                 return;
             }
 
             var line = format(checked, solved);
-            if (interactive) {
-                System.err.print("\r" + line);
-                if (done) {
-                    System.err.println();
-                }
-            } else {
-                System.err.println(line);
+            System.err.print("\r" + line);
+            if (done) {
+                System.err.println();
             }
             System.err.flush();
         }
@@ -147,7 +154,7 @@ public class Pruning {
             for (int i = 0; i < BAR_WIDTH; i++) {
                 bar.append(i < filled ? '=' : '-');
             }
-            return String.format("Pruning post-check [%s] %3d%% checked %d/%d, solved %d",
+            return String.format("Pruning post-check [%s] %3d%% %d/%d solved=%d",
                     bar, percent, checked, total, solved);
         }
     }
@@ -178,186 +185,38 @@ public class Pruning {
         return type != EdgeType.PR_WR && type != EdgeType.PR_RW;
     }
 
-    private static final class ReachabilityOracle<KeyType, ValueType> {
-        private final Map<Transaction<KeyType, ValueType>, Integer> nodeIndex = new HashMap<>();
-        private final BitSet[] reachable;
-
-        private ReachabilityOracle(History<KeyType, ValueType> history,
-                                   KnownGraph<KeyType, ValueType> knownGraph) {
-            int index = 0;
-            for (var txn : history.getTransactions()) {
-                nodeIndex.put(txn, index++);
-            }
-            reachable = new BitSet[nodeIndex.size()];
-            for (int i = 0; i < reachable.length; i++) {
-                reachable[i] = new BitSet(reachable.length);
-            }
-
-            addKnownEdges(knownGraph.getKnownGraphA());
-            addKnownEdges(knownGraph.getKnownGraphB());
-            transitiveClosure();
-        }
-
-        private boolean reaches(Transaction<KeyType, ValueType> from,
-                                Transaction<KeyType, ValueType> to) {
-            return reaches(indexOf(from), indexOf(to));
-        }
-
-        private boolean reaches(int from, int to) {
-            return reachable[from].get(to);
-        }
-
-        private boolean canAddEdge(Transaction<KeyType, ValueType> from,
-                                   Transaction<KeyType, ValueType> to) {
-            return canAddEdge(indexOf(from), indexOf(to));
-        }
-
-        private boolean canAddEdge(int from, int to) {
-            return from != to && !reaches(to, from);
-        }
-
-        private boolean canAddAll(Collection<SEREdge<KeyType, ValueType>> edges) {
-            Integer commonTarget = null;
-            for (var edge : edges) {
-                if (!isPruningEdge(edge.getType())) {
-                    continue;
-                }
-
-                int from = indexOf(edge.getFrom());
-                int to = indexOf(edge.getTo());
-                if (commonTarget == null) {
-                    commonTarget = to;
-                } else if (commonTarget != to) {
-                    return canAddAllOnEndpointGraph(edges);
-                }
-
-                /*
-                 * Constraint branches generated by SERVerifier point every
-                 * WW/RW edge at the same writer. Such edges cannot create a
-                 * cycle together unless one of them already closes a base
-                 * path from that common target, so no trial graph is needed.
-                 */
-                if (!canAddEdge(from, to)) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private boolean canAddAllOnEndpointGraph(Collection<SEREdge<KeyType, ValueType>> edges) {
-            var localNodeIndex = new HashMap<Integer, Integer>();
-            var globalNodes = new ArrayList<Integer>();
-            var localEdges = new ArrayList<int[]>();
-            for (var edge : edges) {
-                if (!isPruningEdge(edge.getType())) {
-                    continue;
-                }
-
-                int globalFrom = indexOf(edge.getFrom());
-                int globalTo = indexOf(edge.getTo());
-                int localFrom = localNodeIndex.computeIfAbsent(globalFrom, ignored -> {
-                    globalNodes.add(globalFrom);
-                    return globalNodes.size() - 1;
-                });
-                int localTo = localNodeIndex.computeIfAbsent(globalTo, ignored -> {
-                    globalNodes.add(globalTo);
-                    return globalNodes.size() - 1;
-                });
-                localEdges.add(new int[] { localFrom, localTo });
-            }
-
-            if (localEdges.isEmpty()) {
-                return true;
-            }
-
-            /*
-             * Any cycle introduced by these edges alternates between a new edge
-             * and a path already present in the base graph. Since reachable is
-             * the transitive closure, every such base path can be represented by
-             * one edge between endpoints of the new edges. Checking only this
-             * endpoint graph is therefore equivalent to copying and updating the
-             * full transaction reachability matrix.
-             */
-            var localReachable = new BitSet[globalNodes.size()];
-            for (int i = 0; i < globalNodes.size(); i++) {
-                localReachable[i] = new BitSet(globalNodes.size());
-                for (int j = 0; j < globalNodes.size(); j++) {
-                    if (reachable[globalNodes.get(i)].get(globalNodes.get(j))) {
-                        localReachable[i].set(j);
-                    }
-                }
-            }
-
-            for (var edge : localEdges) {
-                int from = edge[0];
-                int to = edge[1];
-                if (!canAddEdge(localReachable, from, to)) {
-                    return false;
-                }
-                addEdge(localReachable, from, to);
-            }
-            return true;
-        }
-
-        private void addEdge(Transaction<KeyType, ValueType> from,
-                             Transaction<KeyType, ValueType> to) {
-            addEdge(indexOf(from), indexOf(to));
-        }
-
-        private void addEdge(int from, int to) {
-            addEdge(reachable, from, to);
-        }
-
-        private void addAll(Collection<SEREdge<KeyType, ValueType>> edges) {
-            for (var edge : edges) {
-                if (isPruningEdge(edge.getType())) {
-                    addEdge(edge.getFrom(), edge.getTo());
-                }
+    private static <KeyType, ValueType> void addKnownEdges(
+            PrecedenceOracle<Transaction<KeyType, ValueType>> oracle,
+            ValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> graph) {
+        for (var endpoint : graph.edges()) {
+            var edges = graph.edgeValue(endpoint).orElse(Collections.emptyList());
+            if (edges.stream().anyMatch(edge -> isNonPredicateEdge(edge.getType()))) {
+                oracle.add(endpoint.source(), endpoint.target());
             }
         }
+    }
 
-        private void addKnownEdges(ValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> graph) {
-            for (var ep : graph.edges()) {
-                var edges = graph.edgeValue(ep).orElse(Collections.emptyList());
-                if (edges.stream().anyMatch(edge -> isNonPredicateEdge(edge.getType()))) {
-                    reachable[indexOf(ep.source())].set(indexOf(ep.target()));
-                }
+    private static <KeyType, ValueType> boolean wouldCycle(
+            PrecedenceOracle<Transaction<KeyType, ValueType>> oracle,
+            Collection<SEREdge<KeyType, ValueType>> edges) {
+        var relations = new ArrayList<PrecedenceOracle.Relation<
+                Transaction<KeyType, ValueType>>>();
+        for (var edge : edges) {
+            if (isPruningEdge(edge.getType())) {
+                relations.add(new PrecedenceOracle.Relation<>(
+                        edge.getFrom(), edge.getTo()));
             }
         }
+        return oracle.wouldCycle(relations);
+    }
 
-        private void transitiveClosure() {
-            for (int k = 0; k < reachable.length; k++) {
-                for (int i = 0; i < reachable.length; i++) {
-                    if (reachable[i].get(k)) {
-                        reachable[i].or(reachable[k]);
-                    }
-                }
+    private static <KeyType, ValueType> void addAll(
+            PrecedenceOracle<Transaction<KeyType, ValueType>> oracle,
+            Collection<SEREdge<KeyType, ValueType>> edges) {
+        for (var edge : edges) {
+            if (isPruningEdge(edge.getType())) {
+                oracle.add(edge.getFrom(), edge.getTo());
             }
-        }
-
-        private void addEdge(BitSet[] graph, int from, int to) {
-            if (graph[from].get(to)) {
-                return;
-            }
-            var newTargets = (BitSet) graph[to].clone();
-            newTargets.set(to);
-            for (int p = 0; p < graph.length; p++) {
-                if ((p == from || graph[p].get(from)) && !graph[p].get(to)) {
-                    graph[p].or(newTargets);
-                }
-            }
-        }
-
-        private boolean canAddEdge(BitSet[] graph, int from, int to) {
-            return from != to && !graph[to].get(from);
-        }
-
-        private int indexOf(Transaction<KeyType, ValueType> txn) {
-            var index = nodeIndex.get(txn);
-            if (index == null) {
-                throw new IllegalStateException("transaction missing from pruning reachability oracle: " + txn);
-            }
-            return index;
         }
     }
 
