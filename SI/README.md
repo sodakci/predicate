@@ -1,12 +1,18 @@
 # SI 使用手册
 
-SI 是本仓库中的谓词感知快照隔离检测器。它读取 PRHIST 历史，构造事务之间的已知依赖、待定写写顺序和谓词读约束，并调用 MonoSAT 判断是否存在一个合法的 SI 解释。
+SI 是本仓库中的谓词感知快照隔离检测器。它读取 PRHIST 历史，构造 Adya typed dependency 的 A/B 边、待定写写顺序和谓词读约束，并调用 MonoSAT 判断是否存在一个合法的 SI 解释。
 
-详细的项目结构、核心算法流程和关键文件说明见：
+当前最终判定不是旧式 AR 序列图：
 
 ```text
-si-result-detector/docs/PROJECT_OVERVIEW.md
+A = {SO, WR, WW, PR_WR}
+B = {RW, PR_RW}
+InducedSI = A ∪ (A ∘ B)
 ```
+
+求解器要求 `InducedSI` 无环。实现中 `depGraph` 表示 A，B 以带 guard 的 typed edge 保存；每加入 A 或 B 都同步补齐 `A ∘ B` 到实际参与 verdict 的 `inducedGraph`。
+
+详细的项目结构和关键文件说明见 [PROJECT_OVERVIEW.md](si-result-detector/docs/PROJECT_OVERVIEW.md)；其中“求解核心：分阶段 MonoSAT 编码”“两图如何实际参与冲突判断”“Predicate 求解核心”和“SAT 循环、判定与冲突提取”四节给出了 guard 公式、A/B 组合、frontier/refinement 与 UNSAT 缩减的完整说明。
 
 ## 目录说明
 
@@ -25,7 +31,6 @@ SI/
     src/main/java/verifier/
     tools/audit-prhist.sh
     tools/run_catalog_experiment.py
-    tools/validate_prhist_suite.py
     monosat/
 ```
 
@@ -182,7 +187,7 @@ java -Djava.library.path=build/monosat -Xmx8g \
 SI detector 正常运行时会打印：
 
 ```text
-Mode: SI, pruning forced WW then checking induced SI graph with MonoSAT predicate frontiers
+Mode: SI, solving Adya typed dependency graphs A/B and checking the induced SI graph
 ```
 
 如果输出里出现 `Mode: SER`，说明当前命令使用的是 SER jar，而不是 SI jar。
@@ -204,8 +209,11 @@ Mode: SI, pruning forced WW then checking induced SI graph with MonoSAT predicat
 ## 常用 audit 参数
 
 ```text
+--pruning-mode NONE|REACHABILITY|SNAPSHOT|PRUN
+    选择 WW/RW 剪枝模式，默认 REACHABILITY。
+
 --no-pruning
-    关闭 pruning。用于对比 pruning 前后的求解行为。
+    强制使用 NONE；优先级高于 --pruning-mode。
 
 --no-coalescing
     关闭相同事务对上的 WW choice 合并。用于调试约束规模。
@@ -220,10 +228,37 @@ Mode: SI, pruning forced WW then checking induced SI graph with MonoSAT predicat
     指定 SAT solver 后端。当前只支持 monosat。
 
 --solver-stats
-    打印 SAT 后端标识和额外统计信息。
+    打印 SAT 后端标识，并启用详细谓词编码计数。
+
+--solver-timeout-seconds
+    当前仅完成 CLI 参数解析，尚未传入 MonoSAT 后端，不能作为已生效的超时机制。
 ```
 
+四种剪枝模式的含义：
+
+- `NONE`：不预先固定 WW 方向，全部交给 MonoSAT。
+- `REACHABILITY`：逐个试加 constraint 两侧的 typed edges，以 `A ∪ (A ∘ B)` 是否成环固定单侧可行的方向。
+- `SNAPSHOT`：只执行共享快照传播；快照闭包只使用 A，可推出的 RW 仍写入 B。
+- `PRUN`：在 SNAPSHOT 传播基础上，再执行 induced-graph 分支剪枝。
+
+未在剪枝阶段拒绝的历史，最终都由同一个 `SISolverInduced` 完成 typed-edge 编码和 induced-graph 判定；剪枝只减少待求解的 WW choices，不改变图语义。
+
+求解器构造分为六个可单独计时的阶段：
+
+```text
+SI_GRAPH_ENCODE_SETUP
+SI_GRAPH_ENCODE_KNOWN_EDGES
+SI_GRAPH_ENCODE_WW
+SI_GRAPH_ENCODE_RW
+SI_GRAPH_ENCODE_PREDICATE
+SI_GRAPH_ENCODE_ACYCLIC
+```
+
+其中 WW 阶段只编码分支的 WW 方向，普通 RW 在下一阶段由 `readFrom + wwOrder` 统一生成。运行时输出的 `Predicate source constraints` 表示 external `(predicate read,key)` frontier 约束数，不是谓词读事件数。
+
 结构化谓词会按 SAT 模型构造 latest-visible 快照并执行完整查询。错误的 JOIN、投影、重复行或遗漏行都会被拒绝；改变查询结果的后续写会生成相应的 `PR_RW` anti-dependency。
+
+谓词编码分为两条路径：row-local `QueryPlan` 在求解前逐 key EAGER 编码；JOIN、`DISTINCT` 等 general query 预先编码带 frontier guard 的 `PR_WR/PR_RW`，求解后只对不匹配的完整快照加入 no-good clause。谓词边不是诊断标签：它们通过统一 typed-edge 入口进入 A/B，并实际参与冲突判断。
 
 示例：
 
@@ -244,7 +279,20 @@ java -Djava.library.path=build/monosat -Xmx12g \
 
 TPC-C StockLevel 当前仍输出 SQL 文本而不是结构化 `query`，因此不属于已完整支持的输入。
 
+当前 SI 未引入 SER 的 GMWR 路径；谓词求解保持 EAGER/general refinement。general 路径在全部 scope key 都为 INTERNAL 时不会创建 `PredicateCheck`：非 row-local 查询不会再次执行完整 JOIN/`DISTINCT` snapshot 求值；row-local 查询若 EAGER 校验失败后回退到该路径，也存在同一跳过边界。
+
 ## 查看统计和 dump
+
+只统计剪枝前后约束规模、不启动最终 MonoSAT 求解：
+
+```bash
+cd SI/si-result-detector
+java -Djava.library.path=build/monosat -Xmx8g \
+  -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
+  constraint-stat --pruning-mode PRUN /absolute/path/to/hist-00000
+```
+
+输出字段包括 `constraints_before/after`、`implications_before/after`、内部一致性和剪枝冲突状态。
 
 统计历史规模：
 

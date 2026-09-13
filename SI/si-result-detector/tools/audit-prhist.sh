@@ -22,8 +22,8 @@ Environment variables:
   SI_RESULT_DETECTOR_OUTPUT_DIR  Directory for audit logs. Default: /tmp/si-result-detector-prhist-audit
 
 Examples:
-  tools/audit-prhist.sh ../PolySIHistories/predicate_high_intensity
-  SI_RESULT_DETECTOR_HEAP=12g tools/audit-prhist.sh ../PolySIHistories/predicate_high_intensity/search_32_420_18_10000_0.5_hotspot/hist-00000
+  tools/audit-prhist.sh ../../predicateHistories/predicate_high_intensity
+  SI_RESULT_DETECTOR_HEAP=12g tools/audit-prhist.sh ../../predicateHistories/predicate_high_intensity/search_32_420_18_10000_0.5_hotspot/hist-00000
 EOF
 }
 

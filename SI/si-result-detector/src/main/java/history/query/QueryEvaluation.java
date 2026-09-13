@@ -56,9 +56,7 @@ public final class QueryEvaluation<KeyType, ValueType> {
     }
 
     public boolean canonicalEquals(RecordedQueryResult<KeyType, ValueType> recorded) {
-        return recorded != null
-                && valueMultiset.equals(recorded.valueMultiset())
-                && canonicalInputs.equals(recorded.canonicalInputs());
+        return recorded != null && recorded.canonicalEquals(this);
     }
 
     static Map<QueryValue, Integer> multiset(List<QueryValue> values) {

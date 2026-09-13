@@ -1,21 +1,67 @@
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import graph.KnownGraph;
+import history.Event;
+import history.History;
 import history.InvalidHistoryError;
 import history.Transaction;
 import history.loaders.PredicateHistoryLoader;
+import history.query.GeneralRecordedQueryResult;
+import history.query.MapVisibleState;
+import history.query.RelationResolver;
+import history.query.RowLocalRecordedQueryResult;
 import verifier.PredicateFixtures;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 public class TestPredicateHistoryLoader {
+    @Test
+    void layersRecordedResultsByQueryCapability() throws Exception {
+        var input = "[{\"key\":\"kv:0\",\"value\":7}]";
+        var rowLocal = "{\"type\":\"pr\",\"query\":{"
+                + "\"from\":{\"relation\":\"kv\"},"
+                + "\"select\":{\"columns\":[\"k\",\"value\"],\"distinct\":false},"
+                + "\"where\":[\"TRUE\"]},\"result\":{\"inputs\":" + input
+                + ",\"values\":[{\"k\":\"0\",\"value\":7}]}}";
+        var distinct = "{\"type\":\"pr\",\"query\":{"
+                + "\"from\":{\"relation\":\"kv\"},"
+                + "\"select\":{\"columns\":[\"value\"],\"distinct\":true},"
+                + "\"where\":[\"TRUE\"]},\"result\":{\"inputs\":" + input
+                + ",\"values\":[{\"value\":7}]}}";
+        var invalidCompact = rowLocal.replace("\"value\":7}]}}",
+                "\"value\":8}]}}");
+        var historyDir = dataset(input, List.of(
+                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                        + rowLocal + "," + distinct + "," + invalidCompact + "]}"));
+
+        var events = new PredicateHistoryLoader(historyDir).loadHistory()
+                .getTransaction(0).getEvents();
+        var compactResult = events.get(0).getRecordedPredicateResult();
+        var generalResult = events.get(1).getRecordedPredicateResult();
+
+        assertTrue(compactResult instanceof RowLocalRecordedQueryResult);
+        assertTrue(compactResult.isCompact());
+        assertEquals("{\"k\":\"0\",\"value\":7}",
+                compactResult.values().get(0).toString());
+        assertTrue(generalResult instanceof GeneralRecordedQueryResult);
+        assertFalse(generalResult.isCompact());
+
+        var invalidEvent = events.get(2);
+        var evaluation = invalidEvent.getPredicate().evaluate(new MapVisibleState<>(
+                Map.of("kv:0", new PredicateHistoryLoader.PredicateValue(7L)),
+                RelationResolver.canonicalStringKeys()));
+        assertFalse(evaluation.canonicalEquals(invalidEvent.getRecordedPredicateResult()));
+    }
+
     @Test
     void loadsCompactKvRelationalPredicateHistory() throws Exception {
         var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0},{\"key\":\"kv:1\",\"value\":1}]", List.of(
@@ -73,6 +119,86 @@ public class TestPredicateHistoryLoader {
         assertEquals(history.getTransaction(0L), graph.getPredicateObservations().get(1)
                 .getTupleSources().get(1).getSourceWrite().getTxn());
         assertTrue(graph.getReadFrom().hasEdgeConnecting(history.getTransaction(0L), history.getTransaction(1L)));
+    }
+
+    @Test
+    void classifiesPredicateReadsPerCoveredKey() throws Exception {
+        var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0},{\"key\":\"kv:1\",\"value\":1}]", List.of(
+                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                        + "{\"type\":\"w\",\"key\":\"kv:0\",\"value\":2},"
+                        + predicateOp("TRUE", "[{\"key\":\"kv:0\",\"value\":2},{\"key\":\"kv:1\",\"value\":1}]") + ","
+                        + predicateOp("TRUE", "[{\"key\":\"kv:0\",\"value\":2},{\"key\":\"kv:1\",\"value\":1}]") + "]}"));
+
+        var graph = new KnownGraph<>(new PredicateHistoryLoader(historyDir).loadHistory());
+        var first = graph.getPredicateObservations().stream()
+                .filter(observation -> observation.getTxn().getId() == 0L && observation.getEventIndex() == 1)
+                .findFirst().orElseThrow();
+        var second = graph.getPredicateObservations().stream()
+                .filter(observation -> observation.getTxn().getId() == 0L && observation.getEventIndex() == 2)
+                .findFirst().orElseThrow();
+
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL, first.getPredicateReadType("kv:0"));
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL, first.getPredicateReadType("kv:1"));
+        assertEquals(0, first.getCoverageEpoch());
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL, second.getPredicateReadType("kv:0"));
+        assertEquals(KnownGraph.PredicateReadType.INTERNAL, second.getPredicateReadType("kv:1"));
+        assertEquals(1, second.getCoverageEpoch());
+        assertEquals(first.getPredicateReadEvent().getPredicate().identity(),
+                second.getPredicateReadEvent().getPredicate().identity());
+    }
+
+    @Test
+    void differentPredicateKeepsCoveredKeysExternal() throws Exception {
+        var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0},{\"key\":\"kv:1\",\"value\":1}]", List.of(
+                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                        + predicateOp("value > 100", "[]") + ","
+                        + predicateOp("TRUE", "[{\"key\":\"kv:0\",\"value\":0},{\"key\":\"kv:1\",\"value\":1}]") + "]}"));
+
+        var graph = new KnownGraph<>(new PredicateHistoryLoader(historyDir).loadHistory());
+        var first = graph.getPredicateObservations().stream()
+                .filter(observation -> observation.getEventIndex() == 0)
+                .findFirst().orElseThrow();
+        var second = graph.getPredicateObservations().stream()
+                .filter(observation -> observation.getEventIndex() == 1)
+                .findFirst().orElseThrow();
+
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL, first.getPredicateReadType("kv:0"));
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL, first.getPredicateReadType("kv:1"));
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL, second.getPredicateReadType("kv:0"));
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL, second.getPredicateReadType("kv:1"));
+        assertNotEquals(first.getPredicateReadEvent().getPredicate().identity(),
+                second.getPredicateReadEvent().getPredicate().identity());
+    }
+
+    @Test
+    void classifiesOnlyKeysCoveredByEachPredicate() {
+        var history = new History<String, Integer>();
+        var initSession = history.addSession(-1L);
+        var initTxn = history.addTransaction(initSession, -1L);
+        history.addWriteEvent(initTxn, "kv:0", 0, null);
+        history.addWriteEvent(initTxn, "kv:1", 1, null);
+        initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var session = history.addSession(0L);
+        var txn = history.addTransaction(session, 0L);
+        history.addPredicateReadEvent(txn, scopedPredicate("kv:0"),
+                List.of(new Event.PredResult<>("kv:0", 0)));
+        history.addPredicateReadEvent(txn, scopedPredicate("kv:1"),
+                List.of(new Event.PredResult<>("kv:1", 1)));
+        txn.setStatus(Transaction.TransactionStatus.COMMIT);
+
+        var observations = new KnownGraph<>(history).getPredicateObservations();
+        var first = observations.stream().filter(observation -> observation.getEventIndex() == 0)
+                .findFirst().orElseThrow();
+        var second = observations.stream().filter(observation -> observation.getEventIndex() == 1)
+                .findFirst().orElseThrow();
+
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL, first.getPredicateReadType("kv:0"));
+        assertNull(first.getPredicateReadType("kv:1"));
+        assertEquals(0, first.getCoverageEpoch());
+        assertNull(second.getPredicateReadType("kv:0"));
+        assertEquals(KnownGraph.PredicateReadType.EXTERNAL, second.getPredicateReadType("kv:1"));
+        assertEquals(0, second.getCoverageEpoch());
     }
 
     @Test
@@ -141,6 +267,20 @@ public class TestPredicateHistoryLoader {
                 + "\"select\":{\"columns\":[\"k\",\"value\"],\"distinct\":false},"
                 + "\"where\":[\"" + whereClause + "\"]},"
                 + "\"result\":{\"inputs\":" + inputsJson + ",\"values\":[]}}";
+    }
+
+    private static PredicateFixtures.RowPredicate<String, Integer> scopedPredicate(String coveredKey) {
+        return new PredicateFixtures.RowPredicate<>() {
+            @Override
+            public boolean test(String key, Integer value) {
+                return coveredKey.equals(key);
+            }
+
+            @Override
+            public boolean covers(String key) {
+                return coveredKey.equals(key);
+            }
+        };
     }
 
     private Path dataset(String initialStateJson, List<String> transactionLines) throws Exception {

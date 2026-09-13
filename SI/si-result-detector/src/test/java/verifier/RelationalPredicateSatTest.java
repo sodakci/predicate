@@ -12,6 +12,11 @@ import org.junit.jupiter.api.io.TempDir;
 class RelationalPredicateSatTest {
     private static final String PURCHASE =
             "{\"key\":\"purchases:p0\",\"value\":{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"buyer\":\"u0\"}}";
+    private static final String PURCHASE_UPDATED =
+            "{\"key\":\"purchases:p0\",\"value\":{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"buyer\":\"u1\"}}";
+    private static final String PURCHASE_UPDATE =
+            "{\"type\":\"w\",\"key\":\"purchases:p0\","
+                    + "\"value\":{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"buyer\":\"u1\"}}";
     private static final String INVENTORY_EMPTY =
             "{\"key\":\"inventory:i0\",\"value\":{\"sku\":\"s0\",\"stock\":0}}";
     private static final String INVENTORY_AVAILABLE =
@@ -30,6 +35,35 @@ class RelationalPredicateSatTest {
                         "[{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"stock\":2}]")));
 
         assertTrue(audit(history));
+    }
+
+    @Test
+    void acceptsJoinThatUsesLatestLocalWrite() throws Exception {
+        var history = writeHistory(
+                "join-latest-local-write",
+                "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
+                transaction(0, 10,
+                        PURCHASE_UPDATE + "," + joinRead(
+                                "[" + PURCHASE_UPDATED + ","
+                                        + INVENTORY_AVAILABLE + "]",
+                                "[{\"purchase_id\":\"p0\",\"sku\":\"s0\","
+                                        + "\"stock\":2}]")));
+
+        assertTrue(audit(history));
+    }
+
+    @Test
+    void rejectsJoinThatIgnoresLatestLocalWrite() throws Exception {
+        var history = writeHistory(
+                "join-ignores-latest-local-write",
+                "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
+                transaction(0, 10,
+                        PURCHASE_UPDATE + "," + joinRead(
+                                "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
+                                "[{\"purchase_id\":\"p0\",\"sku\":\"s0\","
+                                        + "\"stock\":2}]")));
+
+        assertFalse(audit(history));
     }
 
     @Test

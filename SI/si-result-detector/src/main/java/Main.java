@@ -20,7 +20,7 @@ import verifier.Pruning;
 import verifier.SIVerifier;
 
 @Command(name = "si-result-detector", mixinStandardHelpOptions = true, version = "si-result-detector 0.1.0", subcommands = { Audit.class,
-        Stat.class, Dump.class })
+        ConstraintStat.class, Stat.class, Dump.class })
 public class Main implements Callable<Integer> {
     @SneakyThrows
     public static void main(String[] args) {
@@ -36,6 +36,41 @@ public class Main implements Callable<Integer> {
     }
 }
 
+@Command(name = "constraint-stat", mixinStandardHelpOptions = true,
+        description = "Count SI constraints before and after pruning without solving")
+class ConstraintStat implements Callable<Integer> {
+    @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
+    private final HistoryType type = HistoryType.PRHIST;
+
+    @Option(names = { "--pruning-mode" }, required = true,
+            description = "WW/RW pruning mode: ${COMPLETION-CANDIDATES}")
+    private SIVerifier.PruningMode pruningMode;
+
+    @Parameters(description = "history path")
+    private Path path;
+
+    @Override
+    public Integer call() {
+        var loader = Utils.getLoader(type, path);
+        Pruning.setEnablePruning(
+                pruningMode == SIVerifier.PruningMode.REACHABILITY);
+        var verifier = new SIVerifier<>(loader, false, pruningMode);
+        var stats = verifier.analyzeConstraintsOnly();
+        System.out.printf(
+                "CONSTRAINT_STATS pruning_mode=%s constraints_before=%d constraints_after=%d "
+                        + "implications_before=%d implications_after=%d "
+                        + "internally_consistent=%s pruning_inconsistent=%s%n",
+                pruningMode.name(),
+                stats.constraintsBefore,
+                stats.constraintsAfter,
+                stats.implicationsBefore,
+                stats.implicationsAfter,
+                stats.internallyConsistent,
+                stats.pruningInconsistent);
+        return stats.internallyConsistent ? 0 : 2;
+    }
+}
+
 @Command(name = "audit", mixinStandardHelpOptions = true, description = "Verify a history")
 class Audit implements Callable<Integer> {
     @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
@@ -43,6 +78,11 @@ class Audit implements Callable<Integer> {
 
     @Option(names = { "--no-pruning" }, description = "disable pruning")
     private final Boolean noPruning = false;
+
+    @Option(names = { "--pruning-mode" },
+            description = "WW/RW pruning mode: ${COMPLETION-CANDIDATES}")
+    private SIVerifier.PruningMode pruningMode =
+            SIVerifier.PruningMode.REACHABILITY;
 
     @Option(names = { "--no-coalescing" }, description = "disable coalescing")
     private final Boolean noCoalescing = false;
@@ -62,6 +102,14 @@ class Audit implements Callable<Integer> {
     @Option(names = { "--solver-stats" }, description = "print SAT backend and CNF statistics")
     private final Boolean solverStats = false;
 
+    @Option(names = { "--predicate-witness-coalescing" }, negatable = true,
+            description = "coalesce predicate witnesses with the same endpoints and type; default on")
+    private Boolean predicateWitnessCoalescing;
+
+    @Option(names = { "--graph-edge-interning" }, negatable = true,
+            description = "reuse one MonoSAT edge per graph and endpoint pair; default on")
+    private Boolean graphEdgeInterning;
+
     @Parameters(description = "history path")
     private Path path;
 
@@ -71,7 +119,20 @@ class Audit implements Callable<Integer> {
     public Integer call() {
         var loader = Utils.getLoader(type, path);
 
-        Pruning.setEnablePruning(!noPruning);
+        var selectedPruningMode = noPruning
+                ? SIVerifier.PruningMode.NONE
+                : pruningMode;
+        var settings = SIVerifier.SolverSettings.defaults(selectedPruningMode);
+        settings.solverTimeoutSeconds = solverTimeoutSeconds;
+        settings.detailedPredicateMetrics = solverStats;
+        if (predicateWitnessCoalescing != null) {
+            settings.predicateWitnessCoalescing = predicateWitnessCoalescing;
+        }
+        if (graphEdgeInterning != null) {
+            settings.graphEdgeInterning = graphEdgeInterning;
+        }
+        Pruning.setEnablePruning(selectedPruningMode
+                == SIVerifier.PruningMode.REACHABILITY);
         SIVerifier.setCoalesceConstraints(!noCoalescing);
         SIVerifier.setDotOutput(dotOutput);
         SIVerifier.setCompareDerivedPredicateEdges(compareDerivedPredicateEdges);
@@ -82,26 +143,29 @@ class Audit implements Callable<Integer> {
         }
 
         profiler.startTick("ENTIRE_EXPERIMENT");
-        var pass = true;
-        var verifier = new SIVerifier<>(loader);
-        pass = verifier.audit();
+        var verifier = new SIVerifier<>(loader, settings, solverStats);
+        var result = verifier.auditResult();
         profiler.endTick("ENTIRE_EXPERIMENT");
 
         for (var p : profiler.getDurations()) {
             System.err.printf("%s: %dms\n", p.getKey(), p.getValue());
         }
+        for (var p : profiler.getCounts()) {
+            System.err.printf("%s: %d\n", p.getKey(), p.getValue());
+        }
         if (solverStats) {
             System.err.println("[solver-stats] backend=monosat");
+            System.err.printf("[solver-stats] predicate-witness-coalescing=%s%n",
+                    settings.predicateWitnessCoalescing);
+            System.err.printf("[solver-stats] graph-edge-interning=%s%n",
+                    settings.graphEdgeInterning);
+            System.err.printf("[solver-stats] solver-timeout-seconds=%d%n",
+                    settings.solverTimeoutSeconds);
         }
         System.err.printf("Max memory: %s\n", Utils.formatMemory(profiler.getMaxMemory()));
 
-        if (pass) {
-            System.err.println("[[[[ ACCEPT ]]]]");
-            return 0;
-        } else {
-            System.err.println("[[[[ REJECT ]]]]");
-            return -1;
-        }
+        System.err.println(result.marker);
+        return result.exitCode;
     }
 }
 

@@ -11,24 +11,24 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
-import com.google.common.collect.Streams;
 import com.google.common.graph.EndpointPair;
 import com.google.common.graph.ValueGraph;
 
 import org.apache.commons.lang3.tuple.Pair;
 import graph.Edge;
 import graph.EdgeType;
-import graph.MatrixGraph;
 import history.Event;
 import history.History;
 import history.Transaction;
 import history.Event.EventType;
 import history.query.MapVisibleState;
 import history.query.QueryException;
+import history.query.QueryPlan;
 import history.query.RelationResolver;
 
 class Utils {
@@ -97,7 +97,7 @@ class Utils {
             Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue,
             Map<Pair<Transaction<KeyType, ValueType>, KeyType>, ArrayList<Integer>> txnWrites) {
         var writeEv = resolveUniqueSource(
-                ev.getKey(), ev.getValue(), String.format("%s", ev), writesByKeyValue);
+                ev.getKey(), ev.getValue(), () -> String.format("%s", ev), writesByKeyValue);
         if (writeEv == null) {
             return false;
         }
@@ -164,7 +164,7 @@ class Utils {
 
             var ref = resolveUniqueSource(
                     result.getKey(), result.getValue(),
-                    String.format("%s result (%s,%s)",
+                    () -> String.format("%s result (%s,%s)",
                             ev, result.getKey(), result.getValue()),
                     writesByKeyValue);
             if (ref == null) {
@@ -213,13 +213,33 @@ class Utils {
             return null;
         }
 
-        int previousIndex = previous == null ? -1 : previous.getEventIndex();
         var coveredKeys = new HashSet<KeyType>();
         for (var keyValue : writesByKeyValue.keySet()) {
             if (predicate.scope().covers(keyValue.getLeft())) {
                 coveredKeys.add(keyValue.getLeft());
             }
         }
+
+        if (predicate instanceof QueryPlan
+                && !((QueryPlan<?, ?>) predicate).isRowLocal()) {
+            var snapshot = new HashMap<KeyType, ValueType>();
+            boolean allLocal = true;
+            for (var key : coveredKeys) {
+                var selfWrites = txnWrites.get(Pair.of(ev.getTransaction(), key));
+                var latestSelf = latestWriteBefore(selfWrites, pos);
+                if (latestSelf < 0) {
+                    allLocal = false;
+                    break;
+                }
+                snapshot.put(key, ev.getTransaction().getEvents().get(latestSelf).getValue());
+            }
+            if (allLocal && !predicateSnapshotMatches(ev, snapshot)) {
+                return null;
+            }
+            return new PredicateReadState<>(pos, new HashMap<>(resultByKey));
+        }
+
+        int previousIndex = previous == null ? -1 : previous.getEventIndex();
 
         for (var key : coveredKeys) {
             var selfWrites = txnWrites.get(Pair.of(ev.getTransaction(), key));
@@ -237,7 +257,7 @@ class Utils {
 
             if (latestSelf < 0) {
                 // No transaction-local basis for this key. Its observation is
-                // external and is left to VIS/frontier solving.
+                // external and is left to VIS/AR solving.
                 continue;
             }
 
@@ -256,11 +276,42 @@ class Utils {
         return new PredicateReadState<>(pos, new HashMap<>(resultByKey));
     }
 
-    private static <KeyType, ValueType> boolean predicateMatchesRow(
-            Event<KeyType, ValueType> event, KeyType key, ValueType value) {
-        var predicate = event.getPredicate();
-        var relations = predicate.scope().relations();
-        RelationResolver<KeyType> resolver = resolvedKey -> {
+    private static <KeyType, ValueType> boolean predicateSnapshotMatches(
+            Event<KeyType, ValueType> event, Map<KeyType, ValueType> snapshot) {
+        try {
+            var evaluation = event.getPredicate().evaluate(
+                    new MapVisibleState<>(snapshot, relationResolverFor(event)));
+            var recorded = event.getRecordedPredicateResult();
+            if (recorded != null) {
+                if (!evaluation.canonicalEquals(recorded)) {
+                    System.err.printf("%s whole-snapshot query does not match recorded result\n", event);
+                    return false;
+                }
+                return true;
+            }
+            var expectedInputs = new HashMap<KeyType, ValueType>();
+            for (var result : event.getPredResults()) {
+                if (expectedInputs.putIfAbsent(result.getKey(), result.getValue()) != null) {
+                    System.err.printf("%s has duplicate key in predicate result\n", event);
+                    return false;
+                }
+            }
+            if (!evaluation.inputs().equals(expectedInputs)) {
+                System.err.printf("%s whole-snapshot query does not match recorded inputs\n", event);
+                return false;
+            }
+            return true;
+        } catch (QueryException exception) {
+            System.err.printf("%s whole-snapshot query evaluation failed: %s\n",
+                    event, exception.getMessage());
+            return false;
+        }
+    }
+
+    private static <KeyType, ValueType> RelationResolver<KeyType> relationResolverFor(
+            Event<KeyType, ValueType> event) {
+        var relations = event.getPredicate().scope().relations();
+        return resolvedKey -> {
             var canonical = String.valueOf(resolvedKey);
             var separator = canonical.indexOf(':');
             if (separator > 0) {
@@ -271,10 +322,13 @@ class Utils {
             }
             return "__legacy__";
         };
+    }
 
+    private static <KeyType, ValueType> boolean predicateMatchesRow(
+            Event<KeyType, ValueType> event, KeyType key, ValueType value) {
         try {
-            var evaluation = predicate.evaluate(
-                    new MapVisibleState<>(Map.of(key, value), resolver));
+            var evaluation = event.getPredicate().evaluate(
+                    new MapVisibleState<>(Map.of(key, value), relationResolverFor(event)));
             return evaluation.inputs().containsKey(key)
                     && Objects.equals(evaluation.inputs().get(key), value);
         } catch (QueryException exception) {
@@ -285,63 +339,19 @@ class Utils {
     private static <KeyType, ValueType> WriteRef<KeyType, ValueType> resolveUniqueSource(
             KeyType key,
             ValueType value,
-            String context,
+            Supplier<String> context,
             Map<Pair<KeyType, ValueType>, List<WriteRef<KeyType, ValueType>>> writesByKeyValue) {
         var refs = writesByKeyValue.get(Pair.of(key, value));
         if (refs == null || refs.isEmpty()) {
-            System.err.printf("%s has no corresponding write\n", context);
+            System.err.printf("%s has no corresponding write\n", context.get());
             return null;
         }
         if (refs.size() > 1) {
             System.err.printf("%s has ambiguous source for (%s,%s); compact histories require unique (key,value) writes\n",
-                    context, key, value);
+                    context.get(), key, value);
             return null;
         }
         return refs.get(0);
-    }
-
-    static <KeyType, ValueType> Map<Transaction<KeyType, ValueType>, Integer> getOrderInSession(
-            History<KeyType, ValueType> history) {
-        // @formatter:off
-        return history.getSessions().stream()
-                .flatMap(s -> Streams.zip(
-                    s.getTransactions().stream(),
-                    IntStream.range(0, s.getTransactions().size()).boxed(),
-                    Pair::of))
-                .collect(Collectors.toMap(Pair::getKey, Pair::getValue));
-        // @formatter:on
-    }
-
-    /*
-     * Delete edges in a way that preserves reachability
-     */
-    static <KeyType, ValueType> MatrixGraph<Transaction<KeyType, ValueType>> reduceEdges(
-            MatrixGraph<Transaction<KeyType, ValueType>> graph,
-            Map<Transaction<KeyType, ValueType>, Integer> orderInSession) {
-        System.err.printf("Before: %d edges\n", graph.edges().size());
-        var newGraph = MatrixGraph.ofNodes(graph);
-
-        for (var n : graph.nodes()) {
-            var succ = graph.successors(n);
-            // @formatter:off
-            var firstInSession = succ.stream()
-                .collect(Collectors.toMap(
-                    m -> m.getSession(),
-                    Function.identity(),
-                    (p, q) -> orderInSession.get(p)
-                        < orderInSession.get(q) ? p : q));
-
-            firstInSession.values().forEach(m -> newGraph.putEdge(n, m));
-
-            succ.stream()
-                .filter(m -> m.getSession() == n.getSession()
-                        && orderInSession.get(m) == orderInSession.get(n) + 1)
-                .forEach(m -> newGraph.putEdge(n, m));
-            // @formatter:on
-        }
-
-        System.err.printf("After: %d edges\n", newGraph.edges().size());
-        return newGraph;
     }
 
     static <KeyType, ValueType> String conflictsToDot(Collection<Transaction<KeyType, ValueType>> transactions,

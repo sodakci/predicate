@@ -29,7 +29,72 @@ import util.TriConsumer;
 
 @SuppressWarnings("UnstableApiUsage")
 public class SIVerifier<KeyType, ValueType> {
+    public enum AuditResult {
+        ACCEPT(0, "[[[[ ACCEPT ]]]]"),
+        REJECT(-1, "[[[[ REJECT ]]]]"),
+        TIMEOUT(124, "[[[[ TIMEOUT ]]]]");
+
+        public final int exitCode;
+        public final String marker;
+
+        AuditResult(int exitCode, String marker) {
+            this.exitCode = exitCode;
+            this.marker = marker;
+        }
+    }
+
+    @FunctionalInterface
+    public interface SatSolveBackend {
+        /** Empty means that the backend reached its resource limit. */
+        Optional<Boolean> solve(monosat.Solver solver, int remainingSeconds);
+    }
+
+    public static final class SolverSettings {
+        public PruningMode pruningMode = PruningMode.REACHABILITY;
+        public boolean predicateWitnessCoalescing = true;
+        public boolean graphEdgeInterning = true;
+        public int solverTimeoutSeconds = 600;
+        public boolean detailedPredicateMetrics;
+        public SatSolveBackend satSolveBackend;
+
+        public static SolverSettings defaults(PruningMode pruningMode) {
+            var settings = new SolverSettings();
+            settings.pruningMode = Objects.requireNonNull(pruningMode, "pruningMode");
+            return settings;
+        }
+    }
+
+    public enum PruningMode {
+        NONE,
+        REACHABILITY,
+        SNAPSHOT,
+        PRUN
+    }
+
+    public static final class ConstraintStats {
+        public final boolean internallyConsistent;
+        public final boolean pruningInconsistent;
+        public final int constraintsBefore;
+        public final int constraintsAfter;
+        public final int implicationsBefore;
+        public final int implicationsAfter;
+
+        private ConstraintStats(boolean internallyConsistent, boolean pruningInconsistent,
+                int constraintsBefore, int constraintsAfter,
+                int implicationsBefore, int implicationsAfter) {
+            this.internallyConsistent = internallyConsistent;
+            this.pruningInconsistent = pruningInconsistent;
+            this.constraintsBefore = constraintsBefore;
+            this.constraintsAfter = constraintsAfter;
+            this.implicationsBefore = implicationsBefore;
+            this.implicationsAfter = implicationsAfter;
+        }
+    }
+
     private final History<KeyType, ValueType> history;
+    private final boolean detailedPredicateMetrics;
+    private final PruningMode pruningMode;
+    private final SolverSettings solverSettings;
 
     @Getter
     @Setter
@@ -44,33 +109,63 @@ public class SIVerifier<KeyType, ValueType> {
     private static boolean compareDerivedPredicateEdges = false;
 
     public SIVerifier(HistoryLoader<KeyType, ValueType> loader) {
+        this(loader, false, PruningMode.REACHABILITY);
+    }
+
+    public SIVerifier(HistoryLoader<KeyType, ValueType> loader,
+            boolean detailedPredicateMetrics) {
+        this(loader, detailedPredicateMetrics, PruningMode.REACHABILITY);
+    }
+
+    public SIVerifier(HistoryLoader<KeyType, ValueType> loader,
+            boolean detailedPredicateMetrics,
+            PruningMode pruningMode) {
+        this(loader, SolverSettings.defaults(pruningMode), detailedPredicateMetrics);
+    }
+
+    public SIVerifier(HistoryLoader<KeyType, ValueType> loader,
+            SolverSettings solverSettings,
+            boolean detailedPredicateMetrics) {
         history = loader.loadHistory();
+        this.solverSettings = Objects.requireNonNull(solverSettings, "solverSettings");
+        if (solverSettings.solverTimeoutSeconds < 0) {
+            throw new IllegalArgumentException("solverTimeoutSeconds must be >= 0");
+        }
+        this.solverSettings.detailedPredicateMetrics = detailedPredicateMetrics;
+        this.detailedPredicateMetrics = detailedPredicateMetrics;
+        this.pruningMode = Objects.requireNonNull(
+                solverSettings.pruningMode, "pruningMode");
         System.err.printf("Sessions count: %d\nTransactions count: %d\nEvents count: %d\n",
                 history.getClientSessions().size(), history.getClientTransactions().size(), history.getEvents().size());
     }
 
     public boolean audit() {
+        return auditResult() == AuditResult.ACCEPT;
+    }
+
+    public AuditResult auditResult() {
         var profiler = Profiler.getInstance();
+        long checkerStartedNanos = System.nanoTime();
 
         profiler.startTick("ONESHOT_CONS");
         profiler.startTick("SI_VERIFY_INT");
         boolean satisfy_int = Utils.verifyInternalConsistency(history);
         profiler.endTick("SI_VERIFY_INT");
         if (!satisfy_int) {
-            return false;
+            return AuditResult.REJECT;
         }
 
         profiler.startTick("SI_GEN_PREC_GRAPH");
         var graph = new KnownGraph<>(history);
         profiler.endTick("SI_GEN_PREC_GRAPH");
-        System.err.printf("Mandatory known precedence edges: %d\n",
-                graph.getKnownGraphA().edges().size() + graph.getKnownGraphB().edges().size());
+        System.err.printf("Mandatory typed dependency edges: A=%d, B=%d\n",
+                graph.getKnownGraphA().edges().size(),
+                graph.getKnownGraphB().edges().size());
 
-        // ===== SI MODE (Snapshot Isolation with predicates) =====
-        // SI path: first prune WW directions that are already forced by
-        // InducedSI, then let MonoSAT select the remaining WW directions and
-        // generate predicate PR_WR/PR_RW frontiers.
-        System.err.printf("Mode: SI, pruning forced WW then checking induced SI graph with MonoSAT predicate frontiers\n");
+        // ===== SI MODE (Adya typed dependency graphs with predicates) =====
+        // A = {SO, WR, WW, PR_WR}, B = {RW, PR_RW}; the verdict checks
+        // acyclicity of A union (A composition B).
+        System.err.println("Mode: SI, solving Adya typed dependency graphs A/B and checking the induced SI graph");
 
         profiler.startTick("SI_GEN_CONSTRAINTS");
         var constraints = generateConstraintsSI(history, graph);
@@ -89,24 +184,139 @@ public class SIVerifier<KeyType, ValueType> {
                     countEdgesOfType(derivedPredicateGraph.getKnownGraphB(), EdgeType.PR_RW));
         }
 
-        if (Pruning.pruneConstraints(graph, constraints, history)) {
+        int wwInitialConstraints = constraints.size();
+        profiler.addCount("WW_INITIAL_CONSTRAINTS", wwInitialConstraints);
+        boolean pruningRejected;
+        profiler.startTick("WW_BASELINE_PRUNE_MS");
+        try {
+            switch (pruningMode) {
+            case NONE:
+                pruningRejected = false;
+                break;
+            case PRUN:
+                pruningRejected = Prun.prune(history, graph, constraints).inconsistent;
+                break;
+            case SNAPSHOT:
+                pruningRejected = Prun.pruneSnapshotOnly(
+                        history, graph, constraints).inconsistent;
+                break;
+            case REACHABILITY:
+            default:
+                pruningRejected = Pruning.pruneConstraints(graph, constraints, history);
+                break;
+            }
+        } finally {
+            profiler.endTick("WW_BASELINE_PRUNE_MS");
+        }
+        profiler.addCount("WW_BASELINE_FORCED",
+                wwInitialConstraints - constraints.size());
+        profiler.addCount("WW_AFTER_BASELINE", constraints.size());
+
+        if (pruningRejected) {
             profiler.endTick("ONESHOT_CONS");
-            emitRejectDiagnostics(graph, constraints, Pruning.getLastConflicts());
-            return false;
+            var conflicts = pruningMode == PruningMode.REACHABILITY
+                    ? Pruning.<KeyType, ValueType>getLastConflicts()
+                    : Pair.<Collection<Pair<com.google.common.graph.EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>,
+                            Collection<SIConstraint<KeyType, ValueType>>>of(
+                                    Collections.emptyList(), Collections.emptyList());
+            emitRejectDiagnostics(graph, constraints, conflicts);
+            return AuditResult.REJECT;
         }
         profiler.endTick("ONESHOT_CONS");
 
         profiler.startTick("ONESHOT_SOLVE");
-        var solver = new SISolverInduced<>(history, graph, constraints);
-
-        boolean accepted = solver.solve();
+        SISolverInduced<KeyType, ValueType> solver;
+        profiler.startTick("SI_GRAPH_ENCODE");
+        try {
+            solver = new SISolverInduced<>(
+                    history, graph, constraints, true,
+                    detailedPredicateMetrics, solverSettings);
+        } finally {
+            profiler.endTick("SI_GRAPH_ENCODE");
+        }
+        System.err.printf("Predicate source constraints: %d%n",
+                solver.getPredicateSourceConstraintCount());
+        profiler.startTick("SI_GRAPH_SOLVE");
+        SolveStatus status;
+        try {
+            status = solver.solveStatus();
+        } finally {
+            profiler.endTick("SI_GRAPH_SOLVE");
+        }
         profiler.endTick("ONESHOT_SOLVE");
 
-        if (!accepted) {
+        if (status == SolveStatus.TIMEOUT) {
+            printTimeoutTimes(checkerStartedNanos);
+            return AuditResult.TIMEOUT;
+        }
+        if (status == SolveStatus.UNSAT) {
             emitRejectDiagnostics(graph, constraints, solver.getConflicts());
+            return AuditResult.REJECT;
+        }
+        return AuditResult.ACCEPT;
+    }
+
+    private void printTimeoutTimes(long checkerStartedNanos) {
+        var profiler = Profiler.getInstance();
+        System.err.printf(
+                "[SI] timeout-scope=solver checker_ms=%d encode_ms=%s solve_ms=%s monosat_ms=%s%n",
+                (System.nanoTime() - checkerStartedNanos) / 1_000_000L,
+                metricOrDash(profiler, "SI_GRAPH_ENCODE"),
+                metricOrDash(profiler, "SI_GRAPH_SOLVE"),
+                metricOrDash(profiler, "SI_MONOSAT_SOLVE"));
+    }
+
+    private static String metricOrDash(Profiler profiler, String tag) {
+        try {
+            return Long.toString(profiler.getTime(tag));
+        } catch (RuntimeException ignored) {
+            return "-";
+        }
+    }
+
+    public ConstraintStats analyzeConstraintsOnly() {
+        if (!Utils.verifyInternalConsistency(history)) {
+            return new ConstraintStats(false, false, 0, 0, 0, 0);
         }
 
-        return accepted;
+        var graph = new KnownGraph<>(history);
+        var constraints = generateConstraintsSI(history, graph);
+        int constraintsBefore = constraints.size();
+        int implicationsBefore = countConstraintImplications(constraints);
+
+        boolean pruningInconsistent;
+        switch (pruningMode) {
+        case NONE:
+            pruningInconsistent = false;
+            break;
+        case PRUN:
+            pruningInconsistent = Prun.prune(history, graph, constraints).inconsistent;
+            break;
+        case SNAPSHOT:
+            pruningInconsistent = Prun.pruneSnapshotOnly(
+                    history, graph, constraints).inconsistent;
+            break;
+        case REACHABILITY:
+        default:
+            pruningInconsistent = Pruning.pruneConstraints(graph, constraints, history);
+            break;
+        }
+
+        return new ConstraintStats(
+                true,
+                pruningInconsistent,
+                constraintsBefore,
+                constraints.size(),
+                implicationsBefore,
+                countConstraintImplications(constraints));
+    }
+
+    private int countConstraintImplications(
+            Collection<SIConstraint<KeyType, ValueType>> constraints) {
+        return constraints.stream()
+                .mapToInt(constraint -> constraint.getEdges1().size()
+                        + constraint.getEdges2().size())
+                .sum();
     }
 
     private void emitRejectDiagnostics(
@@ -161,7 +371,7 @@ public class SIVerifier<KeyType, ValueType> {
         int conditionalEdges = constraints.stream()
                 .map(c -> c.getEdges1().size() + c.getEdges2().size())
                 .reduce(0, Integer::sum);
-        System.err.println("[SI] Reject reason: induced SI graph is cyclic or MonoSAT WW/predicate-frontier constraints are unsatisfiable.");
+        System.err.println("[SI] Reject reason: Adya typed dependency constraints make the induced SI graph unsatisfiable.");
         System.err.printf(
                 "[SI] Diagnostic counts: knownEdges=%d, unresolvedWWChoices=%d, conditionalDependencyImplications=%d, predicateReads=%d\n",
                 knownEdges, constraints.size(), conditionalEdges, graph.getPredicateObservations().size());
@@ -198,7 +408,6 @@ public class SIVerifier<KeyType, ValueType> {
             Set<Transaction<KeyType, ValueType>> allowedTxns) {
         for (var ep : known.edges()) {
             var labels = known.edgeValue(ep).orElse(List.of()).stream()
-                    .filter(edge -> edge.getType() != EdgeType.PR_WR && edge.getType() != EdgeType.PR_RW)
                     .map(edge -> String.format("known %s%s",
                             edge.getType(),
                             edge.getKey() == null ? "" : String.format(" key=%s", edge.getKey())))
@@ -450,43 +659,162 @@ public class SIVerifier<KeyType, ValueType> {
         private InducedGraph() {
         }
 
-        static <KeyType, ValueType> boolean canAddAll(
-                History<KeyType, ValueType> history,
-                KnownGraph<KeyType, ValueType> graph,
-                Collection<SIEdge<KeyType, ValueType>> edges,
-                boolean requireResolvedPredicates) {
-            var trial = copyOf(history, graph);
-            for (var edge : edges) {
-                if (edge.getFrom().equals(edge.getTo()) || isBottomTxn(edge.getTo())) {
+        /**
+         * Compact branch oracle for the SI criterion A union (A composition B).
+         * It reuses the current endpoint matrices instead of rebuilding a full
+         * KnownGraph and Guava/MatrixGraph stack for every constraint side.
+         */
+        static final class Oracle<KeyType, ValueType> {
+            private final Map<Transaction<KeyType, ValueType>, Integer> nodeIndex =
+                    new IdentityHashMap<>();
+            private final BitSet[] directA;
+            private final BitSet[] directB;
+
+            Oracle(KnownGraph<KeyType, ValueType> graph) {
+                int next = 0;
+                for (var txn : graph.getKnownGraphA().nodes()) {
+                    if (!isBottomTxn(txn)) {
+                        nodeIndex.put(txn, next++);
+                    }
+                }
+                directA = emptyRows(nodeIndex.size());
+                directB = emptyRows(nodeIndex.size());
+                addKnownEdges(graph.getKnownGraphA(), directA);
+                addKnownEdges(graph.getKnownGraphB(), directB);
+            }
+
+            boolean hasCycle() {
+                return !isAcyclic(directA, directB);
+            }
+
+            boolean canAddAll(Collection<SIEdge<KeyType, ValueType>> edges) {
+                var trialA = cloneRows(directA);
+                var trialB = cloneRows(directB);
+                if (!addAll(edges, trialA, trialB)) {
                     return false;
                 }
-                trial.putEdge(edge.getFrom(), edge.getTo(), new Edge<>(edge.getType(), edge.getKey()));
+                return isAcyclic(trialA, trialB);
             }
-            return !inducedGraph(trial).hasLoops();
-        }
 
-        private static <KeyType, ValueType> KnownGraph<KeyType, ValueType> copyOf(
-                History<KeyType, ValueType> history,
-                KnownGraph<KeyType, ValueType> graph) {
-            var copy = new KnownGraph<>(history);
-            copyGraphEdges(graph.getKnownGraphA(), copy);
-            copyGraphEdges(graph.getKnownGraphB(), copy);
-            return copy;
-        }
-
-        private static <KeyType, ValueType> void copyGraphEdges(
-                ValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> source,
-                KnownGraph<KeyType, ValueType> target) {
-            for (var ep : source.edges()) {
-                for (var edge : source.edgeValue(ep).orElse(List.of())) {
-                    target.putEdge(ep.source(), ep.target(), edge);
+            void addAll(Collection<SIEdge<KeyType, ValueType>> edges) {
+                if (!addAll(edges, directA, directB)) {
+                    throw new IllegalArgumentException(
+                            "cannot commit invalid SI dependency branch");
                 }
+            }
+
+            private boolean addAll(Collection<SIEdge<KeyType, ValueType>> edges,
+                    BitSet[] targetA, BitSet[] targetB) {
+                if (edges == null) {
+                    return true;
+                }
+                for (var edge : edges) {
+                    if (edge.getFrom().equals(edge.getTo()) || isBottomTxn(edge.getTo())) {
+                        return false;
+                    }
+                    if (isBottomTxn(edge.getFrom())) {
+                        continue;
+                    }
+                    var from = nodeIndex.get(edge.getFrom());
+                    var to = nodeIndex.get(edge.getTo());
+                    if (from == null || to == null) {
+                        throw new IllegalStateException(
+                                "transaction missing from SI induced-graph oracle");
+                    }
+                    if (isDependencyEdgeA(edge.getType())) {
+                        targetA[from].set(to);
+                    } else if (isDependencyEdgeB(edge.getType())) {
+                        targetB[from].set(to);
+                    } else {
+                        throw new IllegalArgumentException(
+                                "unsupported SI dependency edge type: " + edge.getType());
+                    }
+                }
+                return true;
+            }
+
+            private void addKnownEdges(
+                    ValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> graph,
+                    BitSet[] target) {
+                for (var endpoint : graph.edges()) {
+                    if (isBottomTxn(endpoint.source()) || isBottomTxn(endpoint.target())) {
+                        continue;
+                    }
+                    target[nodeIndex.get(endpoint.source())]
+                            .set(nodeIndex.get(endpoint.target()));
+                }
+            }
+
+            private static BitSet[] emptyRows(int size) {
+                var rows = new BitSet[size];
+                for (int i = 0; i < size; i++) {
+                    rows[i] = new BitSet(size);
+                }
+                return rows;
+            }
+
+            private static BitSet[] cloneRows(BitSet[] source) {
+                var rows = new BitSet[source.length];
+                for (int i = 0; i < source.length; i++) {
+                    rows[i] = (BitSet) source[i].clone();
+                }
+                return rows;
+            }
+
+            private static boolean isAcyclic(BitSet[] directA, BitSet[] directB) {
+                var induced = cloneRows(directA);
+                for (int from = 0; from < directA.length; from++) {
+                    for (int middle = directA[from].nextSetBit(0); middle >= 0;
+                            middle = directA[from].nextSetBit(middle + 1)) {
+                        induced[from].or(directB[middle]);
+                    }
+                }
+
+                var inDegree = new int[induced.length];
+                for (var successors : induced) {
+                    for (int to = successors.nextSetBit(0); to >= 0;
+                            to = successors.nextSetBit(to + 1)) {
+                        inDegree[to]++;
+                    }
+                }
+                var queue = new ArrayDeque<Integer>();
+                for (int node = 0; node < inDegree.length; node++) {
+                    if (inDegree[node] == 0) {
+                        queue.add(node);
+                    }
+                }
+                int visited = 0;
+                while (!queue.isEmpty()) {
+                    int from = queue.removeFirst();
+                    visited++;
+                    for (int to = induced[from].nextSetBit(0); to >= 0;
+                            to = induced[from].nextSetBit(to + 1)) {
+                        if (--inDegree[to] == 0) {
+                            queue.addLast(to);
+                        }
+                    }
+                }
+                return visited == induced.length;
+            }
+
+            private static boolean isDependencyEdgeA(EdgeType type) {
+                return type == EdgeType.SO || type == EdgeType.WR
+                        || type == EdgeType.WW || type == EdgeType.PR_WR;
+            }
+
+            private static boolean isDependencyEdgeB(EdgeType type) {
+                return type == EdgeType.RW || type == EdgeType.PR_RW;
             }
         }
 
         static <KeyType, ValueType> MatrixGraph<Transaction<KeyType, ValueType>> depReachability(
                 KnownGraph<KeyType, ValueType> graph) {
             return depGraph(graph).reachability();
+        }
+
+        static <KeyType, ValueType> boolean hasCycle(
+                KnownGraph<KeyType, ValueType> graph) {
+            return inducedGraph(graph).hasLoops();
         }
 
         static <KeyType, ValueType> boolean reaches(
@@ -507,12 +835,41 @@ public class SIVerifier<KeyType, ValueType> {
             for (int i = 0; i + 1 < cycleNodes.size(); i++) {
                 var from = cycleNodes.get(i);
                 var to = cycleNodes.get(i + 1);
-                var edges = new ArrayList<Edge<KeyType>>();
-                edges.addAll(graph.getKnownGraphA().edgeValue(from, to).orElse(List.of()));
-                edges.addAll(graph.getKnownGraphB().edgeValue(from, to).orElse(List.of()));
-                result.add(Pair.of(com.google.common.graph.EndpointPair.ordered(from, to), edges));
+                appendInducedWitness(graph, from, to, result);
             }
             return result;
+        }
+
+        private static <KeyType, ValueType> void appendInducedWitness(
+                KnownGraph<KeyType, ValueType> graph,
+                Transaction<KeyType, ValueType> from,
+                Transaction<KeyType, ValueType> to,
+                List<Pair<com.google.common.graph.EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>> result) {
+            var directA = graph.getKnownGraphA().edgeValue(from, to)
+                    .orElse(List.of());
+            if (!directA.isEmpty()) {
+                result.add(Pair.of(
+                        com.google.common.graph.EndpointPair.ordered(from, to),
+                        new ArrayList<>(directA)));
+                return;
+            }
+
+            for (var middle : graph.getKnownGraphA().successors(from)) {
+                var first = graph.getKnownGraphA().edgeValue(from, middle)
+                        .orElse(List.of());
+                var second = graph.getKnownGraphB().edgeValue(middle, to)
+                        .orElse(List.of());
+                if (first.isEmpty() || second.isEmpty()) {
+                    continue;
+                }
+                result.add(Pair.of(
+                        com.google.common.graph.EndpointPair.ordered(from, middle),
+                        new ArrayList<>(first)));
+                result.add(Pair.of(
+                        com.google.common.graph.EndpointPair.ordered(middle, to),
+                        new ArrayList<>(second)));
+                return;
+            }
         }
 
         private static <KeyType, ValueType> MatrixGraph<Transaction<KeyType, ValueType>> inducedGraph(

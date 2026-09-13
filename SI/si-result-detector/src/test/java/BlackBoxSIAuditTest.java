@@ -57,6 +57,28 @@ class BlackBoxSIAuditTest {
     }
 
     @Test
+    void pruningModesAndConstraintStatRunThroughTheCli() throws Exception {
+        var historyDir = writeTextHistoryAsPrhist("pruning-modes", List.of(
+                "w(1,1,1,1)",
+                "r(1,1,2,2)"));
+
+        for (var mode : SIVerifier.PruningMode.values()) {
+            var audit = runAuditCommand(
+                    "audit", "-t", "PRHIST", "--pruning-mode", mode.name(),
+                    historyDir.toString());
+            assertEquals(0, audit.exitCode,
+                    () -> mode + " audit failed:\n" + audit.stderr);
+        }
+
+        var stats = runAuditCommand(
+                "constraint-stat", "-t", "PRHIST",
+                "--pruning-mode", "SNAPSHOT", historyDir.toString());
+        assertEquals(0, stats.exitCode);
+        assertTrue(stats.stdout.contains(
+                "CONSTRAINT_STATS pruning_mode=SNAPSHOT"));
+    }
+
+    @Test
     void auditCli_reportsPurePredicateRwCycle() throws Exception {
         var historyDir = writePrhist("pure-prrw", "["
                 + "{\"key\":\"inventory_onhand_x\",\"value\":130000001,\"semantic\":130,\"source_write_id\":1},"

@@ -3,6 +3,7 @@ package history;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -62,6 +63,64 @@ public class History<KeyType, ValueType> {
 
 	public Collection<Event<KeyType, ValueType>> getEvents() {
 		return transactions.values().stream().flatMap(txn -> txn.events.stream()).collect(Collectors.toList());
+	}
+
+	/**
+	 * Ensures every ordinary and predicate-result key has an explicit version on
+	 * the bottom transaction. Missing keys receive an ABSENT write
+	 * ({@code value == null}).
+	 *
+	 * @return keys synthesized on the bottom transaction
+	 */
+	public Set<KeyType> ensureInitialVersions() {
+		var missing = missingInitialKeys();
+		if (missing.isEmpty()) {
+			return missing;
+		}
+
+		var initTxn = getTransaction(-1L);
+		if (initTxn == null) {
+			return Set.of();
+		}
+		for (var key : missing) {
+			addWriteEvent(initTxn, key, null, null);
+		}
+		return missing;
+	}
+
+	public Set<KeyType> missingInitialKeys() {
+		var required = new LinkedHashSet<KeyType>();
+		for (var event : getEvents()) {
+			if (event.getType() == Event.EventType.READ || event.getType() == Event.EventType.WRITE) {
+				if (event.getKey() != null) {
+					required.add(event.getKey());
+				}
+			} else if (event.getType() == Event.EventType.PREDICATE_READ) {
+				for (var result : event.getPredResults()) {
+					if (result.getKey() != null) {
+						required.add(result.getKey());
+					}
+				}
+			}
+		}
+
+		var initialKeys = new HashSet<KeyType>();
+		var initTxn = getTransaction(-1L);
+		if (initTxn != null) {
+			for (var event : initTxn.getEvents()) {
+				if (event.getType() == Event.EventType.WRITE && event.getKey() != null) {
+					initialKeys.add(event.getKey());
+				}
+			}
+		}
+
+		var missing = new LinkedHashSet<KeyType>();
+		for (var key : required) {
+			if (!initialKeys.contains(key)) {
+				missing.add(key);
+			}
+		}
+		return missing;
 	}
 
 	private static boolean isInternalInitSession(Session<?, ?> session) {
