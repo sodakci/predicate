@@ -36,8 +36,42 @@ class BlackBoxSERAuditTest {
         ));
 
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"),
+        assertTrue(result.stderr.contains("SER audit result: ACCEPT"),
                 () -> "expected ACCEPT marker, stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains(
+                "History\nTransactions: 2 | Events: 2 | Predicates: 0"),
+                () -> "stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains("WW\n1 -> 1"));
+        assertTrue(result.stderr.contains("Predicate\nCandidates:"));
+        assertTrue(result.stderr.contains("SAT\nVariables:"));
+        assertTrue(result.stderr.contains("Timing\nWW:"));
+        assertTrue(result.stderr.contains("Peak memory:"));
+        assertTrue(result.stderr.contains("\nGMWR\n"));
+        assertTrue(result.stderr.contains("GMWR-WW reduced:"));
+        assertFalse(result.stderr.contains("ENTIRE_EXPERIMENT:"));
+        assertFalse(result.stderr.contains("Pruning round"));
+        assertFalse(result.stderr.contains("post-check"));
+        assertTrue(result.stderr.stripTrailing().endsWith("SER audit result: ACCEPT"));
+    }
+
+    @Test
+    void auditCli_exposesOnlyPublicAuditOptionsInHelp() throws Exception {
+        var result = runAuditCommand("audit", "--help");
+        var help = result.stdout + result.stderr;
+
+        assertEquals(0, result.exitCode);
+        assertTrue(help.contains("--predicate-encoding"));
+        assertTrue(help.contains("--solver-timeout-seconds"));
+        assertTrue(help.contains("--solver-stats"));
+        assertFalse(help.contains("--predicate-mode"));
+        assertFalse(help.contains("--ser-propagation-mode"));
+        assertFalse(help.contains("--gmwr-prepropagation"));
+        assertFalse(help.contains("--predicate-witness-coalescing"));
+        assertFalse(help.contains("--graph-edge-interning"));
+        assertFalse(help.contains("--ww-pruning"));
+        assertFalse(help.contains("--no-coalescing"));
+        assertFalse(help.contains("--dot-output"));
+        assertFalse(help.contains("--solver="));
     }
 
     @Test
@@ -52,16 +86,24 @@ class BlackBoxSERAuditTest {
         ));
 
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ REJECT ]]]]"),
+        assertTrue(result.stderr.contains("SER audit result: REJECT"),
                 () -> "expected REJECT marker, stderr was:\n" + result.stderr);
         assertTrue(result.stderr.contains("[SER] Reject reason:"),
                 () -> "expected rejection reason, stderr was:\n" + result.stderr);
-        assertTrue(result.stdout.contains("Cycle witness:"),
-                () -> "expected cycle witness, stdout was:\n" + result.stdout);
-        assertTrue(result.stdout.contains("RW key="),
-                () -> "expected cycle edge labels, stdout was:\n" + result.stdout);
-        assertFalse(result.stdout.contains("ops:"),
-                () -> "reject diagnostics should not dump transaction operation lists, stdout was:\n" + result.stdout);
+        assertTrue(result.stdout.isEmpty(),
+                () -> "reject diagnostics should stay on stderr, stdout was:\n" + result.stdout);
+        assertTrue(result.stderr.stripTrailing().endsWith("SER audit result: REJECT"));
+    }
+
+    @Test
+    void auditCli_reportsErrorsWithFinalVerdict() throws Exception {
+        var missing = tempDir.resolve("missing-history");
+
+        var result = runAuditCommand("audit", missing.toString());
+
+        assertEquals(1, result.exitCode);
+        assertTrue(result.stderr.contains("[SER] Error:"));
+        assertTrue(result.stderr.stripTrailing().endsWith("SER audit result: ERROR"));
     }
 
     @Test
@@ -84,28 +126,18 @@ class BlackBoxSERAuditTest {
                         + "{\"key\":\"inventory_onhand_z\",\"value\":130000003,\"semantic\":130,\"source_write_id\":3,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_y\",\"value\":400000002,\"semantic\":40,\"write_id\":12}]}"));
 
-        var result = runAuditCommand("audit", "-t", "PRHIST", historyDir.toString());
+        var result = runAuditCommand("audit", historyDir.toString());
 
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stderr.contains("Mode: SER, solving serialization constraint graph"),
-                () -> "expected serialization graph mode description, stderr was:\n" + result.stderr);
-        assertTrue(result.stderr.contains("Predicate source constraints: 9")
-                        || result.stderr.contains("[SER] Cycle witness: 3 edges"),
-                () -> "expected predicate source constraints or an early PR_RW cycle witness, stderr was:\n" + result.stderr);
         assertTrue(result.stderr.contains("[SER] Conflict clause:"),
                 () -> "expected direct MonoSAT assumption conflict, stderr was:\n" + result.stderr);
-        assertTrue(result.stderr.contains("[PREDICATE_OBLIGATION]"),
-                () -> "expected predicate assumption reason, stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains("[PREDICATE_OBLIGATION]")
+                        || result.stderr.contains("[GMWR_RULE]"),
+                () -> "expected predicate/GMWR assumption reason, stderr was:\n"
+                        + result.stderr);
         assertFalse(result.stderr.contains("Conditional AR implications:"),
                 () -> "legacy AR implication count should not be printed, stderr was:\n" + result.stderr);
-        assertTrue(result.stdout.contains("Cycle witness:"),
-                () -> "expected cycle witness, stdout was:\n" + result.stdout);
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_x"),
-                () -> "expected predicate RW edge for x, stdout was:\n" + result.stdout);
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_y"),
-                () -> "expected predicate RW edge for y, stdout was:\n" + result.stdout);
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_z"),
-                () -> "expected predicate RW edge for z, stdout was:\n" + result.stdout);
+        assertTrue(result.stdout.isEmpty());
     }
 
     @Test
@@ -117,15 +149,25 @@ class BlackBoxSERAuditTest {
                 "{\"session\":1,\"txn\":1,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_\",\"comparator\":\"ge\",\"threshold\":100},\"results\":[]}]}"));
 
-        var disabled = runAuditCommand("audit", "-t", "PRHIST", "--solver-stats",
-                "--no-predicate-witness-coalescing", historyDir.toString());
-        var enabled = runAuditCommand("audit", "-t", "PRHIST", "--solver-stats",
-                "--predicate-mode=GMWR", historyDir.toString());
+        var disabled = runAuditCommand("audit", "--solver-stats",
+                "--predicate-encoding=eager", "--no-predicate-witness-coalescing",
+                historyDir.toString());
+        var enabled = runAuditCommand("audit", "--solver-stats",
+                "--predicate-encoding=GMWR", historyDir.toString());
 
         assertEquals(disabled.exitCode, enabled.exitCode);
-        assertTrue(disabled.stderr.contains("predicate-mode=eager"));
+        assertTrue(disabled.stderr.contains("predicate-encoding=eager"));
+        assertTrue(disabled.stderr.contains("ser-propagation-mode=ww-only"));
+        assertTrue(disabled.stderr.contains("gmwr-prepropagation=false"));
+        assertTrue(disabled.stderr.contains("graph-edge-interning=true"));
         assertFalse(disabled.stderr.contains("Predicate dependency prune:"));
-        assertTrue(enabled.stderr.contains("predicate-mode=gmwr"));
+        assertTrue(enabled.stderr.contains("predicate-encoding=gmwr"));
+        assertTrue(enabled.stderr.contains("\nGMWR\n"));
+        assertTrue(enabled.stderr.contains("GMWR-WW reduced:"));
+        assertTrue(enabled.stderr.indexOf("Timing\n")
+                        < enabled.stderr.indexOf("ENTIRE_EXPERIMENT:"));
+        assertTrue(enabled.stderr.stripTrailing().endsWith(
+                "SER audit result: " + (enabled.exitCode == 0 ? "ACCEPT" : "REJECT")));
     }
 
     @Test
@@ -141,24 +183,8 @@ class BlackBoxSERAuditTest {
         // Theory: serial order T1 -> T2 -> T3. WR: T1->T2 on x and
         // T2->T3 on y. WW: T1->T3 on x. No RW edge points backward.
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"),
+        assertTrue(result.stderr.contains("SER audit result: ACCEPT"),
                 () -> "expected ACCEPT marker, stderr was:\n" + result.stderr);
-    }
-
-    @Test
-    void auditCli_supportsMonosatSolverBackend() throws Exception {
-        var historyDir = writeTextHistoryAsPrhist("monosat-history", List.of(
-                "w(1,1,1,1)",
-                "r(1,1,2,2)"));
-
-        var result = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat", "--solver-stats",
-                historyDir.toString());
-
-        assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"));
-        assertTrue(result.stderr.contains("backend=monosat"), () -> "stderr was:\n" + result.stderr);
-        assertTrue(result.stderr.contains("predicate-mode=eager"),
-                () -> "stderr was:\n" + result.stderr);
     }
 
     @Test
@@ -167,12 +193,17 @@ class BlackBoxSERAuditTest {
                 "w(1,1,1,1)",
                 "r(1,1,2,2)"));
 
-        var result = runAuditCommand("audit", "-t", "PRHIST", "--solver-stats",
+        var result = runAuditCommand("audit", "--solver-stats",
                 historyDir.toString());
 
         assertEquals(0, result.exitCode);
         assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"));
         assertTrue(result.stderr.contains("backend=monosat"), () -> "stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains("predicate-encoding=gmwr"));
+        assertTrue(result.stderr.contains("ser-propagation-mode=ww-gmwr"));
+        assertTrue(result.stderr.contains("gmwr-prepropagation=true"));
+        assertTrue(result.stderr.contains("predicate-witness-coalescing=true"));
+        assertTrue(result.stderr.contains("graph-edge-interning=true"));
     }
 
     @Test
@@ -192,7 +223,7 @@ class BlackBoxSERAuditTest {
         assertEquals(reachability.exitCode, none.exitCode);
         assertEquals(0, reachability.exitCode);
         assertEquals(0, none.exitCode);
-        assertTrue(reachability.stderr.contains("Pruning round 1"),
+        assertFalse(reachability.stderr.contains("Pruning round"),
                 () -> "stderr was:\n" + reachability.stderr);
         assertFalse(none.stderr.contains("Pruning round"),
                 () -> "stderr was:\n" + none.stderr);
@@ -208,7 +239,7 @@ class BlackBoxSERAuditTest {
                     historyDir.toString());
 
             assertEquals(0, result.exitCode);
-            assertTrue(result.stderr.contains("Unresolved WW choices: 0"),
+            assertTrue(result.stderr.contains("WW\n0 -> 0"),
                     () -> "stderr was:\n" + result.stderr);
             assertFalse(result.stderr.contains("pruning round"),
                     () -> "stderr was:\n" + result.stderr);
@@ -227,14 +258,14 @@ class BlackBoxSERAuditTest {
                 "r(2,0,2,2)",
                 "w(2,1,2,2)"));
 
-        var monosat = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat", historyDir.toString());
-        var withoutWwPruning = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat",
+        var monosat = runAuditCommand("audit", historyDir.toString());
+        var withoutWwPruning = runAuditCommand("audit",
                 "--ww-pruning=NONE", historyDir.toString());
 
         assertEquals(-1, monosat.exitCode);
         assertEquals(monosat.exitCode, withoutWwPruning.exitCode);
-        assertTrue(monosat.stderr.contains("[[[[ REJECT ]]]]"));
-        assertTrue(withoutWwPruning.stderr.contains("[[[[ REJECT ]]]]"));
+        assertTrue(monosat.stderr.contains("SER audit result: REJECT"));
+        assertTrue(withoutWwPruning.stderr.contains("SER audit result: REJECT"));
     }
 
     @Test
@@ -251,8 +282,8 @@ class BlackBoxSERAuditTest {
                 "r(2,0,2,2)",
                 "w(2,1,2,2)"));
 
-        assertOptionMatrix(acceptHistory, "PRHIST", 0);
-        assertOptionMatrix(rejectHistory, "PRHIST", -1);
+        assertOptionMatrix(acceptHistory, 0);
+        assertOptionMatrix(rejectHistory, -1);
     }
 
     @Test
@@ -273,19 +304,8 @@ class BlackBoxSERAuditTest {
                         + "{\"type\":\"r\",\"key\":\"dep_y\",\"value\":1,\"semantic\":1,\"source_write_id\":20,\"source_txn\":0},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_x\",\"value\":101,\"semantic\":101,\"write_id\":21}]}"));
 
-        assertOptionMatrix(acceptHistory, "PRHIST", 0);
-        assertOptionMatrix(rejectHistory, "PRHIST", -1);
-    }
-
-    @Test
-    void auditCli_rejectsInvalidSolverArgument() throws Exception {
-        var historyDir = writeTextHistoryAsPrhist("invalid-solver-history", List.of("w(1,1,1,1)"));
-
-        var result = runAuditCommand("audit", "-t", "PRHIST", "--solver", "xxx", historyDir.toString());
-
-        assertEquals(2, result.exitCode);
-        assertTrue(result.stderr.contains("Invalid value") || result.stderr.contains("xxx"),
-                () -> "stderr was:\n" + result.stderr);
+        assertOptionMatrix(acceptHistory, 0);
+        assertOptionMatrix(rejectHistory, -1);
     }
 
     @Test
@@ -301,10 +321,7 @@ class BlackBoxSERAuditTest {
         // because T2 read the initial y=0 and T1 overwrote y. Each partition
         // is acyclic by itself, but A union B has T1 -> T2 -> T1.
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stdout.contains("known WR key=1"),
-                () -> "expected WR edge in cycle witness, stdout was:\n" + result.stdout);
-        assertTrue(result.stdout.contains("RW key=2"),
-                () -> "expected RW edge in cycle witness, stdout was:\n" + result.stdout);
+        assertTrue(result.stderr.contains("[SER] Reject reason:"));
     }
 
     @Test
@@ -322,7 +339,7 @@ class BlackBoxSERAuditTest {
         // PR_WR/source edge T1->T0 for inventory_onhand_x. The SER graph has
         // the cycle T0 -> T1 -> T0.
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ REJECT ]]]]"),
+        assertTrue(result.stderr.contains("SER audit result: REJECT"),
                 () -> "expected REJECT marker, stderr was:\n" + result.stderr);
     }
 
@@ -339,8 +356,7 @@ class BlackBoxSERAuditTest {
         // Theory: WR T1->T0 on dep_y, and empty PR on x requires PR_RW
         // T0->T1 because T1 writes a matching x. The cycle is T1 -> T0 -> T1.
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_x"),
-                () -> "expected PR_RW edge in cycle witness, stdout was:\n" + result.stdout);
+        assertTrue(result.stderr.contains("[SER] Reject reason:"));
     }
 
     @Test
@@ -367,9 +383,7 @@ class BlackBoxSERAuditTest {
         // one initial matching tuple and writes another key to a non-matching
         // value, producing PR_RW T0->T1, T1->T2, T2->T0.
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_x"));
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_y"));
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_z"));
+        assertTrue(result.stderr.contains("[SER] Reject reason:"));
     }
 
     @Test
@@ -386,8 +400,7 @@ class BlackBoxSERAuditTest {
         // Theory: T_bottom -> T1/T2 by WW on x/y. RW T1->T2 on y and
         // RW T2->T1 on x form a classic SER cycle.
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stdout.contains("RW key=1"));
-        assertTrue(result.stdout.contains("RW key=2"));
+        assertTrue(result.stderr.contains("[SER] Reject reason:"));
     }
 
     @Test
@@ -408,7 +421,7 @@ class BlackBoxSERAuditTest {
 
         // Latest-visible frontier semantics accepts this serial manual fixture.
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"),
+        assertTrue(result.stderr.contains("SER audit result: ACCEPT"),
                 () -> "expected ACCEPT marker, stderr was:\n" + result.stderr);
     }
 
@@ -438,21 +451,18 @@ class BlackBoxSERAuditTest {
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_C_0000\",\"value\":430000008,\"semantic\":43,\"write_id\":8}]}"));
 
         // Theory: the manual reject history contains a four-transaction
-        // predicate anti-dependency cycle; the witness should be PR_RW-only.
+        // predicate anti-dependency cycle.
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ REJECT ]]]]"),
+        assertTrue(result.stderr.contains("SER audit result: REJECT"),
                 () -> "expected REJECT marker, stderr was:\n" + result.stderr);
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_A_0000"));
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_B_0000"));
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_C_0000"));
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_D_0000"));
+        assertTrue(result.stderr.contains("[SER] Reject reason:"));
     }
 
     private CliResult runAudit(List<String> historyLines) throws Exception {
         var historyFile = tempDir.resolve("history.txt");
         var historyDir = writeTextHistoryAsPrhist(historyFile.getFileName().toString(), historyLines);
 
-        return runAuditCommand("audit", "-t", "PRHIST", historyDir.toString());
+        return runAuditCommand("audit", historyDir.toString());
     }
 
     private CliResult runPrhistAudit(String name, List<String> lines) throws Exception {
@@ -461,7 +471,7 @@ class BlackBoxSERAuditTest {
 
     private CliResult runPrhistAudit(String name, String initialStateJson, List<String> lines) throws Exception {
         var historyDir = writePrhist(name, initialStateJson, lines);
-        return runAuditCommand("audit", "-t", "PRHIST", historyDir.toString());
+        return runAuditCommand("audit", historyDir.toString());
     }
 
     private Path writePrhist(String name, String initialStateJson, List<String> lines) throws Exception {
@@ -705,32 +715,25 @@ class BlackBoxSERAuditTest {
         return key + "\u0000" + value;
     }
 
-    private void assertOptionMatrix(Path historyPath, String type, int expectedExitCode) throws Exception {
-        var solvers = List.of("monosat");
+    private void assertOptionMatrix(Path historyPath, int expectedExitCode) throws Exception {
         var optionSets = List.of(
                 List.<String>of(),
-                List.of("--ww-pruning=none"),
-                List.of("--no-coalescing"),
-                List.of("--ww-pruning=none", "--no-coalescing"));
+                List.of("--ww-pruning=none"));
 
-        for (var solver : solvers) {
-            for (var options : optionSets) {
-                var args = new java.util.ArrayList<String>();
-                args.add("audit");
-                args.add("-t");
-                args.add(type);
-                args.add("--solver");
-                args.add(solver);
-                args.addAll(options);
-                args.add(historyPath.toString());
+        for (var options : optionSets) {
+            var args = new java.util.ArrayList<String>();
+            args.add("audit");
+            args.addAll(options);
+            args.add(historyPath.toString());
 
-                var result = runAuditCommand(args);
-                assertEquals(expectedExitCode, result.exitCode,
-                        () -> String.format("solver=%s options=%s stderr:%n%s%nstdout:%n%s",
-                                solver, options, result.stderr, result.stdout));
-                assertTrue(result.stderr.contains(expectedExitCode == 0 ? "[[[[ ACCEPT ]]]]" : "[[[[ REJECT ]]]]"),
-                        () -> String.format("solver=%s options=%s stderr:%n%s", solver, options, result.stderr));
-            }
+            var result = runAuditCommand(args);
+            assertEquals(expectedExitCode, result.exitCode,
+                    () -> String.format("options=%s stderr:%n%s%nstdout:%n%s",
+                            options, result.stderr, result.stdout));
+            assertTrue(result.stderr.contains(expectedExitCode == 0
+                            ? "SER audit result: ACCEPT"
+                            : "SER audit result: REJECT"),
+                    () -> String.format("options=%s stderr:%n%s", options, result.stderr));
         }
     }
 
@@ -740,10 +743,6 @@ class BlackBoxSERAuditTest {
 
     private CliResult runAuditCommand(String... args) throws Exception {
         Pruning.setEnablePruning(true);
-        SERVerifier.setCoalesceConstraints(true);
-        SERVerifier.setDotOutput(false);
-        SERVerifier.setCompareDerivedPredicateEdges(false);
-
         var stdout = new ByteArrayOutputStream();
         var stderr = new ByteArrayOutputStream();
         var oldOut = System.out;

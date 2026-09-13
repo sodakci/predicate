@@ -27,9 +27,16 @@ public class Pruning<KeyType, ValueType> {
     private static Pair<?, ?> lastConflicts = emptyConflicts();
 
     private final PrecedenceOracle<Transaction<KeyType, ValueType>> precedence;
+    private final boolean verbose;
 
     Pruning(PrecedenceOracle<Transaction<KeyType, ValueType>> precedence) {
+        this(precedence, true);
+    }
+
+    Pruning(PrecedenceOracle<Transaction<KeyType, ValueType>> precedence,
+            boolean verbose) {
         this.precedence = Objects.requireNonNull(precedence, "precedence");
+        this.verbose = verbose;
     }
 
     PrecedenceOracle<Transaction<KeyType, ValueType>> precedenceOracle() {
@@ -55,7 +62,9 @@ public class Pruning<KeyType, ValueType> {
         int rounds = 1, solvedConstraints = 0, totalConstraints = constraints.size();
         boolean hasCycle = false;
         while (!hasCycle) {
-            System.err.printf("Pruning round %d\n", rounds);
+            if (verbose) {
+                System.err.printf("Pruning round %d\n", rounds);
+            }
             var result = pruneConstraintsWithPostChecking(knownGraph, constraints);
 
             hasCycle = result.getRight();
@@ -70,9 +79,11 @@ public class Pruning<KeyType, ValueType> {
         }
 
         profiler.endTick("SER_PRUNE");
-        System.err.printf("Pruned %d rounds, solved %d constraints\n" + "After prune: graphA: %d, graphB: %d\n", rounds,
-                solvedConstraints, knownGraph.getKnownGraphA().edges().size(),
-                knownGraph.getKnownGraphB().edges().size());
+        if (verbose) {
+            System.err.printf("Pruned %d rounds, solved %d constraints\n" + "After prune: graphA: %d, graphB: %d\n", rounds,
+                    solvedConstraints, knownGraph.getKnownGraphA().edges().size(),
+                    knownGraph.getKnownGraphB().edges().size());
+        }
         return hasCycle;
     }
 
@@ -86,9 +97,11 @@ public class Pruning<KeyType, ValueType> {
         profiler.startTick("SER_PRUNE_POST_CHECK");
         int checked = 0;
         int total = constraints.size();
-        var progress = new PostCheckProgress(total);
-        progress.refresh(checked, solvedConstraints.size(), false);
-        if (total == 0) {
+        var progress = verbose ? new PostCheckProgress(total) : null;
+        if (progress != null) {
+            progress.refresh(checked, solvedConstraints.size(), false);
+        }
+        if (progress != null && total == 0) {
             progress.refresh(checked, solvedConstraints.size(), true);
         }
         for (var c : constraints) {
@@ -98,7 +111,9 @@ public class Pruning<KeyType, ValueType> {
 
             if (!okEither && !okOr) {
                 lastConflicts = Pair.of(Collections.emptyList(), List.of(c));
-                progress.refresh(checked, solvedConstraints.size(), true);
+                if (progress != null) {
+                    progress.refresh(checked, solvedConstraints.size(), true);
+                }
                 profiler.endTick("SER_PRUNE_POST_CHECK");
                 return Pair.of(0, true);
             }
@@ -113,7 +128,9 @@ public class Pruning<KeyType, ValueType> {
                 solvedConstraints.add(c);
             }
 
-            progress.refresh(checked, solvedConstraints.size(), checked == total);
+            if (progress != null) {
+                progress.refresh(checked, solvedConstraints.size(), checked == total);
+            }
         }
         profiler.endTick("SER_PRUNE_POST_CHECK");
 

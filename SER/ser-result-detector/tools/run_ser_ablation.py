@@ -37,7 +37,7 @@ class Config:
     def cli_args(self) -> list[str]:
         return [
             "--ww-pruning", self.ww_pruning,
-            "--predicate-mode", self.predicate,
+            "--predicate-encoding", self.predicate,
             "--ser-propagation-mode", self.propagation,
             ("--gmwr-prepropagation" if self.prepropagation
              else "--no-gmwr-prepropagation"),

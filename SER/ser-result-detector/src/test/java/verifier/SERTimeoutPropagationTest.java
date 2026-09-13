@@ -56,7 +56,7 @@ class SERTimeoutPropagationTest {
         var text = stderr.toString();
         assertFalse(text.contains("[SER] Reject reason:"));
         assertFalse(text.contains("[[[[ REJECT ]]]]"));
-        assertTrue(text.contains("timeout-scope=solver"));
+        assertFalse(text.contains("timeout-scope=solver"));
     }
 
     @Test

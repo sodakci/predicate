@@ -1,14 +1,7 @@
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Locale;
 import java.util.concurrent.Callable;
-import java.util.stream.Collectors;
 
-import history.Event;
-import history.Event.EventType;
-import history.History;
-import history.HistoryLoader;
-import history.Transaction;
 import history.loaders.PredicateHistoryLoader;
 import lombok.SneakyThrows;
 import picocli.CommandLine;
@@ -19,8 +12,8 @@ import picocli.CommandLine.ITypeConverter;
 import util.Profiler;
 import verifier.SERVerifier;
 
-@Command(name = "ser-result-detector", mixinStandardHelpOptions = true, version = "ser-result-detector 0.1.0", subcommands = { Audit.class,
-        ConstraintStat.class, Stat.class, Dump.class })
+@Command(name = "ser-result-detector", mixinStandardHelpOptions = true,
+        version = "ser-result-detector 0.1.0", subcommands = Audit.class)
 public class Main implements Callable<Integer> {
     @SneakyThrows
     public static void main(String[] args) {
@@ -47,40 +40,6 @@ enum WwPruningMode {
     }
 }
 
-@Command(name = "constraint-stat", mixinStandardHelpOptions = true,
-        description = "Count SER constraints before and after pruning without solving")
-class ConstraintStat implements Callable<Integer> {
-    @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
-    private final HistoryType type = HistoryType.PRHIST;
-
-    @Option(names = { "--ww-pruning" },
-            description = "WW pruning: ${COMPLETION-CANDIDATES} (default: ${DEFAULT-VALUE})")
-    private WwPruningMode wwPruning = WwPruningMode.REACHABILITY;
-
-    @Parameters(description = "history path")
-    private Path path;
-
-    @Override
-    public Integer call() {
-        var loader = Utils.getLoader(type, path);
-        var verifier = new SERVerifier<>(loader, false,
-                SERVerifier.PredicateSolvingMode.EAGER, wwPruning.asVerifierMode());
-        var stats = verifier.analyzeConstraintsOnly();
-        System.out.printf(
-                "CONSTRAINT_STATS ww_pruning=%s constraints_before=%d constraints_after=%d "
-                        + "implications_before=%d implications_after=%d "
-                        + "internally_consistent=%s pruning_inconsistent=%s%n",
-                wwPruning.name(),
-                stats.constraintsBefore,
-                stats.constraintsAfter,
-                stats.implicationsBefore,
-                stats.implicationsAfter,
-                stats.internallyConsistent,
-                stats.pruningInconsistent);
-        return stats.internallyConsistent ? 0 : 2;
-    }
-}
-
 @Command(name = "audit", mixinStandardHelpOptions = true, description = "Verify a history")
 class Audit implements Callable<Integer> {
     static final class SerPropagationModeConverter
@@ -92,24 +51,10 @@ class Audit implements Callable<Integer> {
         }
     }
 
-    @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
-    private final HistoryType type = HistoryType.PRHIST;
-
     @Option(names = { "--ww-pruning" },
-            description = "WW pruning: ${COMPLETION-CANDIDATES} (default: ${DEFAULT-VALUE})")
+            hidden = true,
+            description = "[experimental] WW pruning: ${COMPLETION-CANDIDATES}")
     private WwPruningMode wwPruning = WwPruningMode.REACHABILITY;
-
-    @Option(names = { "--no-coalescing" }, description = "disable coalescing")
-    private final Boolean noCoalescing = false;
-
-    @Option(names = { "--dot-output" }, description = "print conflicts in dot format")
-    private final Boolean dotOutput = false;
-
-    @Option(names = { "--compare-derived-predicate-edges" }, description = "derive PR_* graph edges for diagnostics only")
-    private final Boolean compareDerivedPredicateEdges = false;
-
-    @Option(names = { "--solver" }, description = "SAT solver backend; only monosat is supported")
-    private String solverKind = "monosat";
 
     @Option(names = { "--solver-timeout-seconds" }, description = "SAT solver timeout in seconds measured from solve(); 0 disables backend timeout")
     private int solverTimeoutSeconds = 600;
@@ -118,49 +63,70 @@ class Audit implements Callable<Integer> {
             description = "print SAT backend and detailed predicate encoding statistics")
     private final Boolean solverStats = false;
 
-    @Option(names = { "--predicate-mode" },
-            description = "predicate solving mode: ${COMPLETION-CANDIDATES}")
-    private SERVerifier.PredicateSolvingMode predicateSolvingMode =
-            SERVerifier.PredicateSolvingMode.EAGER;
+    @Option(names = { "--predicate-encoding" },
+            description = "predicate encoding: ${COMPLETION-CANDIDATES} (default: gmwr)")
+    private SERVerifier.PredicateSolvingMode predicateEncoding;
 
     @Option(names = { "--ser-propagation-mode" },
             converter = SerPropagationModeConverter.class,
-            description = "SER propagation mode: ww-only, ww-gmwr-oneway, or ww-gmwr")
+            hidden = true,
+            description = "[experimental] internal GMWR propagation mode")
     private SERVerifier.SerPropagationMode serPropagationMode;
 
     @Option(names = { "--gmwr-prepropagation" }, negatable = true,
-            description = "run GMWR simplification before SAT; default follows --predicate-mode. Does not control obligation construction")
+            hidden = true,
+            description = "[experimental] override GMWR prepropagation")
     private Boolean gmwrPrepropagation;
 
     @Option(names = { "--predicate-witness-coalescing" }, negatable = true,
-            description = "coalesce same-endpoint predicate witnesses; default on")
+            hidden = true,
+            description = "[experimental] override witness coalescing")
     private Boolean predicateWitnessCoalescing;
 
     @Option(names = { "--graph-edge-interning" }, negatable = true,
-            description = "intern one MonoSAT theory-edge per (from,to); default on (E2 baseline)")
+            hidden = true,
+            description = "[experimental] override graph edge interning")
     private Boolean graphEdgeInterning;
 
-    @Option(names = { "--verify-incremental-propagation" },
-            description = "compare incremental GMWR-WW notification against a full residual scan")
-    private final Boolean verifyIncrementalPropagation = false;
-
-    @Parameters(description = "history path")
+    @Parameters(paramLabel = "HISTORY", description = "history path")
     private Path path;
 
     private final Profiler profiler = Profiler.getInstance();
+    private SERVerifier.PredicateSolvingMode selectedPredicateEncoding =
+            SERVerifier.PredicateSolvingMode.GMWR;
 
     @Override
     public Integer call() {
-        var loader = Utils.getLoader(type, path);
+        try {
+            return runAudit();
+        } catch (CommandLine.ParameterException exception) {
+            throw exception;
+        } catch (Throwable exception) {
+            System.err.printf("[SER] Error: %s%n",
+                    exception.getMessage() == null
+                            ? exception.getClass().getSimpleName()
+                            : exception.getMessage());
+            System.err.println("SER audit result: ERROR");
+            return 1;
+        }
+    }
+
+    private Integer runAudit() {
+        profiler.clear();
+        var loader = new PredicateHistoryLoader(path);
 
         var selectedPruningMode = wwPruning.asVerifierMode();
+        selectedPredicateEncoding = predicateEncoding != null
+                ? predicateEncoding
+                : SERVerifier.PredicateSolvingMode.GMWR;
         var selectedPropagationMode = serPropagationMode != null
                 ? serPropagationMode
-                : predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR
+                : selectedPredicateEncoding == SERVerifier.PredicateSolvingMode.GMWR
                         ? SERVerifier.SerPropagationMode.WW_GMWR
                         : SERVerifier.SerPropagationMode.WW_ONLY;
         var settings = SERVerifier.SolverSettings.forModes(
-                predicateSolvingMode, selectedPruningMode, selectedPropagationMode);
+                selectedPredicateEncoding, selectedPruningMode,
+                selectedPropagationMode);
         if (gmwrPrepropagation != null) {
             settings.gmwrPrepropagation = gmwrPrepropagation;
         }
@@ -170,34 +136,28 @@ class Audit implements Callable<Integer> {
         if (graphEdgeInterning != null) {
             settings.graphEdgeInterning = graphEdgeInterning;
         }
-        settings.verifyIncrementalPropagation = Boolean.TRUE.equals(
-                verifyIncrementalPropagation);
         settings.solverTimeoutSeconds = solverTimeoutSeconds;
         settings.detailedPredicateMetrics = solverStats;
-        SERVerifier.setCoalesceConstraints(!noCoalescing);
-        SERVerifier.setDotOutput(dotOutput);
-        SERVerifier.setCompareDerivedPredicateEdges(compareDerivedPredicateEdges);
-        if (!"monosat".equalsIgnoreCase(solverKind)) {
-            throw new CommandLine.ParameterException(
-                    new CommandLine(this),
-                    "Invalid value for --solver: only monosat is supported");
-        }
-
+        settings.auditProgressListener = this::printCompletedSection;
         profiler.startTick("ENTIRE_EXPERIMENT");
         var verifier = new SERVerifier<>(loader, settings, solverStats);
+        printHistorySummary(verifier);
         var result = verifier.audit();
         profiler.endTick("ENTIRE_EXPERIMENT");
 
-        for (var p : profiler.getDurations()) {
-            System.err.printf("%s: %dms\n", p.getKey(), p.getValue());
-        }
-        for (var p : profiler.getCounts()) {
-            System.err.printf("%s: %d\n", p.getKey(), p.getValue());
-        }
+        printTimingSummary();
+        System.err.printf("Peak memory: %s%n%n",
+                Utils.formatMemoryWithSpace(profiler.getMaxMemory()));
         if (solverStats) {
+            for (var p : profiler.getDurations()) {
+                System.err.printf("%s: %dms\n", p.getKey(), p.getValue());
+            }
+            for (var p : profiler.getCounts()) {
+                System.err.printf("%s: %d\n", p.getKey(), p.getValue());
+            }
             System.err.println("[solver-stats] backend=monosat");
-            System.err.printf("[solver-stats] predicate-mode=%s%n",
-                    predicateSolvingMode.name().toLowerCase());
+            System.err.printf("[solver-stats] predicate-encoding=%s%n",
+                    selectedPredicateEncoding.name().toLowerCase());
             System.err.printf("[solver-stats] ser-propagation-mode=%s%n",
                     selectedPropagationMode.name().toLowerCase().replace('_', '-'));
             System.err.printf("[solver-stats] gmwr-prepropagation=%s%n",
@@ -208,124 +168,138 @@ class Audit implements Callable<Integer> {
                     settings.graphEdgeInterning);
             System.err.printf("[solver-stats] solver-timeout-seconds=%d%n",
                     settings.solverTimeoutSeconds);
+            System.err.printf("Max memory: %s%n",
+                    Utils.formatMemory(profiler.getMaxMemory()));
+            System.err.println(result.marker);
         }
-        System.err.printf("Max memory: %s\n", Utils.formatMemory(profiler.getMaxMemory()));
-
-        System.err.println(result.marker);
+        System.err.printf("SER audit result: %s%n", result.name());
         return result.exitCode;
     }
-}
 
-@Command(name = "stat", mixinStandardHelpOptions = true, description = "Print some statistics of a history")
-class Stat implements Callable<Integer> {
-    @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
-    private final HistoryType type = HistoryType.PRHIST;
+    private void printHistorySummary(SERVerifier<?, ?> verifier) {
+        System.err.println("History");
+        System.err.printf(Locale.ROOT,
+                "Transactions: %s | Events: %s | Predicates: %s%n%n",
+                grouped(verifier.getTransactionCount()),
+                grouped(verifier.getEventCount()),
+                grouped(verifier.getPredicateObservationCount()));
+        System.err.flush();
+    }
 
-    @Parameters(description = "history path")
-    private Path path;
+    private void printCompletedSection(SERVerifier.AuditStage stage) {
+        switch (stage) {
+        case WW:
+            printWwSummary();
+            break;
+        case GMWR:
+            printGmwrSummary();
+            break;
+        case PREDICATE:
+            printPredicateSummary();
+            break;
+        case SAT:
+            printSatSummary();
+            break;
+        default:
+            throw new IllegalArgumentException("Unknown audit stage: " + stage);
+        }
+        System.err.flush();
+    }
 
-    @Override
-    public Integer call() {
-        var loader = Utils.getLoader(type, path);
-        var history = loader.loadHistory();
+    private void printWwSummary() {
+        long initial = profiler.getCount("WW_INITIAL_CHOICES");
+        long wwAfterReachability = profiler.getCount("WW_AFTER_REACHABILITY");
+        long reachabilityForced = profiler.getCount("WW_REACHABILITY_FORCED");
 
-        var txns = history.getClientTransactions();
-        var events = history.getEvents();
-        var writeFreq = events.stream()
-                .collect(Collectors.toMap(ev -> ev.getKey(), ev -> ev.getType().equals(EventType.WRITE) ? 1 : 0,
-                        Integer::sum))
-                .entrySet().stream().collect(Collectors.toMap(w -> w.getValue(), w -> 1, Integer::sum)).entrySet()
-                .stream().sorted((p, q) -> Integer.compare(p.getKey(), q.getKey()))
-                .collect(Collectors.toCollection(ArrayList::new));
-
-        System.out.printf(
-                "Sessions: %d\n" + "Transactions: %d, read-only: %d, write-only: %d, read-modify-write: %d\n"
-                        + "Events: total %d, read %d, write %d\n" + "Variables: %d\n",
-                history.getClientSessions().size(), txns.size(),
-                txns.stream().filter(txn -> txn.getEvents().stream().allMatch(ev -> ev.getType() == EventType.READ))
-                        .count(),
-                txns.stream().filter(txn -> txn.getEvents().stream().allMatch(ev -> ev.getType() == EventType.WRITE))
-                        .count(),
-                txns.stream().filter(Stat::isReadModifyWriteTxn).count(), events.size(),
-                events.stream().filter(e -> e.getType() == Event.EventType.READ).count(),
-                events.stream().filter(e -> e.getType() == Event.EventType.WRITE).count(),
-                events.stream().map(e -> e.getKey()).distinct().count());
-
-        System.out.println("(writes, #keys):");
-        int min = writeFreq.get(0).getKey(), max = writeFreq.get(writeFreq.size() - 1).getKey();
-        int step = Math.max((max - min) / 8, 1), lowerBound;
-
-        if (writeFreq.get(0).getKey() == 1) {
-            System.out.printf("1: %d\n", writeFreq.get(0).getValue());
-            lowerBound = 2;
+        System.err.println("WW");
+        if (selectedPredicateEncoding == SERVerifier.PredicateSolvingMode.GMWR) {
+            System.err.printf(Locale.ROOT, "%s -> %s -> %s%n",
+                    grouped(initial), grouped(wwAfterReachability),
+                    grouped(profiler.getCount("WW_AFTER_GMWR")));
         } else {
-            lowerBound = 1;
+            System.err.printf(Locale.ROOT, "%s -> %s%n",
+                    grouped(initial), grouped(wwAfterReachability));
         }
-        for (; lowerBound <= max; lowerBound += step) {
-            int x = lowerBound;
-            int count = writeFreq.stream().filter(w -> x <= w.getKey() && w.getKey() < x + step)
-                    .mapToInt(w -> w.getValue()).sum();
-            System.out.printf("%d...%d: %d\n", lowerBound, lowerBound + step - 1, count);
+        System.err.printf(Locale.ROOT, "Reachability forced: %s (%.1f%%)%n",
+                grouped(reachabilityForced), percentage(reachabilityForced, initial));
+        if (selectedPredicateEncoding == SERVerifier.PredicateSolvingMode.GMWR) {
+            long gmwrReduced = Math.max(0L, wwAfterReachability
+                    - profiler.getCount("WW_AFTER_GMWR"));
+            System.err.printf(Locale.ROOT, "GMWR-WW reduced:      %s (%.1f%%)%n",
+                    grouped(gmwrReduced), percentage(gmwrReduced, wwAfterReachability));
         }
-
-        return 0;
+        System.err.println();
     }
 
-    private static boolean isReadModifyWriteTxn(Transaction<?, ?> txn) {
-        var readKeys = new HashSet<Object>();
-        for (var ev : txn.getEvents()) {
-            if (ev.getType().equals(EventType.READ)) {
-                readKeys.add(ev.getKey());
-            } else if (readKeys.contains(ev.getKey())) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-}
-
-@Command(name = "dump", mixinStandardHelpOptions = true, description = "Print a history to stdout")
-class Dump implements Callable<Integer> {
-    @Option(names = { "-t", "--type" }, description = "history type: ${COMPLETION-CANDIDATES}")
-    private final HistoryType type = HistoryType.PRHIST;
-
-    @Parameters(description = "history path")
-    private Path path;
-
-    @Override
-    public Integer call() {
-        var loader = Utils.getLoader(type, path);
-        var history = loader.loadHistory();
-
-        for (var session : history.getSessions()) {
-            for (var txn : session.getTransactions()) {
-                var events = txn.getEvents();
-                System.out.printf("Transaction %s\n", txn);
-                for (var j = 0; j < events.size(); j++) {
-                    var ev = events.get(j);
-                    System.out.printf("%s\n", ev);
-                }
-                System.out.println();
-            }
-        }
-
-        return 0;
+    private void printGmwrSummary() {
+        System.err.println("GMWR");
+        printSummaryTransition("Constraints:",
+                profiler.getCount("GMWR_INITIAL_CONSTRAINTS"),
+                profiler.getCount("GMWR_RESIDUAL_CONSTRAINTS"));
+        printSummaryTransition("Bundles:",
+                profiler.getCount("SER_GMWR_BUNDLES_COUNT"),
+                profiler.getCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT"));
+        System.err.println();
     }
 
+    private void printPredicateSummary() {
+        System.err.println("Predicate");
+        System.err.printf(Locale.ROOT,
+                "Candidates: %s | Physical edges: %s | Skipped: %s%n%n",
+                grouped(profiler.getCount("SER_PRED_DEPENDENCY_CANDIDATES_COUNT")),
+                grouped(profiler.getCount("SER_PRED_DEPENDENCY_PHYSICAL_EDGES_COUNT")),
+                grouped(profiler.getCount("SER_PRED_DEPENDENCY_SKIPPED_COUNT")));
+    }
+
+    private void printSatSummary() {
+        System.err.println("SAT");
+        System.err.printf(Locale.ROOT, "Variables: %s | Constraints: %s%n%n",
+                grouped(profiler.getCount("SER_PROP_RESIDUAL_SAT_VARIABLES_COUNT")),
+                grouped(profiler.getCount("SER_PROP_RESIDUAL_SAT_CONSTRAINTS_COUNT")));
+    }
+
+    private void printTimingSummary() {
+        long gmwrMs = profiler.getTime("GMWR_BUILD_MS")
+                + profiler.getTime("GMWR_REDUCTION_MS")
+                + profiler.getTime("GMWR_WW_BRIDGE_MS");
+        System.err.println("Timing");
+        if (selectedPredicateEncoding == SERVerifier.PredicateSolvingMode.GMWR) {
+            System.err.printf(Locale.ROOT,
+                    "WW: %.3fs | GMWR: %.3fs | Predicate: %.3fs%n",
+                    seconds("WW_REACHABILITY_PRUNE_MS"), gmwrMs / 1000.0,
+                    seconds("SER_AR_ENCODE_PREDICATE"));
+        } else {
+            System.err.printf(Locale.ROOT, "WW: %.3fs | Predicate: %.3fs%n",
+                    seconds("WW_REACHABILITY_PRUNE_MS"),
+                    seconds("SER_AR_ENCODE_PREDICATE"));
+        }
+        System.err.printf(Locale.ROOT,
+                "MonoSAT: %.3fs | Verify: %.3fs | Total: %.3fs%n%n",
+                seconds("SER_MONOSAT_SOLVE"), seconds("SER_VERIFY_INT"),
+                seconds("ENTIRE_EXPERIMENT"));
+        System.err.flush();
+    }
+
+    private static void printSummaryTransition(
+            String label, long initial, long residual) {
+        System.err.printf(Locale.ROOT, "%-12s %9s -> %s%n",
+                label, grouped(initial), grouped(residual));
+    }
+
+    private double seconds(String metric) {
+        return profiler.getTime(metric) / 1000.0;
+    }
+
+    private static String grouped(long value) {
+        return String.format(Locale.ROOT, "%,d", value);
+    }
+
+    private static double percentage(long value, long denominator) {
+        return denominator == 0L ? 0.0 : value * 100.0 / denominator;
+    }
 }
 
 class Utils {
-    static HistoryLoader<?, ?> getLoader(HistoryType type, Path path) {
-        switch (type) {
-        case PRHIST:
-            return new PredicateHistoryLoader(path);
-        default:
-            throw new IllegalArgumentException("Unsupported history type: " + type);
-        }
-
-    }
-
     static String formatMemory(Long memoryBytes) {
         double[] scale = { 1, 1024, 1024 * 1024, 1024 * 1024 * 1024 };
         String[] unit = { "B", "KB", "MB", "GB" };
@@ -337,8 +311,8 @@ class Utils {
         }
         throw new Error("should not be here");
     }
-}
 
-enum HistoryType {
-    PRHIST
+    static String formatMemoryWithSpace(Long memoryBytes) {
+        return formatMemory(memoryBytes).replaceFirst("(?<=\\d)(?=[A-Z])", " ");
+    }
 }

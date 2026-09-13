@@ -28,22 +28,20 @@ final class GmwrWwBridge<KeyType, ValueType> {
     Result scan(
             KnownGraph<KeyType, ValueType> graph,
             Collection<SERConstraint<KeyType, ValueType>> residualWw) {
-        return scan(graph, residualWw, null, false);
+        return scan(graph, residualWw, null);
     }
 
     Result scanAffected(
             KnownGraph<KeyType, ValueType> graph,
             Collection<SERConstraint<KeyType, ValueType>> residualWw,
-            Collection<Transaction<KeyType, ValueType>> affectedTxns,
-            boolean verifyAgainstFullScan) {
-        return scan(graph, residualWw, affectedTxns, verifyAgainstFullScan);
+            Collection<Transaction<KeyType, ValueType>> affectedTxns) {
+        return scan(graph, residualWw, affectedTxns);
     }
 
     private Result scan(
             KnownGraph<KeyType, ValueType> graph,
             Collection<SERConstraint<KeyType, ValueType>> residualWw,
-            Collection<Transaction<KeyType, ValueType>> affectedTxns,
-            boolean verifyAgainstFullScan) {
+            Collection<Transaction<KeyType, ValueType>> affectedTxns) {
         var candidates = affectedTxns == null || affectedTxns.isEmpty()
                 ? residualWw
                 : constraintsTouching(residualWw, affectedTxns);
@@ -51,15 +49,6 @@ final class GmwrWwBridge<KeyType, ValueType> {
         if (incremental.conflict) {
             return incremental.toResult();
         }
-        if (verifyAgainstFullScan && affectedTxns != null && !affectedTxns.isEmpty()) {
-            var full = collectForced(residualWw, precedence);
-            if (full.conflict != incremental.conflict
-                    || full.forced.size() != incremental.forced.size()) {
-                throw new IllegalStateException(
-                        "incremental GMWR-WW scan missed a forced WW/RW branch");
-            }
-        }
-
         var forcedConstraints = Collections.newSetFromMap(
                 new IdentityHashMap<SERConstraint<KeyType, ValueType>, Boolean>());
         for (var branch : incremental.forced) {

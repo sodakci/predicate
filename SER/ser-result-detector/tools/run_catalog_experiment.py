@@ -10,7 +10,6 @@ JSON/CSV outputs suitable for paper tables.
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as dt
 import hashlib
 import json
@@ -25,21 +24,12 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+from run_ser_baseline_vs_gmwr import parse_stderr, run_one, write_csv_atomic
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_JAR = ROOT / "build" / "libs" / "ser-result-detector-1.0.0-SNAPSHOT.jar"
 DEFAULT_MONOSAT_NATIVE_DIR = ROOT / "build" / "monosat"
-VERDICT_RE = re.compile(r"\[\[\[\[\s*(ACCEPT|REJECT)\s*\]\]\]\]")
-TIMER_RE = re.compile(r"^([A-Z0-9_]+):\s+([0-9]+)ms$", re.MULTILINE)
-COUNT_RES = {
-    "sessions_count": re.compile(r"Sessions count:\s*([0-9]+)"),
-    "transactions_count": re.compile(r"Transactions count:\s*([0-9]+)"),
-    "events_count": re.compile(r"Events count:\s*([0-9]+)"),
-    "mandatory_known_edges": re.compile(r"Mandatory known precedence edges:\s*([0-9]+)"),
-    "unresolved_ww_choices": re.compile(r"Unresolved WW choices:\s*([0-9]+)"),
-    "predicate_constraints": re.compile(r"Predicate source constraints:\s*([0-9]+)"),
-}
-MAX_MEMORY_RE = re.compile(r"Max memory:\s*(.+)")
 
 
 def load_json(path: pathlib.Path) -> Any:
@@ -157,28 +147,12 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "case"
 
 
-def parse_metrics(log_text: str) -> Dict[str, Any]:
-    metrics: Dict[str, Any] = {}
-    verdict_match = VERDICT_RE.search(log_text)
-    if verdict_match:
-        metrics["actual_verdict"] = verdict_match.group(1)
-    for key, regex in COUNT_RES.items():
-        match = regex.search(log_text)
-        if match:
-            metrics[key] = int(match.group(1))
-    for name, millis in TIMER_RE.findall(log_text):
-        metrics[f"time_{name.lower()}_ms"] = int(millis)
-    memory_match = MAX_MEMORY_RE.search(log_text)
-    if memory_match:
-        metrics["max_memory"] = memory_match.group(1).strip()
-    return metrics
-
-
 def run_case(case: Dict[str, Any], args: argparse.Namespace, output_root: pathlib.Path,
              logs_dir: pathlib.Path) -> Dict[str, Any]:
     hist_dir = pathlib.Path(case["hist_dir"])
-    log_name = f"{case['case_index']:04d}_{safe_name(case['case'])}.log"
-    log_path = logs_dir / log_name
+    log_stem = f"{case['case_index']:04d}_{safe_name(case['case'])}"
+    stdout_path = logs_dir / f"{log_stem}.stdout.log"
+    stderr_path = logs_dir / f"{log_stem}.stderr.log"
     cmd = [
         args.java,
         *args.jvm_opt,
@@ -188,49 +162,27 @@ def run_case(case: Dict[str, Any], args: argparse.Namespace, output_root: pathli
         "-jar",
         str(args.jar),
         "audit",
-        "-t",
-        args.history_type,
-        "--solver",
-        args.solver,
         "--solver-timeout-seconds",
         str(args.solver_timeout_seconds),
+        "--predicate-encoding",
+        args.predicate_encoding,
     ]
     if args.solver_stats:
         cmd.append("--solver-stats")
-    if args.no_pruning:
-        cmd.append("--no-pruning")
-    if args.no_coalescing:
-        cmd.append("--no-coalescing")
-    if args.compare_derived_predicate_edges:
-        cmd.append("--compare-derived-predicate-edges")
     cmd.append(str(hist_dir))
 
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = str(args.monosat_native_dir) + (
+        os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
     started = dt.datetime.now(dt.timezone.utc)
-    start = time.monotonic()
-    timed_out = False
-    try:
-        completed = subprocess.run(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, timeout=args.timeout_seconds,
-                                   check=False)
-        exit_code = completed.returncode
-        log_text = completed.stdout
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        exit_code = None
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
-        log_text = stdout + stderr + f"\n[[RUNNER TIMEOUT after {args.timeout_seconds}s]]\n"
+    exit_code, elapsed_seconds, timed_out = run_one(
+        cmd, env, stdout_path, stderr_path, args.timeout_seconds)
+    stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+    status, actual, metrics, memory = parse_stderr(stderr_text)
+    if timed_out:
+        status, actual = "TIMEOUT", "TIMEOUT"
 
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-    log_path.write_text(log_text, encoding="utf-8", errors="replace")
-    metrics = parse_metrics(log_text)
-    actual = metrics.get("actual_verdict", "TIMEOUT" if timed_out else "RUNTIME_ERROR")
     expected = case["expected_verdict"]
-    matched = actual == expected
     return {
         "suite": case["suite"],
         "case_index": case["case_index"],
@@ -239,17 +191,21 @@ def run_case(case: Dict[str, Any], args: argparse.Namespace, output_root: pathli
         "expected_verdict": expected,
         "manifest_expected_verdict": case.get("manifest_expected_verdict"),
         "actual_verdict": actual,
-        "matched_expected": matched,
+        "matched_expected": actual == expected,
         "timed_out": timed_out,
         "exit_code": exit_code,
-        "elapsed_wall_ms": elapsed_ms,
+        "elapsed_wall_ms": int(elapsed_seconds * 1000),
         "started_at": started.isoformat(),
-        "raw_log": str(log_path.relative_to(output_root)),
+        "status": status,
+        "max_memory": memory,
+        "stdout_log": str(stdout_path.relative_to(output_root)),
+        "stderr_log": str(stderr_path.relative_to(output_root)),
         "command": shlex.join(cmd),
-        **metrics,
+        **{f"time_{name.lower()}_ms": value for name, value in metrics.items()
+           if name.endswith("_MS") or name in (
+               "ENTIRE_EXPERIMENT", "ONESHOT_CONS", "ONESHOT_SOLVE")},
         "catalog_entry": case["catalog_entry"],
     }
-
 
 def write_results(output_root: pathlib.Path, results: List[Dict[str, Any]], config: Dict[str, Any]) -> None:
     with (output_root / "results.jsonl").open("w", encoding="utf-8") as f:
@@ -260,30 +216,22 @@ def write_results(output_root: pathlib.Path, results: List[Dict[str, Any]], conf
         key
         for result in results
         for key in result.keys()
-        if key.startswith("time_") or key in COUNT_RES or key in ("max_memory",)
+        if key.startswith("time_") or key == "max_memory"
     })
     fieldnames = [
         "suite", "case_index", "case", "expected_verdict", "manifest_expected_verdict", "actual_verdict",
         "matched_expected", "timed_out", "exit_code", "elapsed_wall_ms",
-        *metric_keys, "hist_dir", "raw_log", "command",
+        *metric_keys, "hist_dir", "stdout_log", "stderr_log", "command",
     ]
-    with (output_root / "results.csv").open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(results)
+    write_csv_atomic(output_root / "results.csv", results, fieldnames)
 
     paper_fields = [
         "suite", "case", "expected_verdict", "manifest_expected_verdict", "actual_verdict", "matched_expected",
-        "transactions_count", "events_count", "mandatory_known_edges",
-        "unresolved_ww_choices", "predicate_constraints",
         "time_entire_experiment_ms", "time_oneshot_cons_ms",
-        "time_ser_prune_ms", "time_oneshot_solve_ms",
+        "time_oneshot_solve_ms",
         "elapsed_wall_ms", "max_memory",
     ]
-    with (output_root / "paper_table.csv").open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=paper_fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(results)
+    write_csv_atomic(output_root / "paper_table.csv", results, paper_fields)
 
     summary = summarize(results, config)
     dump_json(output_root / "summary.json", summary)
@@ -324,17 +272,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Extra JVM option; repeat for multiple options")
     parser.add_argument("--monosat-native-dir", type=pathlib.Path, default=DEFAULT_MONOSAT_NATIVE_DIR,
                         help="Directory containing MonoSAT native library, e.g. libmonosat.so")
-    parser.add_argument("--solver", default="monosat", help="SER solver backend")
     parser.add_argument("--solver-timeout-seconds", type=int, default=1800,
                         help="Timeout passed to the solver backend")
     parser.add_argument("--timeout-seconds", type=int, default=2100,
                         help="Wall-clock timeout per case enforced by this runner")
-    parser.add_argument("--history-type", default="prhist", help="History type passed to audit")
+    parser.add_argument("--predicate-encoding", choices=("eager", "gmwr"), default="gmwr",
+                        help="Predicate encoding passed to audit")
     parser.add_argument("--solver-stats", action="store_true", help="Print and parse solver stats when supported")
-    parser.add_argument("--no-pruning", action="store_true", help="Pass --no-pruning")
-    parser.add_argument("--no-coalescing", action="store_true", help="Pass --no-coalescing")
-    parser.add_argument("--compare-derived-predicate-edges", action="store_true",
-                        help="Pass --compare-derived-predicate-edges")
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N catalog cases")
     parser.add_argument("--fail-fast", action="store_true", help="Stop after first mismatch, runtime error, or timeout")
     return parser.parse_args(argv)
@@ -378,14 +322,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "heap": args.heap,
         "stack": args.stack,
         "jvm_opt": args.jvm_opt,
-        "solver": args.solver,
         "solver_timeout_seconds": args.solver_timeout_seconds,
         "runner_timeout_seconds": args.timeout_seconds,
-        "history_type": args.history_type,
+        "predicate_encoding": args.predicate_encoding,
         "solver_stats": args.solver_stats,
-        "no_pruning": args.no_pruning,
-        "no_coalescing": args.no_coalescing,
-        "compare_derived_predicate_edges": args.compare_derived_predicate_edges,
     }
     dump_json(output_root / "config.json", config)
     dump_json(output_root / "machine.json", machine_info(args.java, args.jar))
@@ -397,7 +337,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         result = run_case(case, args, output_root, logs_dir)
         results.append(result)
         print(f"  -> {result['actual_verdict']} wall={result['elapsed_wall_ms']}ms "
-              f"match={result['matched_expected']} log={result['raw_log']}", flush=True)
+              f"match={result['matched_expected']} log={result['stderr_log']}", flush=True)
         write_results(output_root, results, config)
         if args.fail_fast and not result["matched_expected"]:
             break

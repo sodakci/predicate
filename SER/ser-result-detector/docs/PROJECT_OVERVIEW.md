@@ -6,7 +6,7 @@
 2. 逻辑依赖如何转换成 serialization order 约束。
 3. MonoSAT 为何只需要一张 endpoint-only `serializationGraph`。
 
-日常构建和运行命令见 `SER/README.md`，WW/RW pruning 细节见 `docs/prunning.md`。
+日常构建和运行命令见 `SER/README.md`；WW/RW pruning 使用默认的 reachability 检查。
 
 ## 1. 先给出结论
 
@@ -39,7 +39,7 @@ guard = guard(k1) OR guard(k2)
 (a,b,PR_WR,k1) + (a,b,WR,k1)
 ```
 
-不会在语义层或谓词合并层被改写成同一种依赖。Java 层仍分别保留 `PR_WR` 和 `WR`；它们只在投影到 `serializationGraph` 时可共用同一条 `(a,b)` native edge，因为无环性只取决于端点和方向。该行为由 `--[no-]graph-edge-interning` 控制。
+不会在语义层或谓词合并层被改写成同一种依赖。Java 层仍分别保留 `PR_WR` 和 `WR`；它们只在投影到 `serializationGraph` 时可共用同一条 `(a,b)` native edge，因为无环性只取决于端点和方向。生产 G2/E2 均默认启用该内部实现，旧 `--[no-]graph-edge-interning` 仅作为隐藏实验兼容参数。
 
 因此准确答案不是二选一，而是：
 
@@ -53,10 +53,12 @@ guard = guard(k1) OR guard(k2)
 SER detector 读取一段 PRHIST 事务历史，判断是否存在一个能够解释全部点读、写和谓词读的串行执行。输出为：
 
 ```text
-[[[[ ACCEPT ]]]]
-[[[[ REJECT ]]]]
-[[[[ TIMEOUT ]]]]
+SER audit result: ACCEPT
+SER audit result: REJECT
+SER audit result: TIMEOUT
 ```
+
+普通 `audit` 按阶段流式输出精简的 History、WW、可选 GMWR、Predicate、SAT 和 Timing 摘要，隐藏逐轮 pruning、progress bar、bridge epoch 与原始 counter。EAGER 省略 GMWR section 和 WW 第三项。`--solver-stats` 在摘要后输出完整 profiler metrics/counters、求解配置及兼容旧 runner 的 `[[[[ ... ]]]]` 标记；`SER audit result: ...` 始终是最后一行。
 
 当前实现使用定理 33 对应的 Adya 风格依赖关系：
 
@@ -225,7 +227,7 @@ B ->RW C
 
 默认 constraint coalescing 会让同一 writer 事务对跨 key 共用一个方向选择，因为全局串行顺序中不可能在 `k1` 上要求 `A<C`、同时在 `k2` 上要求 `C<A`。这里合并的是“选择变量”，分支内部的各个 `WW/RW/type/key` 边仍保留。
 
-pruning 只提前物化已经被已知可达性或 shared-snapshot 规则唯一决定的分支；未决分支继续进入 SAT。
+pruning 只提前物化已经被已知可达性唯一决定的分支；未决分支继续进入 SAT。
 
 ### 5.3 `SERSolverAR`：编码已知边、WW 和 RW
 
@@ -321,7 +323,7 @@ guard = g1 OR g2
 
 不会在这一层合并，因为 type 不同。`PR_WR` 与 `WR` 也不会在这一层合并，因为该过程只处理 predicate candidates，而且分组键仍包含 type。
 
-这个开关是 `--predicate-witness-coalescing`，当前默认开启，并不等同于 `--no-coalescing` 所控制的 WW constraint coalescing。
+这个内部设置是 `predicateWitnessCoalescing`，生产 G2/E2 均开启；隐藏参数 `--predicate-witness-coalescing` 仅供实验覆盖。WW constraint 始终由 `generateConstraintsCoalesce()` 按事务对合并。
 
 ### 6.3 Serialization graph-edge interning：按 `(from,to)`
 
@@ -415,9 +417,9 @@ D_M 有有向环  <=>  π(D_M) 有有向环
 ```text
 history type                    PRHIST
 pruning mode                   REACHABILITY
-predicate solving mode         EAGER
-SER propagation mode           WW_ONLY
-GMWR prepropagation            false
+predicate solving mode         GMWR
+SER propagation mode           WW_GMWR
+GMWR prepropagation            true
 WW constraint coalescing       true
 predicate witness coalescing   true
 graph-edge interning           true
@@ -426,38 +428,36 @@ solver timeout                 600 seconds
 detailed solver stats          false
 ```
 
-按当前实验命名，这个无参数组合属于 `E2`：`EAGER + WW_ONLY + graph-edge interning`。`E1` 的主要区别是关闭 graph-edge interning。
+按当前实验命名，这个无参数组合属于完整 `G2`：`GMWR + WW_GMWR + prepropagation + witness coalescing + graph-edge interning`。
 
-如果只增加：
-
-```text
---predicate-mode=GMWR
-```
-
-则模式相关默认值变为：
+如果显式使用：
 
 ```text
-predicate solving mode         GMWR
-SER propagation mode           WW_GMWR
-GMWR prepropagation            true
+--predicate-encoding=eager
 ```
 
-其他三种 coalescing/interning 默认仍为开启。
+则切换为论文 E2 baseline：
 
-### 8.2 三个最容易混淆的压缩开关
+```text
+predicate solving mode         EAGER
+SER propagation mode           WW_ONLY
+GMWR prepropagation            false
+```
+
+WW reachability、predicate witness coalescing 和 graph-edge interning 仍开启。E1/G1 所需的物理展开或 one-way propagation 只通过隐藏 experimental flags 保留给 benchmark。
+
+### 8.2 两个物理压缩实验开关
+
+下表 CLI 均为隐藏 experimental 参数；生产 G2/E2 不要求用户指定。
 
 | CLI | 内部设置 | 默认 | 解决的问题 | 关闭后的直接变化 |
 | --- | --- | --- | --- | --- |
-| `--no-coalescing` | `SERVerifier.coalesceConstraints` | 开启 | 同一 writer 事务对可能在多个 key 上重复产生 WW 二选一；全局事务顺序只需要一个方向变量 | 每个 key/读关系可以生成独立 `SERConstraint`，SAT 分支和重复 implication 增多 |
 | `--[no-]predicate-witness-coalescing` | `predicateWitnessCoalescing` | 开启 | 多个 key 产生相同 `(from,to,type)` 的 `PR_WR/PR_RW` witness | 不再把 keys 和 guards 合并，每个 predicate witness 单独进入依赖队列 |
 | `--[no-]graph-edge-interning` | `graphEdgeInterning` | 开启 | 不同 type/key 最终可能产生相同 `(from,to)` 的 MonoSAT serialization edge | 每个送入 `encodeDependencyEdge` 的 Java typed edge各建一条 serialization edge |
 
 三者处理的不是同一个对象：
 
 ```text
-SERConstraint choice
-    --no-coalescing 控制
-
 PR_WR/PR_RW typed witnesses
     --[no-]predicate-witness-coalescing 控制
 
@@ -465,7 +465,7 @@ MonoSAT serializationGraph edge
     --[no-]graph-edge-interning 控制
 ```
 
-它们都以保持 ACCEPT/REJECT 等价为目标，改变的是公式规模和物理表示，不改变六类 Adya relation 的定义。
+两个开关都以保持 ACCEPT/REJECT 等价为目标，改变的是公式规模和物理表示，不改变六类 Adya relation 的定义。
 
 #### `PR_WR(a,b)` 与 `WR(a,b)` 共用 native edge 是否由开关控制
 
@@ -503,7 +503,7 @@ audit --graph-edge-interning history
 
 关闭后，Java 语义层没有变化，只是 MonoSAT 中重新出现同向平行边；预期 verdict 不变，native edge 数量和求解成本可能增大。
 
-### 8.3 WW/RW pruning 开关
+### 8.3 隐藏实验 WW/RW pruning 开关
 
 | CLI | 默认 | 解决的问题 | 对 Adya 图的影响 |
 | --- | --- | --- | --- |
@@ -516,16 +516,16 @@ audit --graph-edge-interning history
 
 | CLI | 默认 | 解决的问题 | 保留的语义 |
 | --- | --- | --- | --- |
-| `--predicate-mode=EAGER` | 是 | row-local 谓词逐 key 直接生成结果合法性 clause；实现路径直接 | 仍构造 source-aware `PR_WR/PR_RW`，general query 仍做模型 refinement |
-| `--predicate-mode=GMWR` | 否 | 合并 `(reader,badWriter)` obligations、剪除不可能 source/frontier，并减少残余 clause | 不改变 recorded source、`PR_WR/PR_RW` 定义或完整查询结果校验 |
+| `--predicate-encoding=eager` | 否 | row-local 谓词逐 key 直接生成结果合法性 clause，对应 E2 | 仍构造 source-aware `PR_WR/PR_RW`，general query 仍做模型 refinement |
+| `--predicate-encoding=gmwr` | 是 | 合并 `(reader,badWriter)` obligations、剪除不可能 source/frontier，并减少残余 clause，对应完整 G2 | 不改变 recorded source、`PR_WR/PR_RW` 定义或完整查询结果校验 |
 
-`--predicate-mode` 选择完整 predicate solving mode，不是 WW pruning 开关。
+`--predicate-encoding` 是公开的完整 predicate solving mode，不是 WW pruning 开关。旧 `--predicate-mode` 已删除。
 
 `predicateWitnessCoalescing` 与该模式独立，CLI 默认在 EAGER 和 GMWR 下都开启；不要把“选择 GMWR”误解为“才会开启 `(from,to,type)` witness 合并”。
 
 ### 8.5 GMWR prepropagation 与 WW feedback
 
-`--[no-]gmwr-prepropagation` 控制是否在 SAT 编码前运行 GMWR 化简：
+内部 `gmwrPrepropagation` 控制是否在 SAT 编码前运行 GMWR 化简；生产 G2 固定开启，`--[no-]gmwr-prepropagation` 仅为隐藏实验覆盖：
 
 | 当前 predicate mode | 默认 | 行为 |
 | --- | --- | --- |
@@ -534,7 +534,7 @@ audit --graph-edge-interning history
 
 关闭 prepropagation 不会关闭 GMWR obligation 构造，也不会退回 EAGER；它只是不在 SAT 前化简这些 obligations。
 
-`--ser-propagation-mode` 控制 GMWR 信息是否反向固定残余 WW choice：
+内部 `serPropagationMode` 控制 GMWR 信息是否反向固定残余 WW choice；生产 G2 固定为 `WW_GMWR`，`--ser-propagation-mode` 仅为隐藏实验覆盖：
 
 | 值 | 默认条件 | 当前作用 |
 | --- | --- | --- |
@@ -544,20 +544,17 @@ audit --graph-edge-interning history
 
 当前 `SERSolverAR` 中只有 `WW_GMWR` 会进入 `GmwrWwBridge`；`WW_ONLY` 和 `WW_GMWR_ONEWAY` 都不会反向物化 WW。并且只有 `predicate mode=GMWR` 时才会构造 GMWR propagation state。
 
-`--verify-incremental-propagation` 默认关闭。它在 GMWR-WW 增量 bridge 中把 affected-only 扫描与 full residual scan 做一致性核对，解决的是实现正确性验证问题，不是新的求解语义；开启会增加诊断开销。
-
-### 8.6 诊断和运行控制开关
+### 8.6 公开运行控制与隐藏实验开关
 
 | CLI | 默认 | 作用 | 是否进入正常 Adya verdict 语义 |
 | --- | --- | --- | --- |
+| `--predicate-encoding=gmwr` | GMWR | 选择默认 G2；`eager` 切换为 E2 | 是，选择等价实现路径 |
 | `--solver-timeout-seconds=600` | 600 秒 | 从 `solve()` 开始限制 MonoSAT 时间；`0` 表示不设 backend timeout | 不改变公式，但可能返回 `TIMEOUT` 而不是等到 SAT/UNSAT |
 | `--solver-stats` | 关 | 输出 SAT、GMWR、coalescing 和 native edge 统计 | 否，只增加统计 |
-| `--compare-derived-predicate-edges` | 关 | 额外运行旧的 derived `PR_*` 图路径作比较 | 否，派生结果明确不送入主 AR SAT solver |
-| `--dot-output` | 关 | 把冲突输出改为 DOT 格式 | 否，只改变输出格式 |
-| `--solver=monosat` | `monosat` | 选择 SAT backend | 当前只接受 MonoSAT，其他值直接报参数错误 |
-| `-t/--type=PRHIST` | `PRHIST` | 选择历史 loader | 当前枚举只有 PRHIST |
 
-### 8.7 如何单独验证某个压缩开关
+普通 `audit --help` 只展示以上三项。E1/G1 和剪枝消融使用的 `--ser-propagation-mode`、GMWR prepropagation、witness coalescing、edge interning 与 WW pruning 仍可解析，但均隐藏并标记 experimental。固定 backend/loader、旧谓词参数和诊断参数已经删除。
+
+### 8.7 如何通过隐藏实验参数验证某个压缩开关
 
 若只想确认 `PR_WR/WR` 的 native edge 共享是否影响结果，应保持其他参数不变，只切换 graph-edge interning：
 
@@ -566,17 +563,16 @@ audit --graph-edge-interning /path/to/history
 audit --no-graph-edge-interning /path/to/history
 ```
 
-若要得到三层压缩都关闭的物理展开基线：
+若要关闭两层谓词物理压缩：
 
 ```bash
 audit \
-  --no-coalescing \
   --no-predicate-witness-coalescing \
   --no-graph-edge-interning \
   /path/to/history
 ```
 
-前一组只隔离 `(from,to)` native edge 复用；后一组会同时扩大 WW constraints、predicate witness 队列和 MonoSAT native 图，不能把性能差异只归因于 graph-edge interning。
+前一组只隔离 `(from,to)` native edge 复用；后一组会同时扩大 predicate witness 队列和 MonoSAT native 图，不能把性能差异只归因于 graph-edge interning。
 
 ## 9. 完整例子
 

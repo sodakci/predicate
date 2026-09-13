@@ -6,9 +6,8 @@
 
 | 层级 | 文件 | 类 / 函数 | 代码作用 |
 | --- | --- | --- | --- |
-| JAR/CLI 入口 | `SER/ser-result-detector/src/main/java/Main.java` | `Main.main(String[])` | 创建 Picocli `CommandLine`，注册 `audit`、`constraint-stat`、`stat`、`dump` 子命令，进程退出码取子命令返回值。 |
+| JAR/CLI 入口 | `SER/ser-result-detector/src/main/java/Main.java` | `Main.main(String[])` | 创建 Picocli `CommandLine`，只注册 `audit` 子命令，进程退出码取该命令返回值。 |
 | SER 命令入口 | 同上 | `Audit.call()` | 解析 SER 配置，构造 `PredicateHistoryLoader`、`SERVerifier.SolverSettings`，调用 `SERVerifier.audit()`，打印 timing/count、最大内存和 verdict marker。 |
-| 辅助启动器 | `SER/ser-result-detector/src/main/java/Launcher.java` | `Launcher.main()` | 通过 `JarClassLoader.invokeMain("Main", args)` 间接启动；Gradle `application.mainClass` 和 JAR manifest 的直接入口仍是 `Main`。 |
 | checker 总控 | `SER/ser-result-detector/src/main/java/verifier/SERVerifier.java` | `SERVerifier.audit()` | 串联一致性检查、`KnownGraph`、WW/RW constraint、基线 pruning、`SERSolverAR` 编码和求解，并映射到 verdict。 |
 | precedence primitive | `SER/ser-result-detector/src/main/java/verifier/PrecedenceOracle.java` | `before/successor/predecessor/wouldCycle` | 唯一 Java precedence engine；统一维护增量传递闭包和批量 branch 成环预判。 |
 | 求解入口 | `SER/ser-result-detector/src/main/java/verifier/SERSolverAR.java` | 构造函数；`solve()`；`solveOnce()` | 构造 logical dependency layer + 唯一 MonoSAT serialization graph；调用 MonoSAT；必要时做 predicate model refinement。 |
@@ -20,15 +19,14 @@
 ```text
 Main.main
   -> Audit.call
-     -> Main.Utils.getLoader
-        -> new PredicateHistoryLoader(path)
+     -> new PredicateHistoryLoader(path)
      -> new SERVerifier(loader, settings, solverStats)
         -> loader.loadHistory()
      -> SERVerifier.audit
         -> verifier.Utils.verifyInternalConsistency
         -> new KnownGraph(history)
         -> SERVerifier.generateConstraintsSER
-        -> Pruning.pruneConstraints / Prun.prune / Prun.pruneSnapshotOnly / NONE
+        -> Pruning.pruneConstraints / NONE
         -> new SERSolverAR(history, graph, residualConstraints, ...)
            -> propagateBeforeEncoding [GMWR only]
            -> buildKnownOrder
@@ -48,7 +46,7 @@ Main.main
 
 | 文件 | 类 / 函数 | 索引 |
 | --- | --- | --- |
-| `src/main/java/history/loaders/PredicateHistoryLoader.java` | `loadHistory()` | 读取同目录 `initial_state.json` 和 `history.prhist.jsonl`。当前唯一 CLI `HistoryType` 是 `PRHIST`。 |
+| `src/main/java/history/loaders/PredicateHistoryLoader.java` | `loadHistory()` | 读取同目录 `initial_state.json` 和 `history.prhist.jsonl`；`audit` 直接构造该 loader。 |
 | 同上 | `loadInitialState()` | 创建 `session=-1, txn=-1` 的 bottom/init transaction；每个初始 tuple 变成 WRITE。 |
 | 同上 | `parseTransactionHeader()` / `parseTransaction()` | 显式读取整数`session_seq`，拒绝同session重复值；按`(session, session_seq)`排序后，只接受`status=commit`并把transaction加入对应session。 |
 | 同上 | `parseOperation()` | `w -> addWriteEvent`，`r -> addReadEvent`，`pr -> StructuredQueryParser + RecordedQueryResult`。 |
@@ -98,12 +96,10 @@ Main.main
 | --- | --- | --- |
 | SO | `KnownGraph` constructor：每个 session 的相邻 transaction | 不产生候选 SO。 |
 | WR | `KnownGraph` constructor：point read 唯一 source writer -> reader，同时写入 `readFrom` 和 A | 不由 SAT 选择。 |
-| WW | `SERVerifier.generateConstraintsCoalesce/NoCoalesce` 产生两方向候选；pruning/GMWR feedback 可把被迫分支提交到 A | residual 分支由 `SERSolverAR.encodeRemainingWwChoices()` 以 Boolean guard 编码。 |
+| WW | `SERVerifier.generateConstraintsCoalesce` 产生两方向候选；pruning/GMWR feedback 可把被迫分支提交到 A | residual 分支由 `SERSolverAR.encodeRemainingWwChoices()` 以 Boolean guard 编码。 |
 | RW | 同一 WW decision 分支内由固定 WR + 另一 writer 产生；forced 分支提交到 B，residual 分支由同一 guard 激活 | 无独立 RW 重建路径。 |
 | Pred-WR (`PR_WR`) | 主路径初始 `KnownGraph` 不生成 | `SERSolverAR` 的 recorded source / selected frontier 产生 fixed 或 guarded PR_WR；GMWR preprop 可产生 definite typed PR_WR。 |
 | Pred-RW (`PR_RW`) | 主路径初始 `KnownGraph` 不生成 | `LatestVisibleChecker` 产出 source validity，`assertLatestVisible()`、`encodeSelectedPredicateDependencies()` 根据 selected source、later write 和 result delta 产生 guarded PR_RW。 |
-
-`SERVerifier.injectPredicateEdgesSER()` / `refreshDerivedPredicateEdges()` 是 `--compare-derived-predicate-edges` 的诊断路径，日志明确标注“不被 AR SAT solver 使用”；不能把该路径当作生产求解调用链。
 
 ## 5. 普通 WW/RW candidate 与保存结构
 
@@ -112,7 +108,6 @@ Main.main
 | `src/main/java/verifier/SEREdge.java` | `SEREdge` | checker/solver 层的带 `(from,to,type,keys)` 逻辑依赖描述；不是 Guava graph edge，也不是 MonoSAT literal。 |
 | `src/main/java/verifier/SERConstraint.java` | `SERConstraint` | `edges1 OR edges2`，附两个 writer transaction 和 id。这里没有单独的 `Option`/`Group` class；两个 edge collections 就是两个 option，constraint 本身就是 group。 |
 | `src/main/java/verifier/SERVerifier.java` | `generateConstraintsCoalesce()` | 对同 key writer pair 创建双向 WW；把对应 `WR(a,b,k)` 推出的 `RW(b,c,k)` 放入选择 `WW(a,c,k)` 的同一分支；同一 transaction pair 的多个 key 合并为一个 constraint。 |
-| 同上 | `generateConstraintsNoCoalesce()` | 每个 WR/third-writer 建一个 `{WW+RW} OR {reverse WW}`，另为每个 writer pair 建独立 WW 二选一。 |
 
 ## 6. Pruning / reachability
 
@@ -127,11 +122,7 @@ Main.main
 
 保留 `Pruning` 的完整 branch-cycle判断：对两个候选 branch分别调用共享 oracle的批量 `wouldCycle()`；一侧非法时物化另一侧，两侧非法时报告冲突。此次统一只改变 `before relation` 的所有权，不改变该规则。
 
-### 6.2 已退出生产路径的 shared-snapshot 原型
-
-`verifier/Prun.java` 暂时保留供第二阶段物理清理前核对历史实现，但 `audit`、`constraint-stat`、默认脚本和主要验收测试均不再调用它。生产流程固定使用上一节的 WW reachability；该原型产生的图构造、closure、propagation 与 post-check 不参与当前 verdict。
-
-### 6.3 唯一 deterministic before relation
+### 6.2 唯一 deterministic before relation
 
 `SERVerifier`创建一次 `PrecedenceOracle<Transaction>`，并经constructor injection传给 `Pruning`、`SERSolverAR`、`GmwrPropagationState`和 `GmwrWwBridge`。所有生产组件的 `before(a,b)`读取同一实例，solver known-order不再另建 closure。
 
@@ -212,19 +203,11 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 
 | CLI | 默认 | 消费位置 |
 | --- | --- | --- |
-| `-t/--type` | `PRHIST` | `Main.Utils.getLoader()`；当前 enum 只有 PRHIST。 |
-| `--ww-pruning` | `REACHABILITY` | 仅允许 `NONE/REACHABILITY`；`SERVerifier.audit()` WW reachability switch。 |
-| `--no-coalescing` | false | static `SERVerifier.coalesceConstraints`；控制 WW constraint generation。 |
-| `--predicate-mode` | `EAGER` | `SolverSettings.predicateSolvingMode`；选择 predicate EAGER/GMWR。 |
-| `--ser-propagation-mode` | EAGER=`WW_ONLY`，GMWR=`WW_GMWR` | `propagateBeforeEncoding()`；只有 `WW_GMWR` 执行 GMWR->WW feedback。 |
-| `--[no-]gmwr-prepropagation` | 跟随是否 GMWR | 控制 `GmwrPropagationState.propagate()`，不控制 GMWR obligation 是否构造。 |
-| `--[no-]predicate-witness-coalescing` | true | predicate `(from,to,type)` witness 合并。 |
-| `--[no-]graph-edge-interning` | true | `serializationGraph` 每 endpoint pair 是否复用 physical theory edge。 |
-| `--verify-incremental-propagation` | false | GMWR-WW affected scan 与 full scan 自检。 |
+| `--predicate-encoding` | `GMWR` | 公开算法选择；默认映射完整 G2，`eager` 映射 E2。 |
 | `--solver-timeout-seconds` | 600 | `SERSolverAR.solveOnce()`。 |
 | `--solver-stats` | false | detailed predicate counts和配置输出。 |
-| `--dot-output` | false | REJECT diagnostics。 |
-| `--compare-derived-predicate-edges` | false | 只跑独立诊断 PR edge derivation，不供 solver 使用。 |
+
+普通 `audit --help` 只公开上述三项。E1/G1 与剪枝实验仍可使用隐藏的 `--ww-pruning`、`--ser-propagation-mode`、`--[no-]gmwr-prepropagation`、`--[no-]predicate-witness-coalescing` 和 `--[no-]graph-edge-interning`。固定 backend/loader、旧谓词别名、非合并 WW、增量校验和派生图诊断入口均已删除。
 
 ## 11. Statistics / timing / debug 索引
 
@@ -238,8 +221,8 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | `publishResidualSatStats()` | residual WW choice 数、`solver.nVars()`、`solver.nClauses()`。 |
 | `PredicateEncodingMetrics.publish()` / `publishGmwrMetrics()` | source/scope/frontier/witness/physical edge/blocking clause/GMWR bundle 与各子阶段耗时。 |
 | `Main.Audit.call()` | 遍历输出全部 duration/count、solver 配置、最大内存和最终 marker。 |
-| `SERVerifier.emitRejectDiagnostics()` | 输出 typed-dependency UNSAT 原因、`!A1 | !A2 -> reason`映射及可用的cycle witness，支持DOT/legacy格式。 |
-| `SERSolverARDifferentialTest.predicateWriterModeMatrixMatchesExhaustiveOracle()` | predicate × writer pattern × EAGER/GMWR/WWBridge配置 × coalesce开关，逐项要求生产SER verdict等于穷举AR oracle。 |
+| `SERVerifier.emitRejectDiagnostics()` | 输出 typed-dependency UNSAT 原因、`!A1 | !A2 -> reason` 映射或当前 conflict core 摘要。 |
+| `SERSolverARDifferentialTest.predicateWriterModeMatrixMatchesExhaustiveOracle()` | predicate × writer pattern × EAGER/GMWR/WWBridge 配置，逐项要求生产 SER verdict 等于穷举 AR oracle。 |
 | `SERAcceptanceSuiteTest` | 按T1-T8编号组织的验收入口；常规运行覆盖基础WR/SO、WW/RW、predicate、模式与剪枝等价、共享oracle、单serialization graph结构和论文指标契约。 |
 
 ### 11.1 T1-T8 验收测试映射
@@ -247,10 +230,10 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | 类别 | 自动化覆盖 |
 | --- | --- |
 | T1 | `BasicAdyaCorrectness`：单WR、多reader、反向SO形成的WR/SO环。 |
-| T2 | `WwRwEncoding`：WW合法分支、SO强制的WW/RW冲突、coalesce开关差分、三writer的三个client WW choice。 |
+| T2 | `WwRwEncoding`：WW合法分支、SO强制的WW/RW冲突、三 writer 的三个 client WW choice。 |
 | T3 | `PredicateCorrectness`：returned/stale/overwrite、absent matching writer、bad/repair writer、INTERNAL和mixed key。T3.4按“写入值满足谓词但结果为空”的本意使用`x=20, x>10`；若使用`x<10`，`20`本身不属于结果，不能推出writer必须位于reader之后。 |
 | T4 | 常规测试比较手工predicate corpus；`SER_ACCEPTANCE_EXTENDED=true`时额外执行100,000个生成history的EAGER/GMWR verdict差分。 |
-| T5 | 对`Pruning`、`Prun`、`GmwrPropagationState`、`GmwrWwBridge`、`SERSolverAR`做同实例断言，并验证fact可见性和反向关系立即冲突。 |
+| T5 | 对`Pruning`、`GmwrPropagationState`、`GmwrWwBridge`、`SERSolverAR`做同实例断言，并验证fact可见性和反向关系立即冲突。 |
 | T6 | 反射守卫确保`SERSolverAR`只保留`serializationGraph`，并比较endpoint interning开关的verdict；小history语义基准继续由`SERSolverARDifferentialTest`的独立穷举AR oracle提供。 |
 | T7 | `NONE/REACHABILITY`、GMWR和WWBridge对同一corpus必须与baseline verdict一致；另直接验证reachability删除成环branch。 |
 | T8 | 验证EAGER/GMWR发布runner消费的candidate、residual SAT vars/clauses和GMWR obligation指标；实际规模、内存和运行时间由`tools/run_ser_baseline_vs_gmwr.py`在独立进程中采集。 |
@@ -261,7 +244,7 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 ./gradlew test --tests verifier.SERAcceptanceSuiteTest
 ```
 
-10,000个coalesce差分与100,000个EAGER/GMWR差分属于长跑测试，默认跳过；显式运行：
+100,000 个 EAGER/GMWR 差分属于长跑测试，默认跳过；显式运行：
 
 ```bash
 SER_ACCEPTANCE_EXTENDED=true ./gradlew test --tests verifier.SERAcceptanceSuiteTest
@@ -274,6 +257,5 @@ SER_ACCEPTANCE_EXTENDED=true ./gradlew test --tests verifier.SERAcceptanceSuiteT
 3. RW 在求解器构造时确实有 `SEREdge`/theory-edge candidate，但只有 WW guard 为 true 才被 implication 激活。
 4. `guard -> serializationEdge` 是单向绑定；physical edge literal 不反向等价于某个具体 relation guard。
 5. GMWR residual clause约束 serialization literals；typed PR_WR/PR_RW 元数据由独立 frontier 路径生成。
-6. 暂留 shared-snapshot 原型的内部 derived order 不进入当前 solver；生产调用链只消费 reachability 与 GMWR 产生的确定事实。
+6. 生产调用链只消费 reachability 与 GMWR 产生的确定事实。
 7. EAGER/GMWR row-local 的公式可逐项对应；general GMWR 的 monotone witness 缩小 clause 是否在全部 query shape 上等价，需要结合结构判定和差分测试边界说明。当前P0矩阵已把JOIN纳入完整visible-snapshot oracle，但有限小history差分不能替代全局证明。
-8. `injectPredicateEdgesSER()` 是诊断孤岛；任何把它误认成 solver 输入的文档都与当前代码不符。

@@ -29,7 +29,6 @@ SER/
     gradlew
     jdk11-env.sh
     docs/PROJECT_OVERVIEW.md
-    docs/prunning.md
     src/main/java/Main.java
     src/main/java/history/
     src/main/java/history/loaders/PredicateHistoryLoader.java
@@ -37,9 +36,8 @@ SER/
     src/main/java/verifier/
     tools/audit-prhist.sh
     tools/run_catalog_experiment.py
-    tools/run_gmwr_comparison.py
-    tools/run_pruning_constraint_comparison.py
-    tools/validate_prhist_suite.py
+    tools/run_ser_baseline_vs_gmwr.py
+    tools/run_ser_ablation.py
     monosat/
 ```
 
@@ -95,7 +93,7 @@ cd SER/ser-result-detector
 ./gradlew test
 ```
 
-当前 SER 全量回归为 183 项测试、0 failure、0 error、2 skipped。
+当前 SER 全量回归为 263 项测试、0 failure、0 error、3 skipped。
 
 ## 输入格式
 
@@ -186,22 +184,14 @@ select.distinct
 cd SER/ser-result-detector
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit -t PRHIST /absolute/path/to/hist-00000
-```
-
-`-t PRHIST` 可以省略，因为默认类型就是 PRHIST：
-
-```bash
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
   audit /absolute/path/to/hist-00000
 ```
 
-输出末尾会包含稳定 verdict 标记：
+普通 `audit` 按 History、WW、可选 GMWR、Predicate、SAT、Timing 的完成顺序流式打印精简摘要；数量带千位分隔符，时间统一为秒并保留三位小数。History 中的 Events 仅统计客户端事务事件，不包含内部初始版本写。稳定 verdict 始终是最后一行：
 
 ```text
-[[[[ ACCEPT ]]]]
-[[[[ REJECT ]]]]
+SER audit result: ACCEPT
+SER audit result: REJECT
 ```
 
 含义：
@@ -220,69 +210,41 @@ java -Djava.library.path=build/monosat -Xmx8g \
 ## 常用 audit 参数
 
 ```text
---ww-pruning NONE|REACHABILITY
-    控制 WW 可达性剪枝，默认 REACHABILITY。NONE 仅用于实验对照。
-
---no-coalescing
-    关闭相同事务对上的 WW choice 合并。用于调试约束规模。
-
---dot-output
-    以 DOT 格式输出冲突图，便于可视化。
-
---compare-derived-predicate-edges
-    额外打印按旧方式派生的 PR_WR / PR_RW 边数量。当前 SAT 求解不会依赖这些派生边。
-
---solver monosat
-    指定 SAT 后端。当前只支持 monosat。
+--predicate-encoding EAGER|GMWR
+    谓词编码，默认 GMWR。EAGER 对应论文 E2 baseline。
 
 --solver-timeout-seconds N
-    SAT 求解超时秒数，默认 600；0 表示禁用。计时从 `solve()` 调用开始，不包含编码。超时输出 `[[[[ TIMEOUT ]]]]`，退出码 124，并分别打印 encode/solve 时间。全检查器超时由 runner 进程超时负责，从 `audit()` 开始计算墙钟。
+    SAT 求解超时秒数，默认 600；0 表示禁用。计时从 `solve()` 调用开始，不包含编码。超时摘要输出 `SER audit result: TIMEOUT`，退出码 124，并分别打印 encode/solve 时间。全检查器超时由 runner 进程超时负责，从 `audit()` 开始计算墙钟。
 
 --solver-stats
-    打印 SAT 后端标识、PR GMWR 模式和详细编码统计。
-
---predicate-mode EAGER|GMWR
-    选择谓词编码：EAGER 或 GMWR。不再被 `--ser-propagation-mode` 覆盖。
-
---ser-propagation-mode ww-only|ww-gmwr-oneway|ww-gmwr
-    WW 反馈。默认：EAGER 用 ww-only，GMWR 用 ww-gmwr。
-
---gmwr-prepropagation / --no-gmwr-prepropagation
-    是否在 SAT 前做 GMWR 化简。只控制优化，不控制语义义务构造。默认随 `--predicate-mode`。
-
---predicate-witness-coalescing / --no-predicate-witness-coalescing
-    是否合并相同端点的谓词逻辑 witness。默认开启。
-
---graph-edge-interning / --no-graph-edge-interning
-    是否对相同 `(from,to)` 只创建一条 MonoSAT theory-edge，并保留全部逻辑来源。默认开启（论文主 baseline E2）。关闭时对应 E1 物理图消融。
+    在精简摘要后打印完整 profiler metrics/counters、SAT 后端和求解配置；verdict 仍为最后一行。
 ```
 
-### 使用 GMWR
+### 默认 G2 与 E2 baseline
 
-`EAGER` 是默认模式，不启用谓词 dependency 剪枝。审计单个历史时，需要显式指定 `GMWR`：
+不带算法选项的 `audit HISTORY` 直接运行完整 G2：
 
 ```bash
 cd SER/ser-result-detector
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit --predicate-mode=GMWR --solver-stats \
-  /absolute/path/to/hist-00000
+  audit /absolute/path/to/hist-00000
 ```
 
-完整 G2 配置示例：
+其内部固定组合为 WW reachability、compact GMWR encoding、完整 GMWR-WW semantic propagation/fixpoint、predicate witness coalescing 和 graph-edge interning，随后只把残余约束交给 MonoSAT 并执行 verification。
+
+论文 E2 baseline 只需显式选择 EAGER encoding：
 
 ```bash
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit --predicate-mode=GMWR \
-  --ser-propagation-mode=ww-gmwr \
-  --gmwr-prepropagation \
-  --predicate-witness-coalescing \
-  --graph-edge-interning --solver-stats \
+  audit --predicate-encoding=eager \
   /absolute/path/to/hist-00000
 ```
 
-输出末尾以 `[[[[ ACCEPT ]]]]`、`[[[[ REJECT ]]]]` 或 `[[[[ TIMEOUT ]]]]` 表示 verdict。超时退出码为 124。启用 `--solver-stats` 后，还会输出 `SER_GMWR_BUILD`、`SER_GMWR_RESOLUTION`、bundle、残余 clause、强制顺序以及 `SER_GMWR_SUBSUMED_ITEM_CLAUSES_COUNT` 等 GMWR 指标；不需要统计时可以省略该参数。
+E2 仍使用 WW reachability、EAGER predicate encoding 与 graph-edge interning，但不构造或传播 GMWR。E1/G1 所需的 `--ser-propagation-mode`、`--[no-]gmwr-prepropagation`、`--[no-]predicate-witness-coalescing`、`--[no-]graph-edge-interning` 和 `--ww-pruning` 仅作为隐藏实验参数保留；旧 `--predicate-mode` 已删除。
+
+精简摘要以 `SER audit result: ACCEPT`、`SER audit result: REJECT`、`SER audit result: TIMEOUT` 或 `SER audit result: ERROR` 收尾，并展示 History、WW、可选 GMWR、Predicate、SAT、关键计时和峰值内存；超时退出码为 124。EAGER 不打印 GMWR section，也不在 WW 转换中打印第三项。启用 `--solver-stats` 后，摘要之后仍会输出完整 profiler 标签、配置、runner 使用的 `Max memory` 行和兼容旧 runner 的 `[[[[ ... ]]]]` 标记，最终 verdict 仍是最后一行。
 
 当前实现会自动使用以下等价编码，无需额外命令行开关：
 
@@ -300,37 +262,8 @@ java -Djava.library.path=build/monosat -Xmx8g \
 ```bash
 java -Djava.library.path=build/monosat -Xmx12g \
   -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  audit --compare-derived-predicate-edges --solver-stats \
+  audit --solver-stats \
   ../../predicateHistories/kvpredicate/kvpredicate_serializable_20260706/hist-00000
-```
-
-## 查看统计和 dump
-
-只统计剪枝前后的 WW/RW 约束而不构造 `SERSolverAR`、不运行 MonoSAT：
-
-```bash
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  constraint-stat --ww-pruning=REACHABILITY /absolute/path/to/hist-00000
-```
-
-输出包含 `constraints_before/after`、`implications_before/after`、内部一致性和剪枝一致性。默认使用 REACHABILITY，可用 `--ww-pruning=NONE` 做实验对照。
-
-统计历史规模：
-
-```bash
-cd SER/ser-result-detector
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  stat /absolute/path/to/hist-00000
-```
-
-打印 loader 解析后的事务和操作：
-
-```bash
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/ser-result-detector-1.0.0-SNAPSHOT.jar \
-  dump /absolute/path/to/hist-00000
 ```
 
 ## 批量审计历史目录
@@ -377,29 +310,28 @@ Summary: ACCEPT=... REJECT=... RUNTIME_ERROR=...
 
 如果出现 `RUNTIME_ERROR`，优先看脚本打印的 per-history log 路径。
 
-## 运行剪枝与 GMWR 对比
+## 运行 E2/G2 对比与消融
 
-比较同一批历史在关闭和开启 WW reachability 时的约束规模：
+主 runner 默认只运行 E2/G2，并统一负责执行 detector、解析日志和保存结果：
 
 ```bash
 cd SER/ser-result-detector
 ./gradlew installDist
-python3 tools/run_pruning_constraint_comparison.py \
-  ../../predicateHistories/kvpredicate/test
-```
-
-脚本依次调用 `constraint-stat` 的 `NONE`、`REACHABILITY`，默认写入 `results/pruning_constraint_comparison.csv`，不会执行最终 SAT 求解。
-
-比较 EAGER 与 GMWR：
-
-```bash
-python3 tools/run_gmwr_comparison.py \
+python3 tools/run_ser_baseline_vs_gmwr.py \
   ../../predicateHistories/kvpredicate/test \
-  --ww-pruning REACHABILITY \
   --repeats 5
 ```
 
-该脚本为每次运行保存 stdout/stderr，逐项更新 raw CSV，并可从已有有效 verdict 断点续跑；summary CSV 汇总 verdict、耗时、MonoSAT、内存和 GMWR bundle 指标。
+E1/G1、关闭 WW reachability 等实验变体由消融入口运行：
+
+```bash
+python3 tools/run_ser_ablation.py \
+  ../../predicateHistories/kvpredicate/test \
+  --suite pruning \
+  --repeats 5
+```
+
+两个入口都保存 stdout/stderr 和 raw CSV，并汇总 verdict、耗时、MonoSAT、内存及 GMWR 指标。catalog runner 只保留 catalog 选样和期望 verdict 校验，复用主 runner 的进程执行与日志解析函数。
 
 ## 运行 catalog 实验
 

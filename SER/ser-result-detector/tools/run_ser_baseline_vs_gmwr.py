@@ -111,7 +111,7 @@ class Config:
 
     def cli_args(self) -> list[str]:
         return [
-            "--predicate-mode", self.predicate,
+            "--predicate-encoding", self.predicate,
             "--ser-propagation-mode", self.propagation,
             "--gmwr-prepropagation" if self.preprop else "--no-gmwr-prepropagation",
             "--predicate-witness-coalescing",
@@ -137,7 +137,7 @@ RAW_FIELDS = [
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run E1/E2/G1/G2 SER experiments with a hard 180s timeout per run.")
+        description="Run E2/G2 SER comparison or selected E1/G1 ablations with a hard 180s timeout per run.")
     p.add_argument("history_root", type=Path,
                    help="history dir/file or a tree containing history.prhist.jsonl")
     p.add_argument("--project-root", type=Path,
@@ -151,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--xmx", default="8g")
     p.add_argument("--java", default="java")
     p.add_argument("--config", action="append", choices=list(CONFIGS), dest="configs",
-                   help="repeatable; default E1,E2,G1,G2")
+                   help="repeatable; default E2,G2")
     p.add_argument("--limit", type=int, default=0,
                    help="only first N histories; 0 = all")
     p.add_argument("--extra-jvm-arg", action="append", default=[])
@@ -216,11 +216,11 @@ def memory_to_mb(text: str) -> float | str:
 
 
 def parse_stderr(text: str) -> tuple[str, str, dict[str, int], str]:
-    if "[[[[ ACCEPT ]]]]" in text:
+    if "SER audit result: ACCEPT" in text or "[[[[ ACCEPT ]]]]" in text:
         verdict = "ACCEPT"
-    elif "[[[[ REJECT ]]]]" in text:
+    elif "SER audit result: REJECT" in text or "[[[[ REJECT ]]]]" in text:
         verdict = "REJECT"
-    elif "[[[[ TIMEOUT ]]]]" in text:
+    elif "SER audit result: TIMEOUT" in text or "[[[[ TIMEOUT ]]]]" in text:
         verdict = "TIMEOUT"
     elif "[[[[ INVALID_HISTORY ]]]]" in text:
         verdict = "INVALID_HISTORY"
@@ -267,14 +267,15 @@ def terminate_tree(proc: subprocess.Popen[str]) -> None:
         proc.wait()
 
 
-def run_one(cmd: list[str], env: dict[str, str], stdout_path: Path, stderr_path: Path) -> tuple[int, float, bool]:
+def run_one(cmd: list[str], env: dict[str, str], stdout_path: Path,
+            stderr_path: Path, timeout_seconds: int = HARD_TIMEOUT_SECONDS) -> tuple[int, float, bool]:
     start = time.monotonic()
     with stdout_path.open("w", encoding="utf-8") as out, \
             stderr_path.open("w", encoding="utf-8") as err:
         proc = subprocess.Popen(
             cmd, stdout=out, stderr=err, env=env, text=True, start_new_session=True)
         try:
-            rc = proc.wait(timeout=HARD_TIMEOUT_SECONDS)
+            rc = proc.wait(timeout=timeout_seconds)
             return rc, time.monotonic() - start, False
         except subprocess.TimeoutExpired:
             terminate_tree(proc)
@@ -474,7 +475,7 @@ def main() -> int:
     histories = discover_histories(args.history_root)
     if args.limit > 0:
         histories = histories[:args.limit]
-    selected = args.configs or ["E1", "E2", "G1", "G2"]
+    selected = args.configs or ["E2", "G2"]
     selected = list(dict.fromkeys(selected))
 
     stamp = time.strftime("%Y%m%d-%H%M%S")

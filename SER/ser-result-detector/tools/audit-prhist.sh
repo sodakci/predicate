@@ -85,7 +85,7 @@ for target in "${TARGETS[@]}"; do
 
   echo "=== Auditing $target"
   set +e
-  java "-Djava.library.path=$MONOSAT_NATIVE_DIR" "-Xmx$HEAP_SIZE" "${EXTRA_JAVA_OPTS[@]}" -jar "$JAR_PATH" audit -t PRHIST "$target" >"$log_path" 2>&1
+  java "-Djava.library.path=$MONOSAT_NATIVE_DIR" "-Xmx$HEAP_SIZE" "${EXTRA_JAVA_OPTS[@]}" -jar "$JAR_PATH" audit "$target" >"$log_path" 2>&1
   status=$?
   set -e
 

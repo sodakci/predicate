@@ -52,7 +52,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * This test intentionally uses exhaustive AR enumeration for tiny histories and then compares:
  *  - direct SERSolverAR encoding;
  *  - SERVerifier with pruning on/off;
- *  - SERVerifier with coalescing on/off;
+ *  - SERVerifier with the production WW constraint generator;
  *  - the production MonoSAT solver path.
  *
  * Production verifier cases use unique (key,value) as write identity.
@@ -185,19 +185,16 @@ class SERSolverARDifferentialTest {
         for (var matrixCase : cases) {
             boolean expected = exhaustiveOracle(matrixCase.history);
             for (var mode : MATRIX_MODES) {
-                for (boolean coalescing : List.of(true, false)) {
-                    String name = String.format("predicate=%s writer=%s mode=%s coalesce=%s",
-                            matrixCase.predicateType, matrixCase.writerPattern,
-                            mode.name, coalescing);
-                    tests.add(DynamicTest.dynamicTest(name, () ->
-                            assertMatrixVerifierMatchesOracle(
-                                    matrixCase, mode, coalescing, expected)));
-                }
+                String name = String.format("predicate=%s writer=%s mode=%s",
+                        matrixCase.predicateType, matrixCase.writerPattern,
+                        mode.name);
+                tests.add(DynamicTest.dynamicTest(name, () ->
+                        assertMatrixVerifierMatchesOracle(matrixCase, mode, expected)));
             }
         }
         assertEquals(MatrixPredicateType.values().length
                         * MatrixWriterPattern.values().length
-                        * MATRIX_MODES.size() * 2,
+                        * MATRIX_MODES.size(),
                 tests.size(), "the differential matrix must be a complete Cartesian product");
         return tests;
     }
@@ -217,13 +214,9 @@ class SERSolverARDifferentialTest {
     private static void assertMatrixVerifierMatchesOracle(
             PredicateMatrixCase matrixCase,
             MatrixMode mode,
-            boolean coalescing,
             boolean expected) {
         try {
             Pruning.setEnablePruning(true);
-            SERVerifier.setCoalesceConstraints(coalescing);
-            SERVerifier.setDotOutput(false);
-            SERVerifier.setCompareDerivedPredicateEdges(false);
 
             var settings = SERVerifier.SolverSettings.forModes(
                     mode.predicateMode, mode.pruningMode, mode.propagationMode);
@@ -238,14 +231,11 @@ class SERSolverARDifferentialTest {
                             : SERVerifier.AuditResult.REJECT,
                     actual,
                     () -> String.format(
-                            "predicate=%s writer=%s mode=%s coalescing=%s%n%s",
+                            "predicate=%s writer=%s mode=%s%n%s",
                             matrixCase.predicateType, matrixCase.writerPattern,
-                            mode.name, coalescing, describe(matrixCase.history)));
+                            mode.name, describe(matrixCase.history)));
         } finally {
             Pruning.setEnablePruning(true);
-            SERVerifier.setCoalesceConstraints(true);
-            SERVerifier.setDotOutput(false);
-            SERVerifier.setCompareDerivedPredicateEdges(false);
         }
     }
 
@@ -581,16 +571,11 @@ class SERSolverARDifferentialTest {
                 namedSettings("G1-nopreprop", SERVerifier.PredicateSolvingMode.GMWR,
                         SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY, false, true),
                 namedSettings("G2-nopreprop", SERVerifier.PredicateSolvingMode.GMWR,
-                        SERVerifier.SerPropagationMode.WW_GMWR, false, true),
-                namedSettings("E1-coalesce-intern", SERVerifier.PredicateSolvingMode.EAGER,
-                        SERVerifier.SerPropagationMode.WW_ONLY, false, true));
+                        SERVerifier.SerPropagationMode.WW_GMWR, false, true));
         for (var config : configs) {
-            for (boolean coalescing : List.of(true, false)) {
-                assertEquals(expected, solveSer(history, coalescing, config.settings),
-                        () -> "direct SERSolverAR mismatch for " + label
-                                + " config=" + config.name
-                                + " coalescing=" + coalescing + "\n" + describe(history));
-            }
+            assertEquals(expected, solveSer(history, config.settings),
+                    () -> "direct SERSolverAR mismatch for " + label
+                            + " config=" + config.name + "\n" + describe(history));
         }
     }
 
@@ -619,9 +604,7 @@ class SERSolverARDifferentialTest {
 
     private static <ValueType> boolean solveSer(
             History<String, ValueType> history,
-            boolean coalesce,
             SERVerifier.SolverSettings settings) {
-        SERVerifier.setCoalesceConstraints(coalesce);
         var graph = new KnownGraph<>(history);
         return new SERSolverAR<>(history, graph,
                 SERVerifier.generateConstraintsSER(history, graph),
@@ -639,27 +622,18 @@ class SERSolverARDifferentialTest {
                 for (var pruningMode : List.of(
                         SERVerifier.PruningMode.NONE,
                         SERVerifier.PruningMode.REACHABILITY)) {
-                    for (boolean coalescing : List.of(true, false)) {
-                        SERVerifier.setCoalesceConstraints(coalescing);
-                        SERVerifier.setDotOutput(false);
-                        SERVerifier.setCompareDerivedPredicateEdges(false);
-
-                        boolean actual = new SERVerifier<String, ValueType>(
-                                () -> history, false, predicateMode, pruningMode).audit()
-                                == SERVerifier.AuditResult.ACCEPT;
-                        assertEquals(expected, actual,
-                                () -> String.format(
-                                        "label=%s seed=%d solver=monosat predicateMode=%s pruningMode=%s coalescing=%s%n%s",
-                                        label, seed, predicateMode, pruningMode,
-                                        coalescing, describe(history)));
-                    }
+                    boolean actual = new SERVerifier<String, ValueType>(
+                            () -> history, false, predicateMode, pruningMode).audit()
+                            == SERVerifier.AuditResult.ACCEPT;
+                    assertEquals(expected, actual,
+                            () -> String.format(
+                                    "label=%s seed=%d solver=monosat predicateMode=%s pruningMode=%s%n%s",
+                                    label, seed, predicateMode, pruningMode,
+                                    describe(history)));
                 }
             }
         } finally {
             Pruning.setEnablePruning(true);
-            SERVerifier.setCoalesceConstraints(true);
-            SERVerifier.setDotOutput(false);
-            SERVerifier.setCompareDerivedPredicateEdges(false);
         }
     }
 

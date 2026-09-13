@@ -124,6 +124,7 @@ class SERSolverAR<KeyType, ValueType> {
             };
     private final PredicateEncodingMetrics predicateEncodingMetrics =
             new PredicateEncodingMetrics();
+    private boolean encodingPredicateConstraints;
     private boolean collectingPredicateMetrics;
     // Predicate constraints are refined lazily from concrete SAT models.  This
     // avoids eagerly enumerating the Cartesian product of every key frontier.
@@ -291,7 +292,7 @@ class SERSolverAR<KeyType, ValueType> {
             this.predicateWitnessCoalescing = this.settings.predicateWitnessCoalescing;
             this.graphEdgeInterning = this.settings.graphEdgeInterning;
             this.precedence = Objects.requireNonNull(precedence, "precedence");
-            this.reachabilityPruning = new Pruning<>(this.precedence);
+            this.reachabilityPruning = new Pruning<>(this.precedence, false);
             this.gmwrWwBridge = new GmwrWwBridge<>(this.precedence);
             this.solver = new Solver();
             this.solveDeadlineNanos = 0L;
@@ -355,7 +356,6 @@ class SERSolverAR<KeyType, ValueType> {
                     this::solveOnce);
             if (sat == null) {
                 solverTimedOut = true;
-                System.err.println("SAT solver timed out");
                 conflictEdges = Collections.emptyList();
                 conflictConstraints = Collections.emptyList();
                 conflictReasons = Collections.emptyList();
@@ -743,18 +743,13 @@ class SERSolverAR<KeyType, ValueType> {
             try {
                 result = firstEpoch
                         ? gmwrWwBridge.scan(graph, constraints)
-                        : gmwrWwBridge.scanAffected(graph, constraints,
-                                affected, settings.verifyIncrementalPropagation);
+                        : gmwrWwBridge.scanAffected(graph, constraints, affected);
             } finally {
                 profiler.endTick("GMWR_WW_BRIDGE_MS");
             }
             firstEpoch = false;
             gmwrWwBridgeScans++;
             gmwrWwBridgeConstraintsScanned += result.scannedConstraints;
-            System.err.printf(
-                    "GMWR-WW bridge epoch %d: scanned=%d forced=%d residual=%d%n",
-                    gmwrWwFixpointRounds, result.scannedConstraints,
-                    result.forcedConstraints, constraints.size());
             if (result.conflict) {
                 gmwrToWwConflicts++;
                 propagationConflict = true;
@@ -984,19 +979,19 @@ class SERSolverAR<KeyType, ValueType> {
                 && currentPredicateAssumption != null) {
             guard = and(currentPredicateAssumption.literal, guard);
         }
-        if (collectingPredicateMetrics) {
+        if (encodingPredicateConstraints) {
             predicateEncodingMetrics.dependencyEdgeAttempts++;
         }
         // A false guard cannot activate either an order edge or a typed edge.
         if (guard == Lit.False) {
-            if (collectingPredicateMetrics) {
+            if (encodingPredicateConstraints) {
                 predicateEncodingMetrics.dependencyEdgesSkipped++;
             }
             return;
         }
         if (edge.getType() == EdgeType.PR_WR || edge.getType() == EdgeType.PR_RW) {
             if (skipPredicateWitness(edge, guard)) {
-                if (collectingPredicateMetrics) {
+                if (encodingPredicateConstraints) {
                     predicateEncodingMetrics.dependencyEdgesSkipped++;
                 }
                 return;
@@ -1201,12 +1196,11 @@ class SERSolverAR<KeyType, ValueType> {
      * but unreachable and unnecessary combinations are never enumerated.
      */
     private void encodePredicateConstraints() {
+        encodingPredicateConstraints = true;
         collectingPredicateMetrics = collectPredicateMetrics;
         try {
             for (var observation : graph.getPredicateObservations()) {
-                if (collectingPredicateMetrics) {
-                    predicateEncodingMetrics.observations++;
-                }
+                predicateEncodingMetrics.observations++;
                 var predicateRead = observation.getPredicateReadEvent();
                 var predicate = predicateRead.getPredicate();
                 if (predicate == null) {
@@ -1389,6 +1383,7 @@ class SERSolverAR<KeyType, ValueType> {
                 enqueuePredicateDependenciesWithoutPruning();
             }
         } finally {
+            encodingPredicateConstraints = false;
             collectingPredicateMetrics = false;
             predicateEncodingMetrics.publish(
                     Profiler.getInstance(), collectPredicateMetrics);
@@ -1411,10 +1406,6 @@ class SERSolverAR<KeyType, ValueType> {
             int total = predicateDependencyCandidates.size();
             var physicalEdges = new LinkedHashMap<PredicateTransactionEdgeKey<KeyType, ValueType>,
                     CoalescedPredicateDependency<KeyType, ValueType>>();
-            var progress = new PredicateDependencyPruneProgress(total);
-            progress.refresh(0, 0, false);
-
-            int checked = 0;
             for (var candidate : predicateDependencyCandidates) {
                 var edge = candidate.edge;
                 var key = new PredicateTransactionEdgeKey<>(
@@ -1426,8 +1417,6 @@ class SERSolverAR<KeyType, ValueType> {
                 } else {
                     physical.merge(edge, candidate.guard, candidate.origin);
                 }
-                checked++;
-                progress.refresh(checked, physicalEdges.size(), checked == total);
             }
 
             long physicalPrWrEdges = 0L;
@@ -1458,9 +1447,9 @@ class SERSolverAR<KeyType, ValueType> {
                 }
             }
 
+            predicateEncodingMetrics.dependencyEdgeCandidates += total;
+            predicateEncodingMetrics.dependencyPhysicalEdges += physicalEdges.size();
             if (collectingPredicateMetrics) {
-                predicateEncodingMetrics.dependencyEdgeCandidates += total;
-                predicateEncodingMetrics.dependencyPhysicalEdges += physicalEdges.size();
                 predicateEncodingMetrics.dependencyPhysicalPrWrEdges += physicalPrWrEdges;
                 predicateEncodingMetrics.dependencyPhysicalPrRwEdges += physicalPrRwEdges;
                 predicateEncodingMetrics.dependencyPhysicalSourcedEdges += sourcedPhysicalEdges;
@@ -1472,16 +1461,6 @@ class SERSolverAR<KeyType, ValueType> {
                         total - physicalEdges.size();
                 predicateEncodingMetrics.dependencyEdgesQueued += physicalEdges.size();
             }
-            System.err.printf(
-                    "Predicate dependency prune: %d -> %d physical edges, pruned=%d%n",
-                    total, physicalEdges.size(), total - physicalEdges.size());
-            System.err.printf(
-                    "Predicate physical edges: PR_WR=%d, PR_RW=%d, total=%d%n",
-                    physicalPrWrEdges, physicalPrRwEdges, physicalEdges.size());
-            System.err.printf(
-                    "Predicate physical edge origins: sourced=%d, sourceless=%d, mixed=%d, known/internal=%d%n",
-                    sourcedPhysicalEdges, sourcelessPhysicalEdges, mixedPhysicalEdges,
-                    knownOrInternalPhysicalEdges);
             for (var physical : physicalEdges.values()) {
                 queueGuardedDependency(physical.edge, physical.guard, physical.origin);
             }
@@ -1495,14 +1474,6 @@ class SERSolverAR<KeyType, ValueType> {
         if (gmwrPrWrSourceAlternatives == 0) {
             return;
         }
-        long pruned = gmwrPrWrReachabilityPruned + gmwrPrWrPrRwCyclePruned;
-        System.err.printf(
-                "Predicate semantic PR-WR source prune: %d -> %d alternatives, reachability=%d, pr-rw-cycle=%d, forced=%d%n",
-                gmwrPrWrSourceAlternatives,
-                gmwrPrWrSourceAlternatives - pruned,
-                gmwrPrWrReachabilityPruned,
-                gmwrPrWrPrRwCyclePruned,
-                gmwrPrWrSourceAlternativesForced);
         if (collectingPredicateMetrics) {
             var profiler = Profiler.getInstance();
             profiler.addCount("SER_PRED_PR_WR_SOURCE_ALTERNATIVES_COUNT",
@@ -1544,37 +1515,6 @@ class SERSolverAR<KeyType, ValueType> {
             predicateEncodingMetrics.dependencyEdgesQueued++;
         }
         queueGuardedDependency(edge, guard, origin);
-    }
-
-    private static final class PredicateDependencyPruneProgress {
-        private static final int BAR_WIDTH = 15;
-
-        private final int total;
-        private final int refreshStep;
-
-        private PredicateDependencyPruneProgress(int total) {
-            this.total = total;
-            this.refreshStep = Math.max(1, total / 100);
-        }
-
-        private void refresh(int checked, int physical, boolean done) {
-            if (!done && checked != 0 && checked % refreshStep != 0) {
-                return;
-            }
-            int percent = (int) Math.floor(checked * 100.0 / Math.max(1, total));
-            int filled = Math.min(BAR_WIDTH,
-                    Math.max(0, checked * BAR_WIDTH / Math.max(1, total)));
-            var bar = new StringBuilder(BAR_WIDTH);
-            for (int i = 0; i < BAR_WIDTH; i++) {
-                bar.append(i < filled ? '=' : '-');
-            }
-            System.err.printf("\rPredicate dependency prune [%s] %3d%% %d/%d physical=%d",
-                    bar, percent, checked, total, physical);
-            if (done) {
-                System.err.println();
-            }
-            System.err.flush();
-        }
     }
 
     private long startExternalKeyEncoding(boolean sourced) {
@@ -1881,6 +1821,8 @@ class SERSolverAR<KeyType, ValueType> {
         profiler.addDurationNanos("SER_GMWR_RESOLUTION", gmwrResolutionNanos);
         long forcedOrders = propagation == null ? 0L : propagation.stats.forcedFacts;
         profiler.addCount("SER_GMWR_FORCED_ORDERS_COUNT", forcedOrders);
+        profiler.addCount("SER_GMWR_BUNDLES_COUNT", gmwrBundleCount);
+        profiler.addCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT", gmwrResidualBundles);
         if (!collectPredicateMetrics) {
             return;
         }
@@ -1896,7 +1838,6 @@ class SERSolverAR<KeyType, ValueType> {
         profiler.addCount("SER_GMWR_RETURNED_ITEM_OBLIGATIONS_COUNT", 0L);
         profiler.addCount("SER_GMWR_ABSENT_ITEM_OBLIGATIONS_COUNT",
                 gmwrAbsentItemObligations);
-        profiler.addCount("SER_GMWR_BUNDLES_COUNT", gmwrBundleCount);
         profiler.addCount("SER_GMWR_UNIQUE_ITEM_CLAUSES_COUNT", uniqueItemClauses);
         profiler.addCount("SER_GMWR_MATERIALIZED_ITEM_CLAUSES_COUNT", uniqueItemClauses);
         profiler.addCount("SER_GMWR_DUPLICATE_ITEM_CLAUSES_COUNT",
@@ -1904,7 +1845,6 @@ class SERSolverAR<KeyType, ValueType> {
         profiler.addCount("SER_GMWR_SUBSUMED_ITEM_CLAUSES_COUNT",
                 gmwrSubsumedItemClauses);
         profiler.addCount("SER_GMWR_RESOLVED_BUNDLES_COUNT", gmwrResolvedBundles);
-        profiler.addCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT", gmwrResidualBundles);
         profiler.addCount("SER_GMWR_RESIDUAL_CLAUSES_COUNT", gmwrResidualClauses);
         profiler.addCount("SER_GMWR_RESIDUAL_LITERALS_COUNT", gmwrResidualLiterals);
         profiler.addCount("SER_GMWR_INTERVAL_CANDIDATES_PRUNED_COUNT",
@@ -3499,10 +3439,16 @@ class SERSolverAR<KeyType, ValueType> {
                     "SER_PRED_EXTERNAL_SOURCED_ENCODE", externalSourcedEncodeNanos);
             profiler.addDurationNanos(
                     "SER_PRED_EXTERNAL_SOURCELESS_ENCODE", externalSourcelessEncodeNanos);
+            profiler.addCount("SER_PRED_OBSERVATIONS_COUNT", observations);
+            profiler.addCount("SER_PRED_DEPENDENCY_ATTEMPTS_COUNT", dependencyEdgeAttempts);
+            profiler.addCount("SER_PRED_DEPENDENCY_SKIPPED_COUNT", dependencyEdgesSkipped);
+            profiler.addCount("SER_PRED_DEPENDENCY_CANDIDATES_COUNT",
+                    dependencyEdgeCandidates);
+            profiler.addCount("SER_PRED_DEPENDENCY_PHYSICAL_EDGES_COUNT",
+                    dependencyPhysicalEdges);
             if (!includeCounts) {
                 return;
             }
-            profiler.addCount("SER_PRED_OBSERVATIONS_COUNT", observations);
             profiler.addCount("SER_PRED_NULL_COUNT", nullPredicates);
             profiler.addCount("SER_PRED_RESULT_SOURCES_COUNT", resultSources);
             profiler.addCount("SER_PRED_DUPLICATE_SOURCES_COUNT", duplicateResultSources);
@@ -3534,15 +3480,9 @@ class SERSolverAR<KeyType, ValueType> {
                     knownPredicateEdgeAttempts);
             profiler.addCount("SER_PRED_KNOWN_EDGE_DUPLICATES_COUNT",
                     knownPredicateEdgeDuplicates);
-            profiler.addCount("SER_PRED_DEPENDENCY_ATTEMPTS_COUNT", dependencyEdgeAttempts);
             profiler.addCount("SER_PRED_DEPENDENCY_DUPLICATES_COUNT",
                     dependencyEdgeDuplicates);
-            profiler.addCount("SER_PRED_DEPENDENCY_SKIPPED_COUNT", dependencyEdgesSkipped);
             profiler.addCount("SER_PRED_DEPENDENCY_QUEUED_COUNT", dependencyEdgesQueued);
-            profiler.addCount("SER_PRED_DEPENDENCY_CANDIDATES_COUNT",
-                    dependencyEdgeCandidates);
-            profiler.addCount("SER_PRED_DEPENDENCY_PHYSICAL_EDGES_COUNT",
-                    dependencyPhysicalEdges);
             profiler.addCount("SER_PRED_DEPENDENCY_PHYSICAL_PR_WR_EDGES_COUNT",
                     dependencyPhysicalPrWrEdges);
             profiler.addCount("SER_PRED_DEPENDENCY_PHYSICAL_PR_RW_EDGES_COUNT",

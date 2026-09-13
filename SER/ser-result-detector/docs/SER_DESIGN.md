@@ -12,7 +12,7 @@
 2. WW option 不由 Java 图在求解时“选边”。未被 pruning 决定的 option 用 SAT literal 表示；相应 MonoSAT edge 在 solve 前已创建，assignment 只决定是否启用。
 3. 当前实现没有调用 MonoSAT reachability predicate。`SERVerifier`为一次audit创建唯一 `PrecedenceOracle<Transaction>`，通过constructor injection传给所有确定性order推理组件；MonoSAT侧只建立 `serializationGraph.acyclic()`，decision variables不进入oracle。
 4. `SAT -> ACCEPT` 表示存在一个满足所有已编码约束的 assignment。代码不会在 SAT 后把选中的完整事务序或 dependency 重新写回 `KnownGraph`，也不输出完整 model。
-5. 生产 CLI 只提供默认 WW reachability（实验可用 `--ww-pruning=NONE` 关闭）；`Prun.java` 的 shared-snapshot 原型已退出 `audit` 与 `constraint-stat` 调用链，等待第二阶段物理清理。
+5. 生产 CLI 默认运行完整 G2，只公开 `--predicate-encoding`、solver timeout 和 stats；WW pruning、GMWR propagation 细分及物理压缩开关仅作为隐藏实验兼容入口。
 
 审计日期：2026-09-10。第一步代码索引见 `SER_CODE_MAP.md`。
 
@@ -32,11 +32,11 @@ Main.main
         -> WW reachability pruning (default; experimental NONE)
         -> new SERSolverAR
            -> create Solver + serializationGraph
-           -> GMWR obligation build/preprop/WW feedback（仅 GMWR）
+           -> compact GMWR obligation build/preprop/full WW fixpoint（默认 G2）
            -> buildKnownOrder
            -> encode known edges
            -> encode residual WW choices
-           -> encode predicate constraints (EAGER/GMWR/general)
+           -> encode residual predicate constraints (默认 GMWR；可选 EAGER/general)
            -> map guarded logical dependencies to serialization edges
            -> assert serializationGraph acyclic
         -> solve
@@ -45,6 +45,8 @@ Main.main
            -> SAT / UNSAT / TIMEOUT
         -> ACCEPT / REJECT / TIMEOUT
 ```
+
+`audit HISTORY` 映射为 `GMWR + WW_GMWR + gmwrPrepropagation + predicateWitnessCoalescing + graphEdgeInterning`。公开的 `--predicate-encoding=eager` 映射为 E2：保留 WW reachability 和 graph edge interning，不构造 GMWR propagation state。
 
 与题设给出的抽象流程相比，代码有以下顺序差异：
 
@@ -92,7 +94,7 @@ semantic guard -> serializationGraph edge literal
 | 1. 输入 | CLI positional `path`；可指向 history 目录或 `history.prhist.jsonl`。同目录必须有 `initial_state.json`。 |
 | 2. 输出 | `History<String, PredicateHistoryLoader.PredicateValue>`。 |
 | 3. 核心结构 | Jackson `JsonNode`；`History`、`Session`、`Transaction`、`Event`、`Event.PredResult`、`RecordedQueryResult`、`QueryPlan`。 |
-| 4. 代码 | `Main.Utils.getLoader()`；`PredicateHistoryLoader.loadHistory/loadInitialState/parseTransaction/parseOperation/parseQueryPredicateResult`；`StructuredQueryParser.parse()`。 |
+| 4. 代码 | `Main.Audit.runAudit()` 直接构造 `PredicateHistoryLoader`；后者执行 `loadHistory/loadInitialState/parseTransaction/parseOperation/parseQueryPredicateResult`；`StructuredQueryParser.parse()` 解析 query。 |
 | 5. 信息变化 | JSON tuple/operation 被转换为 typed objects；初始状态进入 bottom transaction；query JSON 变成 AST；result inputs/values 变成 canonical recorded result。 |
 | 6. 推导类型 | 完全确定性；格式或值不合法抛 `InvalidHistoryError`/`Error`。 |
 | 7. graph edge | 不产生。 |
@@ -102,7 +104,7 @@ semantic guard -> serializationGraph edge literal
 
 输入契约的代码事实：
 
-- CLI 的 `HistoryType` 当前只有 `PRHIST`。
+- `audit` 直接使用 `PredicateHistoryLoader`，不再维护单值 history type 工厂。
 - transaction 只接受 `status=commit`。
 - loader先显式读取每个transaction的 `session`、`session_seq`、`txn`，要求`session_seq`是可表示为`long`的整数，并拒绝同一session内重复的`session_seq`；全部header验证后按`(session, session_seq)`排序，再解析`ops`并构造session transaction list。JSONL行顺序不再决定SO。
 - operation 只接受 `w`、`r`、`pr`；`pr` 必须是 `query` + `result`，旧字段 `predicate/results` 被拒绝。
@@ -164,7 +166,7 @@ SO 只加入 session 内相邻 transaction；传递顺序由后续 closure/acycl
 | 1. 输入 | `History` writes 与 `KnownGraph.readFrom` WR。 |
 | 2. 输出 | `Collection<SERConstraint>`，每项是 `edges1 OR edges2`。 |
 | 3. 核心结构 | `SERConstraint`、`SEREdge`、writer pair map。代码中没有独立 `Option`/`Group` class。 |
-| 4. 代码 | `SERVerifier.generateConstraintsSER()` -> `generateConstraintsCoalesce()` 或 `generateConstraintsNoCoalesce()`。 |
+| 4. 代码 | `SERVerifier.generateConstraintsSER()` -> `generateConstraintsCoalesce()`。 |
 | 5. 信息变化 | 为同 key 的不同 writer transaction 建双向 WW alternative；把 `WR(A,B,k)` 与候选 `WW(A,C,k)` 推出的 `RW(B,C,k)` 放入同一 branch。 |
 | 6. 推导类型 | candidate 集合确定性；选择尚未决定。集合/HashMap 迭代可能影响 id/编码顺序，但不应影响可满足性。 |
 | 7. graph edge | 此时只产生 `SEREdge`，不进入 Guava `KnownGraph`。 |
@@ -172,7 +174,7 @@ SO 只加入 session 内相邻 transaction；传递顺序由后续 closure/acycl
 | 9. 下一阶段消费 | baseline pruning 先尝试消除 option；残余交 `SERSolverAR.encodeRemainingWwChoices()`。 |
 | 10. 复杂度 | WW writer pair O(Σ_k w_k²)；RW 扩展 O(Σ_k WR_k·w_k)；内存与生成的 branch edge 总数同阶。 |
 
-coalescing 开启时，同一 transaction writer pair 在多个 key 上的 WW 和相应 RW 汇入同一个 `SERConstraint`，因为一个全局 serialization order只能给该 transaction pair 一个方向。关闭时，每个 WR/第三 writer 有独立 `{WW+RW} OR {reverse WW}`，另有 standalone WW constraint；这会增加变量和重复 edge，但相反方向同时成立最终会由 serialization cycle 排除。
+同一 transaction writer pair 在多个 key 上的 WW 和相应 RW 始终汇入同一个 `SERConstraint`，因为一个全局 serialization order 只能给该 transaction pair 一个方向。旧非合并生产分支已删除。
 
 ### 4.5 Baseline Pruning
 
@@ -203,8 +205,6 @@ non-predicate fixed A+B edges
 ```
 
 单边和多边 branch 都调用同一 oracle；批量 `wouldCycle` 在 oracle 内部构造只含相关 endpoint 的局部试探闭包。停止条件是无 residual、发生冲突，或本轮解决数不超过剩余数的 `stopThreshold=1%`。
-
-`Prun.java` 的旧 shared-snapshot fixed-point 仅作为第一阶段逻辑删除后的历史实现保留，见第10章；它不再参与生产 verdict。
 
 ### 4.6 GMWR Pre-propagation 与 WW Feedback
 
@@ -662,13 +662,13 @@ $$
 | Predicate | `EXTERNAL`、`INTERNAL`、`MIXED`、`ABSENT_RESULT`、`JOIN_PREDICATE` |
 | Writer pattern | `SINGLE_WRITER`、`MULTIPLE_WRITER`、`SELF_WRITE`、`WRITE_AFTER_READ`、`WRITE_CHAIN` |
 | Solver/pruning | `EAGER`、`GMWR`、`GMWR+WWBridge`（均固定 WW reachability） |
-| Constraint coalescing | `true`、`false` |
+| WW constraint generation | 固定使用按 transaction pair 合并的生产实现 |
 
 每个case先由独立AR排列oracle计算唯一期望verdict，再要求生产`SERVerifier`得到完全相同的`ACCEPT/REJECT`；`TIMEOUT`不作为`REJECT`接受。矩阵还在执行前断言predicate分类和writer shape，避免场景标签存在但实际history未覆盖相应路径。
 
 oracle对predicate read使用候选AR下的完整latest-visible snapshot执行`PredicateEvaluator.evaluate()`；因此JOIN比较完整query output与input provenance，而不是把JOIN错误降级为逐键matcher。结果source仍按latest writer identity比较。随机内存与PRHIST差分测试也直接统计并要求至少出现一个INTERNAL case。
 
-验证结果：矩阵定向运行300项全部通过；当前`./gradlew test`全量共512项，0失败、0错误、2个条件跳过。
+验证结果：矩阵定向运行 75 项全部通过；当前 `./gradlew test` 全量共 263 项，0 失败、0 错误、3 个条件跳过。
 
 ## 9. Pruning 与三类 propagation 的严格区分
 
@@ -677,11 +677,10 @@ oracle对predicate read使用候选AR下的完整latest-visible snapshot执行`P
 | 层 | 代码 | 输入信息 | 可做的事 |
 | --- | --- | --- | --- |
 | Baseline reachability | `Pruning` + `PrecedenceOracle` | fixed non-predicate A+B | closure、option cycle legality、forced branch、提前REJECT |
-| Shared snapshot | `Prun` + `PrecedenceOracle` | fixed WR/predicate sources + writer sets | 跨key lower bound、writer-before-source或reader-before-writer、决定WW branch |
 | GMWR worklist | `GmwrPropagationState` | fixed/forced dependencies + GMWR items/frontiers | repair/source删除、satisfied/conflict、force order/PR_WR |
 | GMWR→WW feedback | `GmwrWwBridge` + `PrecedenceOracle` | GMWR precedence + residual WW options | option legality、commit forced WW/RW、fixpoint |
 
-这四层不再拥有各自的before状态。一次audit内，`SERVerifier`创建唯一oracle，并依次注入所选baseline pruner与 `SERSolverAR`；solver再把同一引用注入 `GmwrPropagationState`、`GmwrWwBridge`及内部REACHABILITY feedback。任一模块加入deterministic fact后，其他模块的 `before(a,b)`立即得到相同结果。
+这三层不再拥有各自的before状态。一次audit内，`SERVerifier`创建唯一oracle，并依次注入所选baseline pruner与 `SERSolverAR`；solver再把同一引用注入 `GmwrPropagationState`、`GmwrWwBridge`及内部REACHABILITY feedback。任一模块加入deterministic fact后，其他模块的 `before(a,b)`立即得到相同结果。
 
 oracle只接收fixed history/known-graph edges、pruning确定的order、forced WW/RW branch和GMWR definite facts。SAT尚未选择的residual WW方向、predicate frontier selection以及其他MonoSAT order literals不写入oracle。
 
@@ -721,212 +720,21 @@ semantic guard assignment
   -> CDCL analysis/backtrack/UNSAT
 ```
 
-## 10. 已退出生产路径的 Shared-Snapshot 原型
+## 10. 哪些内容进入 MonoSAT，哪些只存在于 Boolean 层
 
-### 10.1 名称边界与入口
-
-当前代码中至少有三处“snapshot”概念，必须分开：
-
-| 名称 | 代码 | 所处阶段 | 含义 |
-| --- | --- | --- | --- |
-| `PruningMode.SNAPSHOT` | `Prun.pruneSnapshotOnly()` | ordinary WW/RW生成后、SAT编码前 | 本章所述扩展：利用同一reader的固定读取共享事务级snapshot前缀，提前决定writer顺序和WW/RW branch。 |
-| `PRUN`中的shared snapshot | `Prun.prune()` | 同上 | 使用同样规则，并额外按当前writer-pair reachability消解constraint。 |
-| predicate model snapshot | `SERSolverAR`的frontier/model重建与`QueryPlan.evaluate()` | SAT model产生后 | 为general query选择每个key的latest-visible值并执行query；不是本章pruning算法。 |
-
-以下入口只存在于暂留实现中；当前 CLI、`SERVerifier.audit()` 和 `constraint-stat` 均不会调用：
-
-```text
-SNAPSHOT -> Prun.pruneSnapshotOnly(...)
-         -> Prun.prune(..., includeReachabilityPruning=false, "SNAPSHOT")
-
-PRUN     -> Prun.prune(...)
-         -> Prun.prune(..., includeReachabilityPruning=true, "PRUN")
-```
-
-`PRUN` **不会**调用默认算法 `Pruning.pruneConstraints()`。它内部的 `resolveReachableConstraints()`只调用 `PrecedenceOracle.before()` 读取已经确定的 writer 方向；默认 REACHABILITY 则调用同一 oracle 的批量 `wouldCycle()` 检查整个候选 branch。
-
-### 10.2 阶段接口
-
-| 审计项 | 当前实现 |
-| --- | --- |
-| 1. 输入 | `History`、A+B fixed `KnownGraph`、ordinary `SERConstraint` residual集合。 |
-| 2. 输出 | 由snapshot规则增强的内部transaction order；已决定branch写入后的`KnownGraph`；删除已决定项后的constraints；或`Result.inconsistent=true`。 |
-| 3. 核心结构 | `FixedObservation`、`writersByKey`、`observationsByReader`、共享 `PrecedenceOracle`、`ForcedOrder`、`snapshotWriterOrders`。 |
-| 4. 代码 | `Prun.prune/pruneSnapshotOnly/buildFixedObservations/buildSharedLowerBounds/resolveSnapshotConstraints/resolveReachableConstraints`。 |
-| 5. 信息变化 | 从固定source读推导新的transaction order；用writer-pair方向选择WW branch；把branch内WW/RW写入A/B并删除constraint。 |
-| 6. 推导类型 | 完全是checker端确定性fixed-point；不做SAT decision。 |
-| 7. graph edge | oracle 中的新顺序本身不是 Guava edge；仅被物化 branch 中的 `SEREdge` 进入 `KnownGraph`。 |
-| 8. SAT/MonoSAT constraint | 本阶段不创建literal、clause或MonoSAT edge。物化结果稍后作为fixed edge进入MonoSAT；residual仍走WW SAT choice。 |
-| 9. 下一阶段 | `SERSolverAR.buildKnownOrder/encodeKnownEdges()`消费物化A+B；`encodeRemainingWwChoices()`消费未删constraint。 |
-| 10. 复杂度 | 初始BitSet closure约O(T³/word)，空间O(T²/word)；单次增量order最坏O(T²/word)；每轮还扫描observations×同key writers以及PRUN模式下的residual constraints。 |
-
-若传入的 `constraints` 为空，`Prun.prune(...)`在建立事务索引前直接返回全零 `Result`；因此该扩展不会单独运行observation fixed-point。最终已知图cycle和predicate语义仍由后续solver检查。
-
-### 10.3 固定 observation 的来源
-
-`buildFixedObservations()`只收集source已经由history确定的读取：
-
-1. point read：遍历 `KnownGraph.readFrom` 的每个WR endpoint及其edge key，形成 `(reader,key,source)`。
-2. predicate read：遍历 `KnownGraph.PredicateObservation.tupleSources`，只接受 `PredicateReadType.EXTERNAL` 且source transaction不同于reader的recorded tuple source。
-3. internal predicate key不进入；没有recorded source的absent/frontier key也不进入。
-4. 同一 `(reader,key)` 若记录到两个不同source，`recordFixed()`将该pair标记为ambiguous并从fixed map删除；该key不参与本算法。
-
-`buildWritersByKey()`则遍历 `KnownGraph.getAllWrites()`，按key保存writer transaction集合。同一transaction对同一key写多次，在这里因`Set<Integer>`只出现一次；bottom initial writer也属于transaction索引。扫描某observation时跳过source自身和reader自身。
-
-predicate tuple source能在这里参与跨key推理，即使主路径此时尚未把 `PR_WR` 写入A：`Prun`直接读取observation中的source。它不会在本阶段创建 `PR_WR/PR_RW`，也不会执行query或判断write是否改变predicate result；这些仍由 `SERSolverAR.encodePredicateConstraints()`负责。
-
-### 10.4 PrecedenceOracle 与 shared lower bound
-
-事务仍按 `(session.id, transaction.id)` 排序并映射为整数下标，供 `Prun` 的writer集合、BitSet lower bound和统计使用；该排序不是新增SO。order查询直接使用由 `SERVerifier`创建的 `PrecedenceOracle<Transaction>`，当前A+B的所有非self endpoint顺序进入该共享实例，之后所有模块使用统一查询：
-
-```text
-before(a,b)
-successor(a)
-predecessor(b)
-wouldCycle(a,b)
-```
-
-oracle 内部添加 `from -> to` 时令：
-
-```text
-P = predecessors[from] U {from}
-S = reachability[to]   U {to}
-
-对每个 p in P: reachability[p] |= S
-对每个 s in S: predecessors[s] |= P
-```
-
-因此每条新顺序会立即传播到闭包；加入前由 `wouldCycle(from,to)` 统一报告冲突。
-
-对reader `R` 的全部固定observation，`buildSharedLowerBounds()`计算：
-
-```text
-LB(R) = Pred(R)
-        U { source(O) | O.reader = R }
-        U { Pred(source(O)) | O.reader = R }
-```
-
-其中 `Pred(X)=PrecedenceOracle.predecessor(X)`。这个 `LB(R)` 是代码对“同一transaction的读取共享一个serialization snapshot前缀”的具体表示：已经在R之前的事务、R固定读到的每个source、以及这些source的前驱，都被视为R的已知snapshot下界。实现没有upper bound结构，也没有直接生成 `LB×UB` 边。
-
-### 10.5 两条真实传播规则
-
-对固定observation `(R,k,S)` 和每个也写过k的竞争writer `C`，latest-visible二选一为：
-
-```text
-C < S    OR    R < C
-```
-
-即C要么排在记录source S之前，要么排在reader R之后。代码先检查该二选一是否已经满足：
-
-```text
-if C <* S or R <* C:
-    skip
-```
-
-尚未满足时执行以下分支。名称“规则A/B”是本文为定位代码所用，代码中没有同名class。
-
-**规则A：竞争writer已在shared snapshot下界内。**
-
-```text
-if C in LB(R):
-    force C < S
-```
-
-因为C已确定在R的snapshot前缀中，`R<C`不再可选；为使R仍读到S，C只能位于S之前。实现调用 `putForced(additions,C,S,crossKey)`，并把writer pair `(C,S)`放入 `snapshotWriterOrders`。
-
-`crossKey=true` 还要求：`C`并非已经由当前key的 `C=S or C<*S`解释，且R存在另一个key的fixed observation，其source等于C或在C之后。这一布尔值只用于 `Result.crossKeyForcedOrders`计数，不改变传播。
-
-**规则B：source已经在竞争writer之前。**
-
-```text
-else if S <* C:
-    force R < C
-```
-
-此时 `C<S`不可能，只剩anti-dependency方向 `R<C`。实现仍把writer pair `(S,C)`放入 `snapshotWriterOrders`，因为后续需要选择的是 `WW(S,C)` branch；该branch若来自point WR，内部同时包含 `RW(R,C)`。
-
-一次扫描先把新顺序收集进 `LinkedHashMap<Long,ForcedOrder>`，再调用 `PrecedenceOracle.add()`。更新后的 closure 可能扩大其他 reader 的 `LB`，所以外层 while 继续到没有新顺序或 `wouldCycle`。
-
-### 10.6 SNAPSHOT 与 PRUN 的 branch 物化差异
-
-| 模式 | shared-snapshot规则 | 如何选择 `SERConstraint` branch |
-| --- | --- | --- |
-| `SNAPSHOT` | 执行 | 每轮只看规则A/B刚记录的 `snapshotWriterOrders`；只有constraint的两个writer与该有向pair直接匹配才物化。已有SO/WR closure单独确定的writer方向不会被它消费。 |
-| `PRUN` | 执行 | 每轮开头调用 `resolveReachableConstraints()`；只要当前closure中两个writer恰有一个方向可达，就物化对应branch。若本轮物化了任何constraint，立即开始下一轮，再做snapshot扫描。 |
-| `REACHABILITY` | 不执行 | 在另一个class `Pruning` 中试加每个完整branch并检查cycle；不是本章算法。 |
-| `NONE` | 不执行 | 全部constraint直接进入SAT。 |
-
-`resolveSnapshotConstraints()`和 `resolveReachableConstraints()`最终都依据 `SERConstraint.writeTransaction1/writeTransaction2`选择 `edges1` 或 `edges2`。选中后：
-
-```text
-selected SEREdge collection
-  -> putEdgeIfAbsent
-       WW/SO/WR/PR_WR -> KnownGraph A
-       RW             -> KnownGraph B
-       PR_RW          -> 当前函数明确不写回
-  -> 每个非self endpoint加入PrecedenceOracle
-  -> remove SERConstraint from residual collection
-```
-
-当前ordinary constraint generator只把WW/RW放进baseline constraints，因此 `PR_RW`过滤分支在现有主路径不触发。对于来自predicate tuple source的规则B，snapshot阶段通常只固定 `WW(S,C)`；随后predicate encoder会依据固定写顺序和result-change条件决定是否生成 `PR_RW(R,C)`。
-
-一个关键行为差异已有测试固定：如果只有session顺序 `C<*S`，没有本轮shared-snapshot见证，`SNAPSHOT`保留该WW constraint；`PRUN`会因writer pair已可达而物化它。对应测试是 `PrunTest.snapshotOnlyDoesNotApplyReachabilityPruning()`。
-
-### 10.7 与 graph edge、SAT literal 和 MonoSAT 的交接
-
-| 本阶段对象 | 是真实history dependency吗 | 是Java graph edge吗 | 是SAT/MonoSAT literal吗 | 后续去向 |
-| --- | --- | --- | --- | --- |
-| `FixedObservation(R,k,S)` | 表示输入固定source事实 | 否；point WR另已在图中，predicate source只在observation中 | 否 | 用于构造LB和writer二选一。 |
-| `ForcedOrder(C,S)` / `(R,C)` | checker从snapshot语义确定的事务顺序 | 否，仅存在 `PrecedenceOracle` | 否 | 扩大closure、决定其他branch或检测cycle。 |
-| 被选branch的`SEREdge` | 逻辑WW/RW依赖 | 是，写入A/B | 本阶段否 | solver稍后创建并assert fixed theory-edge literal。 |
-| 未选`SERConstraint` | 尚未决定的logical disjunction | 否 | 本阶段否 | `encodeRemainingWwChoices()`创建fresh WW guard。 |
-
-因此SNAPSHOT不是“提前建立SAT约束”，而是“在SAT前删除已能确定的disjunction”。SAT/MonoSAT最终看到两类结果：已物化branch作为fixed graph edge；没有物化的branch保持原样成为Boolean WW choice。
-
-`Prun.Result`仍只返回计数和 `inconsistent`，但 `Prun`内部派生的deterministic order不再随方法返回而丢失：它们已写入audit-scoped共享oracle，后续GMWR和solver known-order直接可见。只有typed WW/RW branch仍需写入 `KnownGraph`，以保留relation type/key metadata并在solver中物化对应fixed dependency。
-
-### 10.8 复杂度、统计与测试覆盖
-
-令T为transaction数，O为fixed observation数，`w_k`为key k的writer transaction数，C为residual constraints数：
-
-- `direct/reachability/predecessors`各占O(T²/word) BitSet空间。
-- 初始 `transitiveClosure()`按intermediate/from做BitSet OR，最坏O(T³/word)。
-- 一次 `PrecedenceOracle.add()` 最坏遍历 O(T) 个前驱和后继并做 BitSet OR，最坏 O(T²/word)。
-- 一次snapshot扫描为O(Σ_observation w_key)，重建所有LB另需BitSet union成本。
-- `SNAPSHOT`每轮扫描constraints以匹配本轮writer pairs；`PRUN`每个消解pass扫描当前residual C。fixed-point轮数受可新增有向transaction pair数量O(T²)约束，因此宽松最坏界可很高；代码没有更紧的全局界或stop-threshold。
-
-`Prun.Result`保存：
-
-| 字段 | 代码中的计数含义 |
-| --- | --- |
-| `newForcedTransactionOrders` | `forcedPairs`中由规则A/B加入的唯一直接pair数。 |
-| `crossKeyForcedOrders` | 具有另一key visibility witness的forced pair数。 |
-| `reachabilityDerivedOrders` | 最终closure相对初始closure新增的pair数，减去forced direct pair后的非负值。 |
-| `crossSnapshotDerivedOrders` | 第二个及以后传播轮次新加入的forced direct pair数。 |
-| `existingGraphDerivedOrders` | 初始A+B closure边数减初始direct endpoint边数。 |
-| `ordersCreatedBeyondInitialTc` | 最终closure相对初始closure新增的总pair数。 |
-| `propagationRounds` | 至少发现一批规则A/B additions的轮数。 |
-| `inconsistent` | closure是否出现自达cycle。 |
-
-这些细分字段只属于暂留原型。生产可见统计为 `WW_INITIAL_CHOICES`、`WW_REACHABILITY_FORCED`、`WW_AFTER_REACHABILITY`、`WW_REACHABILITY_PRUNE_MS` 与 `WW_AFTER_GMWR`。
-
-`PrunTest`仍保留历史原型的局部测试，供第二阶段物理删除前核对；生产差分与验收矩阵只覆盖 `NONE/REACHABILITY`。
-
-## 11. 哪些内容进入 MonoSAT，哪些只存在于 Boolean 层
-
-### 11.1 直接成为 fixed serialization theory edge
+### 10.1 直接成为 fixed serialization theory edge
 
 - initial/forced A+B 中所有非 bottom/self SO、WR、WW、RW、PR_WR、PR_RW；`isEncodedKnownEdge()`当前全部接受。
 - solver阶段 `addKnownPredicateEdge()`配套 `addDependencyEdge(..., Lit.True)` 的 fixed PR_WR。
 - GMWR `DependencyFact.isTypedDependency()` 的 definite typed fact。
 
-### 11.2 成为 conditional serialization theory edge
+### 10.2 成为 conditional serialization theory edge
 
 - residual WW branch中的 WW/RW；
 - selected predicate source的 PR_WR；
 - selected source之后 result-changing writer的 PR_RW。
 
-### 11.3 只作为 Boolean/order constraint
+### 10.3 只作为 Boolean/order constraint
 
 - fresh WW branch selector本身；
 - order pair XOR；
@@ -935,7 +743,7 @@ selected SEREdge collection
 - `LatestVisibleChecker` 产生的 latest-writer validity 组合；
 - GMWR derived order fact 进入 `serializationGraph`，但没有 type 时不记为 logical dependency metadata。
 
-### 11.4 当前是否有“建立了 constraint 但没有真正进入 MonoSAT”
+### 10.4 当前是否有“建立了 constraint 但没有真正进入 MonoSAT”
 
 对活跃主路径逐项检查后的结果：
 
@@ -944,32 +752,31 @@ selected SEREdge collection
 - GMWR obligation：resolved/satisfied的不编码，但其结论来自已编码fixed facts；其余由 `resolveAndEncodeGmwrBundles()`逐 item加clause。
 - general predicate：不一次性进入初始CNF，但每个 `PredicateCheck`在每次SAT model后执行，mismatch必加no-good再solve。
 
-未发现一个已确认会在当前正常路径中静默丢失、从而完全不约束solver的 ordinary或GMWR item。不过存在三类需要警惕的“非直接消费”结构：
+未发现一个已确认会在当前正常路径中静默丢失、从而完全不约束solver的 ordinary或GMWR item。不过存在两类需要警惕的“非直接消费”结构：
 
-1. `SERVerifier.injectPredicateEdgesSER()/refreshDerivedPredicateEdges()`明确只供 `--compare-derived-predicate-edges` 诊断，主solver故意不消费。
-2. `GmwrPropagationState.frontierDomains()`没有一个直接的SAT编码遍历；forced unique source进入 `definiteFacts`，residual frontier则依赖后续 `createKeyFrontier()`重新构造等价语义。代码没有对两套candidate domain做一致性断言。
-3. `LogicalRelation.forced`和 `FactKind.CONDITIONAL_ORDER`当前没有求解消费路径；residual GMWR实际直接调用 `orderLiteral()`。这些对象当前更像bookkeeping/残留接口，不能当成已编码constraint。
+1. `GmwrPropagationState.frontierDomains()`没有一个直接的SAT编码遍历；forced unique source进入 `definiteFacts`，residual frontier则依赖后续 `createKeyFrontier()`重新构造等价语义。代码没有对两套candidate domain做一致性断言。
+2. `LogicalRelation.forced`和 `FactKind.CONDITIONAL_ORDER`当前没有求解消费路径；residual GMWR实际直接调用 `orderLiteral()`。这些对象当前更像bookkeeping/残留接口，不能当成已编码constraint。
 
-## 12. SAT/MonoSAT 到最终 verdict
+## 11. SAT/MonoSAT 到最终 verdict
 
 `SERVerifier.audit()`的映射为：
 
 | 条件 | 返回 | CLI marker / exit code |
 | --- | --- | --- |
-| internal consistency false | `REJECT` | `[[[[ REJECT ]]]]` / -1 |
+| internal consistency false | `REJECT` | `SER audit result: REJECT` / -1 |
 | baseline pruning conflict | `REJECT` | 同上 |
 | GMWR propagation conflict | solver中assert false，最终 `UNSAT -> REJECT` | 同上 |
-| MonoSAT + refinement最终SAT | `ACCEPT` | `[[[[ ACCEPT ]]]]` / 0 |
-| MonoSAT最终UNSAT | `REJECT` | `[[[[ REJECT ]]]]` / -1 |
-| solve backend timeout | `TIMEOUT` | `[[[[ TIMEOUT ]]]]` / 124 |
+| MonoSAT + refinement最终SAT | `ACCEPT` | `SER audit result: ACCEPT` / 0 |
+| MonoSAT最终UNSAT | `REJECT` | `SER audit result: REJECT` / -1 |
+| solve backend timeout | `TIMEOUT` | `SER audit result: TIMEOUT` / 124 |
 
-`INVALID_HISTORY(2)`虽定义在 `AuditResult`，但当前 `SERVerifier` 构造器中的 `loader.loadHistory()`以及 loader异常没有被 `Audit.call()`/`audit()` catch并转换；因此 malformed history通常抛异常退出，而不是稳定打印 `[[[[ INVALID_HISTORY ]]]]`。一致性失败则被归为 REJECT。
+`INVALID_HISTORY(2)`虽定义在 `AuditResult`，当前一致性失败仍归为 REJECT；CLI audit 过程中未分类的运行异常统一以退出码 1 和末行 `SER audit result: ERROR` 报告。
 
 SAT assignment不会生成一个新的 Java transaction sequence。solver 只通过 serialization edge literal model 保证存在一致顺序；general predicate 的 `selectedCandidate()` 读取 serialization literal model 来重建每个 key 的 latest frontier，但最终 ACCEPT 后该 snapshot/model 不对外持久化。
 
-## 13. Statistics、timing 与 debug 输出
+## 12. Statistics、timing 与 debug 输出
 
-### 13.1 Timing
+### 12.1 Timing
 
 `Profiler`按当前thread保存tag的毫秒累计，并用后台线程每100 ms采样JVM used heap最大值。主要tag：
 
@@ -980,62 +787,57 @@ SAT assignment不会生成一个新的 Java transaction sequence。solver 只通
 - GMWR：`GMWR_BUILD_MS`、`GMWR_REDUCTION_MS`、`GMWR_WW_BRIDGE_MS`、`SER_GMWR_BUILD`、`SER_GMWR_RESOLUTION`；
 - predicate细分：source index、scope lookup、snapshot validation、row-local/general scan、sourced/sourceless encode与physical materialization。
 
-### 13.2 Counts
+### 12.2 Counts
 
 `SERVerifier`统计 `WW_INITIAL_CHOICES`、`WW_REACHABILITY_FORCED`、`WW_AFTER_REACHABILITY` 和 `WW_AFTER_GMWR`。`SERSolverAR.publishResidualSatStats()`记录 WW choice变量/constraint以及 `solver.nVars()/nClauses()`。`PredicateEncodingMetrics.publish()`记录 observations、frontiers、candidates、bad writes、comparability、logical/physical predicate edges、coalescing和blocking clauses。`publishGmwrMetrics()`记录item、bundle、subsumed/residual clauses、removed candidates、forced orders与general witnesses。
 
-### 13.3 Debug/diagnostic
+### 12.3 Debug/diagnostic
 
-- 默认 stderr：history规模、known edge数、unresolved WW数、pruning progress、predicate source constraint数、所有 profiler tag和最大内存。
-- `--solver-stats`：额外打印完整predicate counts与生效配置。
-- `--dot-output`：REJECT时输出cycle/conflict DOT和legacy conflict信息。
-- `--compare-derived-predicate-edges`：在独立fresh graph上运行derived PR edge算法，只比较数量，不进入solver。
-- UNSAT conflict extraction：`SERSolverAR.extractConflicts()`直接读取MonoSAT `getConflictClause()`，按PolySI方式对clause literal取反并映射到 `A<n>`；不再重建solver做WW-only缩核。`SERVerifier.emitRejectDiagnostics()`输出 `conflict clause -> reason`，reason类型为`WW_CHOICE`、`PREDICATE_OBLIGATION`或`GMWR_RULE`；没有assumption clause的纯deterministic known-edge冲突仍回退到cycle witness。
+- 默认 stderr：按阶段流式打印 History、WW、可选 GMWR、Predicate、SAT、Timing 与峰值内存；不打印 known edge/unresolved WW 等内部计数、逐轮 pruning、progress bar 或 bridge epoch。
+- `--solver-stats`：在精简摘要后额外打印完整 profiler durations/counts、predicate 配置、runner 使用的 `Max memory` 行和兼容旧 runner 的 verdict marker；`SER audit result: ...` 在所有模式下均为最后一行。
+- UNSAT conflict extraction：`SERSolverAR.extractConflicts()`直接读取MonoSAT `getConflictClause()`，按PolySI方式对clause literal取反并映射到 `A<n>`；不再重建solver做WW-only缩核。`SERVerifier.emitRejectDiagnostics()`只输出当前 conflict clause/reason 或 conflict core 摘要，reason类型为`WW_CHOICE`、`PREDICATE_OBLIGATION`或`GMWR_RULE`。
 
-## 14. Implementation Notes / Potential Issues
+## 13. Implementation Notes / Potential Issues
 
 以下按“代码已确认事实”和“仍需验证风险”表述，不把风险写成已证实错误。
 
-### 14.1 输入与 verdict
+### 13.1 输入与 verdict
 
 1. **`session_seq`已显式消费。** loader在构造`History`前验证并按`(session, session_seq)`排序；SO来自排序后的session transaction list，不再依赖JSONL出现顺序。
 2. **source metadata接口与loader不一致。** `Event/PredResult`保留 `writeId/sourceWriteId/sourceTxnId/sourceOpIndex` 字段，注释称新trace使用精确id；当前PRHIST loader却拒绝这些字段，并按唯一 `(key,value)`解析。重复同key/value版本因此无法表达。
 3. **`INVALID_HISTORY`当前不可达为稳定verdict。** loader exception在`SERVerifier`构造期抛出；consistency failure又映射为REJECT。调用者若依赖exit code 2/marker，需要验证或补充异常映射（本任务未改代码）。
 
-### 14.2 Edge / literal 映射
+### 13.2 Edge / literal 映射
 
 4. **semantic guard与physical edge只有单向 implication。** 这通常保持“需要relation时必须启用edge”的可满足性方向，但physical model可能包含没有semantic witness的额外edge，不能用其真值直接反推relation。
 5. **physical edge 不反向唯一标识 logical relation。** `logicalDependenciesByEndpoint` 持续保留 `SEREdge(type,keys)`，但开启 endpoint interning 后，一个 serialization edge 可对应多个 relation/key；诊断必须回到 logical layer，不能从 MonoSAT edge 反推单一类型。
 6. **`serializationGraph` 不保留 type。** 不同 A/B/type 同 endpoint 在 interning 下共享物理 edge；对 cycle satisfiability 方向足够，type-sensitive explanation/debugging/paper description 以 logical dependency metadata 为准。
 
-### 14.3 Pruning / propagation 交接
+### 13.3 Pruning / propagation 交接
 
-7. **deterministic order交接已统一。** `Prun.Result`仍只携带计数和冲突状态，但 `Prun`、GMWR和solver通过constructor injection持有同一个audit-scoped oracle；中间derived order无需复制到返回值即可继续可见。typed WW/RW仍写回KnownGraph，以保留type/key metadata。
+7. **deterministic order交接已统一。** `Pruning`、GMWR和solver通过constructor injection持有同一个audit-scoped oracle；中间derived order无需复制即可继续可见。typed WW/RW仍写回KnownGraph，以保留type/key metadata。
 8. **GMWR residual frontier domain没有直接编码消费者。** fixed/unique结果通过definite facts传递，residual语义由`createKeyFrontier()`重新生成。需要在大规模或边界query上验证preprop domain削减与重建candidate完全一致。
 9. **存在未参与实际流程的GMWR bookkeeping。** `LogicalRelation.forced`未被读取，`FactKind.CONDITIONAL_ORDER`没有构造点，`BadWriterObligation.outsideAllowed`当前总为true且未被消费。它们不构成当前已确认漏约束，但容易让维护者误以为存在额外编码路径。
-10. **两个baseline branch物化器都不写回PR_RW。** `Pruning.addToKnownGraph()`与`Prun.putEdgeIfAbsent()`都跳过PR_RW。当前ordinary constraint generation不会把PR_RW放入baseline constraints，所以主路径未触发；若未来复用任一pruner处理predicate option，这会成为必须重新审计的接口缺口。
+10. **baseline branch物化器不写回PR_RW。** `Pruning.addToKnownGraph()`跳过PR_RW。当前ordinary constraint generation不会把PR_RW放入baseline constraints，所以主路径未触发；若未来复用该pruner处理predicate option，这会成为必须重新审计的接口缺口。
 
-### 14.4 EAGER/GMWR 等价与求解边界
+### 13.4 EAGER/GMWR 等价与求解边界
 
 11. **general GMWR全局等价尚无代码级证明。** 重点位置是 `QueryPlan.isMonotone()`和 `SERSolverAR.refineGeneralPredicateConstraints()` 的new-input witness缩小。当前测试通过且未发现反例，但覆盖范围有限。
 12. **`WW_ONLY`与`WW_GMWR_ONEWAY`在GMWR下没有独立行为分支。** 两者都可进行GMWR preprop，且都跳过WW feedback；只有`WW_GMWR`额外反馈。配置名可能让使用者误判实际行为。
 13. **timeout不是端到端wall-clock上限。** deadline从`SERSolverAR.solve()`开始，不覆盖parse/consistency/pruning/encoding；UNSAT后只读取最近一次solve的conflict clause，不再启动无时限诊断solver。
-14. **diagnostic PR graph与生产编码是两套实现。** `refreshDerivedPredicateEdges()`只在已确认唯一write order时派生，并有conservative compare candidates；日志明确不供AR solver使用。两者数量不一致不能直接解释为生产漏边，也不能用诊断图证明生产完整性。
-
-### 14.5 当前未发现的风险结论
+### 13.5 当前未发现的风险结论
 
 审计没有发现以下已证实错误：residual WW constraint完全未编码、ordinary RW没有任何MonoSAT承载、GMWR在关闭preprop时漏掉全部absent obligation、或SAT/UNSAT被直接反向映射。相关回归和差分测试在当前工作树均通过。上述潜在问题主要是接口/诊断映射、配置语义和尚未形式证明的等价边界。
 
-## 15. 四张总览图
+## 14. 四张总览图
 
-### 15.1 模块 / 代码调用图
+### 14.1 模块 / 代码调用图
 
 ```mermaid
 flowchart TD
     A[Main.main] --> B[Audit.call]
-    B --> C[Main.Utils.getLoader]
-    B --> E[SERVerifier constructor]
-    C --> E
+    B --> C[new PredicateHistoryLoader]
+    C --> E[SERVerifier constructor]
     E --> D[PredicateHistoryLoader.loadHistory]
     D --> F[SERVerifier.audit]
     F --> G[verifier.Utils.verifyInternalConsistency]
@@ -1060,7 +862,7 @@ flowchart TD
     Y --> AB[SERVerifier.AuditResult]
 ```
 
-### 15.2 数据流图
+### 14.2 数据流图
 
 ```mermaid
 flowchart LR
@@ -1093,7 +895,7 @@ flowchart LR
     S -->|timeout| W[TIMEOUT]
 ```
 
-### 15.3 一个 WW 二选一 constraint 的生命周期
+### 14.3 一个 WW 二选一 constraint 的生命周期
 
 ```mermaid
 flowchart TD
@@ -1123,7 +925,7 @@ flowchart TD
     Q --> S[SAT plus predicate checks -> ACCEPT]
 ```
 
-### 15.4 最终整体架构图
+### 14.4 最终整体架构图
 
 ```mermaid
 flowchart TB
@@ -1187,12 +989,12 @@ flowchart TB
     S -->|no-good| Q
 ```
 
-## 16. 关键代码索引
+## 15. 关键代码索引
 
 | 阶段 | 文件 | 类 / 函数 | 作用 |
 | --- | --- | --- | --- |
 | Entry | `SER/ser-result-detector/src/main/java/Main.java` | `Main.main`、`Audit.call` | CLI、settings、checker调用、marker/exit code。 |
-| Loader select | 同上 | `Utils.getLoader`、`HistoryType` | 当前只选择PRHIST loader。 |
+| Loader | 同上 | `new PredicateHistoryLoader(path)` | 直接加载当前 PRHIST 输入。 |
 | Parse | `src/main/java/history/loaders/PredicateHistoryLoader.java` | `loadHistory/loadInitialState/parseTransaction/parseOperation` | 文件到history/event。 |
 | Query parse | `src/main/java/history/query/StructuredQueryParser.java` | `parse` | query JSON到AST/plan。 |
 | Query execute | `src/main/java/history/query/QueryPlan.java` | `evaluate/isRowLocal/isMonotone` | snapshot执行和路径分类。 |
@@ -1200,12 +1002,11 @@ flowchart TB
 | Representation | `src/main/java/history/Event.java` | `Event`、`PredResult` | point/predicate operation表示。 |
 | Consistency | `src/main/java/verifier/Utils.java` | `verifyInternalConsistency/checkItemRead/checkPredicateRead` | source/latest/local/recorded result门禁。 |
 | Dependency | `src/main/java/graph/KnownGraph.java` | constructor、`putEdge` | SO、WR、write indexes、predicate observations、A/B分流。 |
-| Candidate | `src/main/java/verifier/SERVerifier.java` | `generateConstraintsSER/generateConstraintsCoalesce/NoCoalesce` | WW option与ordinary RW candidate。 |
+| Candidate | `src/main/java/verifier/SERVerifier.java` | `generateConstraintsSER/generateConstraintsCoalesce` | 合并后的 WW option 与 ordinary RW candidate。 |
 | Option data | `src/main/java/verifier/SERConstraint.java` | `SERConstraint` | 两branch group。 |
 | Logical edge | `src/main/java/verifier/SEREdge.java` | `SEREdge` | typed logical candidate及多key coalescing。 |
 | Precedence | `src/main/java/verifier/PrecedenceOracle.java` | `before/successor/predecessor/wouldCycle/add` | `SERVerifier`每次audit创建并注入的唯一deterministic closure；REACHABILITY、GMWR、WW bridge与solver known order共享同一实例。 |
 | Pruning | `src/main/java/verifier/Pruning.java` | `pruneConstraints` | 默认WW/RW reachability pruning。 |
-| Archived prototype | `src/main/java/verifier/Prun.java` | shared-snapshot fixed-point | 已退出生产调用链，等待第二阶段物理清理。 |
 | Latest visible | `src/main/java/verifier/LatestVisibleChecker.java` | `check` | reader/key/candidates + serialization order 到每个 writer 的 latest validity。 |
 | Predicate encode | `src/main/java/verifier/SERSolverAR.java` | `encodePredicateConstraints/createKeyFrontier` | EAGER 直接检查完整候选，GMWR 缩减后检查；随后生成 predicate source、frontier和PR dependencies。 |
 | EAGER | 同上 | `encodeRowLocalPredicateEager` | eager row-local clauses和recorded source。 |
@@ -1224,8 +1025,8 @@ flowchart TB
 | Refinement | 同上 | `refineGeneralPredicateConstraints` | model snapshot执行和no-good。 |
 | Verdict | `src/main/java/verifier/SERVerifier.java` | `audit`、`AuditResult` | status到ACCEPT/REJECT/TIMEOUT。 |
 | Statistics | `src/main/java/util/Profiler.java` | `startTick/endTick/addCount/addDurationNanos` | timing/count/max memory。 |
-| Diagnostics | `src/main/java/verifier/SERVerifier.java` | `emitRejectDiagnostics`、`injectPredicateEdgesSER` | conflict输出和独立PR比较路径。 |
+| Diagnostics | `src/main/java/verifier/SERVerifier.java` | `emitRejectDiagnostics` | 输出当前求解/剪枝产生的 conflict reason 或 core 摘要。 |
 
-## 17. 最终回答
+## 16. 最终回答
 
 当前仓库的 SER checker 从输入 history 到 verdict 的决定机制不是“先完整建好一张 typed dependency graph 再交给 MonoSAT 判环”。它先确定 SO/point-WR、生成 ordinary WW/RW disjunction，并默认用 branch-cycle reachability 在 SAT 前固定一部分分支。随后 solver 用 serialization order 选择残余写顺序和 predicate frontier，以 guarded logical dependencies 驱动唯一 `serializationGraph` 的 endpoint edges。EAGER 把 row-local bad-writer 条件立即展开，GMWR 先将同 reader/bad-writer 义务 bundle 化、传播并只编码残余；general query 再用 SAT model 上的具体 snapshot 执行真实 QueryPlan 并加入 no-good。最终只有同时满足 Boolean 约束、唯一 serialization graph 无环且所有 predicate model 检查稳定通过的 assignment 才产生 ACCEPT；否则产生 REJECT，backend 超时产生 TIMEOUT。

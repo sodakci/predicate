@@ -19,7 +19,6 @@ import org.apache.commons.lang3.tuple.Triple;
 import org.junit.jupiter.api.Test;
 import util.Profiler;
 
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -50,17 +49,10 @@ class SERSolverARSatEncodingTest {
         return h;
     }
 
-    @SuppressWarnings("unchecked")
     private static Collection<SERConstraint<String, Integer>> generateConstraints(
             History<String, Integer> history,
             KnownGraph<String, Integer> graph) {
-        try {
-            Method method = SERVerifier.class.getDeclaredMethod("generateConstraints", History.class, KnownGraph.class);
-            method.setAccessible(true);
-            return (Collection<SERConstraint<String, Integer>>) method.invoke(null, history, graph);
-        } catch (ReflectiveOperationException e) {
-            throw new AssertionError(e);
-        }
+        return SERVerifier.generateConstraintsSER(history, graph);
     }
 
     private static boolean verifySer(History<String, Integer> history) {
@@ -764,7 +756,7 @@ class SERSolverARSatEncodingTest {
     }
 
     @Test
-    void unresolvedPredicateOrderSkippedByRefreshButRejectedByNewSatSolver() {
+    void unresolvedPredicateOrderIsRejectedByCurrentSatSolver() {
         var history = makeHistory(
                 Set.of(1L, 2L, 3L),
                 Map.of(1L, List.of(1L), 2L, List.of(2L, 4L), 3L, List.of(3L)),
@@ -778,9 +770,6 @@ class SERSolverARSatEncodingTest {
         commitAll(history);
 
         var graph = new KnownGraph<>(history);
-        SERVerifier.refreshDerivedPredicateEdges(history, graph);
-
-        assertEquals(0L, countEdgesOfType(graph.getKnownGraphA(), EdgeType.PR_WR));
         assertFalse(verifySer(history));
     }
 
@@ -922,7 +911,7 @@ class SERSolverARSatEncodingTest {
     }
 
     @Test
-    void committedUnresolvedPredicateOrderIsRejectedByArSatNotLegacyRefresh() {
+    void committedUnresolvedPredicateOrderIsRejectedByArSat() {
         var history = makeHistory(
                 Set.of(1L, 2L, 3L),
                 Map.of(1L, List.of(1L), 2L, List.of(2L, 4L), 3L, List.of(3L)),
@@ -935,16 +924,11 @@ class SERSolverARSatEncodingTest {
                         List.of(new Event.PredResult<>("x", 10)))));
         commitAll(history);
 
-        var graph = new KnownGraph<>(history);
-        SERVerifier.refreshDerivedPredicateEdges(history, graph);
-
         // Theory: PR_WR T1->T2 for x, SO T2->T4, and WR T4->T1 for z form
-        // a SER cycle. The x writers T1/T3 are initially unordered, so the
-        // Derived-edge refresh has no reliable PR_* edge before SAT. The AR SAT
-        // path must still reject.
-        assertEquals(0L, countEdgesOfType(graph.getKnownGraphA(), EdgeType.PR_WR));
+        // a SER cycle. The x writers T1/T3 are initially unordered; the AR SAT
+        // predicate encoding must still reject.
         assertFalse(solveSer(history),
-                "strict total AR predicate constraints must detect cycles even when derived PR refresh skips them");
+                "strict total AR predicate constraints must detect the cycle");
     }
 
     @Test

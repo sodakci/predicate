@@ -197,8 +197,12 @@ public class KnownGraph<KeyType, ValueType> {
      * The built graph contains SO and WR edges
      */
     public KnownGraph(History<KeyType, ValueType> history) {
+        this(history, true);
+    }
+
+    public KnownGraph(History<KeyType, ValueType> history, boolean diagnostics) {
         var synthesized = history.ensureInitialVersions();
-        if (!synthesized.isEmpty()) {
+        if (diagnostics && !synthesized.isEmpty()) {
             System.err.printf(
                     "[SER] synthesized ABSENT initial versions for keys: %s%n",
                     synthesized);
@@ -362,31 +366,6 @@ public class KnownGraph<KeyType, ValueType> {
         case PR_RW:
             addEdge(knownGraphB, u, v, edge);
             break;
-        }
-    }
-
-    /**
-     * Remove all derived PR_WR edges from knownGraphA and all PR_RW edges
-     * from knownGraphB.  Called at the start of each refresh cycle so that
-     * stale derived edges are not accumulated across rounds.
-     */
-    public void clearDerivedPredicateEdges() {
-        clearEdgesOfType(knownGraphA, EdgeType.PR_WR);
-        clearEdgesOfType(knownGraphB, EdgeType.PR_RW);
-    }
-
-    private void clearEdgesOfType(
-            MutableValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> graph,
-            EdgeType type) {
-        var snapshot = new ArrayList<>(graph.edges());
-        for (var ep : snapshot) {
-            var edgeOpt = graph.edgeValue(ep.source(), ep.target());
-            if (edgeOpt.isEmpty()) continue;
-            var edges = edgeOpt.get();
-            edges.removeIf(e -> e.getType() == type);
-            if (edges.isEmpty()) {
-                graph.removeEdge(ep.source(), ep.target());
-            }
         }
     }
 

@@ -1,7 +1,6 @@
 package verifier;
 
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -16,12 +15,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
-import com.google.common.graph.EndpointPair;
-import com.google.common.graph.ValueGraph;
-
 import org.apache.commons.lang3.tuple.Pair;
-import graph.Edge;
-import graph.EdgeType;
 import history.Event;
 import history.History;
 import history.Transaction;
@@ -354,68 +348,4 @@ class Utils {
         return refs.get(0);
     }
 
-    static <KeyType, ValueType> String conflictsToDot(Collection<Transaction<KeyType, ValueType>> transactions,
-            Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>> edges,
-            Collection<SERConstraint<KeyType, ValueType>> constraints) {
-        var builder = new StringBuilder();
-        builder.append("digraph {\n");
-
-        for (var txn : transactions) {
-            builder.append(String.format("\"%s\";\n", txn));
-        }
-
-        for (var e : edges) {
-            var pair = e.getLeft();
-            var keys = e.getRight();
-            var label = new StringBuilder();
-
-            for (var k : keys) {
-                if (k.getType() != EdgeType.SO) {
-                    label.append(String.format("%s %s\\n", k.getType(), k.getKey()));
-                } else {
-                    label.append(String.format("%s\\n", k.getType()));
-                }
-            }
-
-            builder.append(
-                    String.format("\"%s\" -> \"%s\" [label=\"%s\"];\n", pair.source(), pair.target(), label));
-        }
-
-        int colorStep = 0x1000000 / (constraints.size() + 1);
-        int color = 0;
-        for (var c : constraints) {
-            color += colorStep;
-            for (var e : c.getEdges1()) {
-                builder.append(String.format("\"%s\" -> \"%s\" [style=dotted,color=\"#%06x\"];\n", e.getFrom(), e.getTo(), color));
-            }
-
-            for (var e : c.getEdges2()) {
-                builder.append(String.format("\"%s\" -> \"%s\" [style=dashed,color=\"#%06x\"];\n", e.getFrom(), e.getTo(), color));
-            }
-        }
-
-        builder.append("}\n");
-        return builder.toString();
-    }
-
-    static <KeyType, ValueType> String conflictsToLegacy(Collection<Transaction<KeyType, ValueType>> transactions,
-            Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>> edges,
-            Collection<SERConstraint<KeyType, ValueType>> constraints) {
-        var builder = new StringBuilder();
-
-        if (edges.isEmpty() && constraints.isEmpty()) {
-            builder.append("Reject reason: serializability violation; no compact conflict core was extracted.\n");
-            builder.append("The contradiction may be caused by SAT-derived RW or predicate-visibility constraints.\n");
-            return builder.toString();
-        }
-
-        edges.forEach(p -> builder.append(String.format("Edge: %s\n", p)));
-        constraints.forEach(c -> builder.append(String.format("Constraint: %s\n", c)));
-        builder.append(String.format("Related transactions:\n"));
-        transactions.forEach(t -> {
-            builder.append(String.format("sessionid: %d, id: %d\n", t.getSession().getId(), t.getId()));
-        });
-
-        return builder.toString();
-    }
 }

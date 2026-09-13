@@ -32,15 +32,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Acceptance tests for the T1-T8 SER test-suite contract. */
 class SERAcceptanceSuiteTest {
-    private static final int COALESCE_EXTENDED_CASES = 10_000;
     private static final int MODE_EXTENDED_CASES = 100_000;
 
     @AfterEach
     void restoreGlobalDefaults() {
         Pruning.setEnablePruning(true);
-        SERVerifier.setCoalesceConstraints(true);
-        SERVerifier.setDotOutput(false);
-        SERVerifier.setCompareDerivedPredicateEdges(false);
     }
 
     @Nested
@@ -99,37 +95,6 @@ class SERAcceptanceSuiteTest {
         void t2_2_sessionOrderForcesConflictingWwRwBranch() {
             assertEquals(SERVerifier.AuditResult.REJECT,
                     audit(twoWritersReaderHistory(true)));
-        }
-
-        @Test
-        void t2_3_coalescingDoesNotChangeVerdict() {
-            for (int seed = 0; seed < 64; seed++) {
-                var history = randomPointHistory(seed);
-                assertEquals(
-                        audit(history, SERVerifier.PredicateSolvingMode.EAGER,
-                                SERVerifier.PruningMode.REACHABILITY,
-                                SERVerifier.SerPropagationMode.WW_ONLY, true),
-                        audit(history, SERVerifier.PredicateSolvingMode.EAGER,
-                                SERVerifier.PruningMode.REACHABILITY,
-                                SERVerifier.SerPropagationMode.WW_ONLY, false),
-                        "coalesce mismatch at seed=" + seed);
-            }
-        }
-
-        @Test
-        @EnabledIfEnvironmentVariable(named = "SER_ACCEPTANCE_EXTENDED", matches = "true")
-        void t2_3_extendedTenThousandHistoryCoalescingDifferential() {
-            for (int seed = 0; seed < COALESCE_EXTENDED_CASES; seed++) {
-                var history = randomPointHistory(seed);
-                assertEquals(
-                        audit(history, SERVerifier.PredicateSolvingMode.EAGER,
-                                SERVerifier.PruningMode.REACHABILITY,
-                                SERVerifier.SerPropagationMode.WW_ONLY, true),
-                        audit(history, SERVerifier.PredicateSolvingMode.EAGER,
-                                SERVerifier.PruningMode.REACHABILITY,
-                                SERVerifier.SerPropagationMode.WW_ONLY, false),
-                        "coalesce mismatch at seed=" + seed);
-            }
         }
 
         @Test
@@ -256,8 +221,8 @@ class SERAcceptanceSuiteTest {
                     badAndRepairWriterHistory(false));
 
             for (var history : histories) {
-                assertModeParity(history, SERVerifier.PruningMode.REACHABILITY, true);
-                assertModeParity(history, SERVerifier.PruningMode.NONE, false);
+                assertModeParity(history, SERVerifier.PruningMode.REACHABILITY);
+                assertModeParity(history, SERVerifier.PruningMode.NONE);
             }
         }
 
@@ -266,7 +231,7 @@ class SERAcceptanceSuiteTest {
         void t4_extendedOneHundredThousandHistoryModeDifferential() {
             for (int seed = 0; seed < MODE_EXTENDED_CASES; seed++) {
                 assertModeParity(randomPredicateHistory(seed),
-                        SERVerifier.PruningMode.REACHABILITY, (seed & 1) == 0);
+                        SERVerifier.PruningMode.REACHABILITY);
             }
         }
     }
@@ -281,7 +246,6 @@ class SERAcceptanceSuiteTest {
             var oracle = new PrecedenceOracle<Transaction<String, Integer>>(
                     history.getTransactions());
             var reachability = new Pruning<String, Integer>(oracle);
-            var snapshot = new Prun<String, Integer>(oracle);
             var propagation = new GmwrPropagationState<>(history, graph, oracle);
             var bridge = new GmwrWwBridge<String, Integer>(oracle);
             var solver = new SERSolverAR<>(history, graph, List.of(), true, false,
@@ -290,7 +254,6 @@ class SERAcceptanceSuiteTest {
                             SERVerifier.SerPropagationMode.WW_GMWR), oracle);
 
             assertSame(oracle, reachability.precedenceOracle());
-            assertSame(oracle, snapshot.precedenceOracle());
             assertSame(oracle, propagation.precedenceOracle());
             assertSame(oracle, bridge.precedenceOracle());
             assertSame(oracle, solver.precedenceOracle());
@@ -371,24 +334,23 @@ class SERAcceptanceSuiteTest {
             for (var history : histories) {
                 var expected = audit(history, SERVerifier.PredicateSolvingMode.EAGER,
                         SERVerifier.PruningMode.NONE,
-                        SERVerifier.SerPropagationMode.WW_ONLY, true);
+                        SERVerifier.SerPropagationMode.WW_ONLY);
                 for (var pruning : List.of(
                         SERVerifier.PruningMode.NONE,
                         SERVerifier.PruningMode.REACHABILITY)) {
                     assertEquals(expected,
                             audit(history, SERVerifier.PredicateSolvingMode.EAGER,
-                                    pruning, SERVerifier.SerPropagationMode.WW_ONLY, true),
+                                    pruning, SERVerifier.SerPropagationMode.WW_ONLY),
                             "EAGER pruning mismatch: " + pruning);
                     assertEquals(expected,
                             audit(history, SERVerifier.PredicateSolvingMode.GMWR,
-                                    pruning, SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY,
-                                    true),
+                                    pruning, SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY),
                             "GMWR pruning mismatch: " + pruning);
                 }
                 assertEquals(expected,
                         audit(history, SERVerifier.PredicateSolvingMode.GMWR,
                                 SERVerifier.PruningMode.REACHABILITY,
-                                SERVerifier.SerPropagationMode.WW_GMWR, true),
+                                SERVerifier.SerPropagationMode.WW_GMWR),
                         "WWBridge mismatch");
             }
         }
@@ -423,14 +385,14 @@ class SERAcceptanceSuiteTest {
             audit(badAndRepairWriterHistory(true),
                     SERVerifier.PredicateSolvingMode.EAGER,
                     SERVerifier.PruningMode.REACHABILITY,
-                    SERVerifier.SerPropagationMode.WW_ONLY, true, true);
+                    SERVerifier.SerPropagationMode.WW_ONLY, true);
             var eagerTags = countTags(profiler);
 
             profiler.clear();
             audit(badAndRepairWriterHistory(true),
                     SERVerifier.PredicateSolvingMode.GMWR,
                     SERVerifier.PruningMode.REACHABILITY,
-                    SERVerifier.SerPropagationMode.WW_GMWR, true, true);
+                    SERVerifier.SerPropagationMode.WW_GMWR, true);
             var gmwrTags = countTags(profiler);
 
             assertTrue(eagerTags.contains("WW_INITIAL_CHOICES"));
@@ -634,28 +596,35 @@ class SERAcceptanceSuiteTest {
         assertEquals(expected,
                 audit(history, SERVerifier.PredicateSolvingMode.EAGER,
                         SERVerifier.PruningMode.REACHABILITY,
-                        SERVerifier.SerPropagationMode.WW_ONLY, true));
+                        SERVerifier.SerPropagationMode.WW_ONLY));
         assertEquals(expected,
                 audit(history, SERVerifier.PredicateSolvingMode.GMWR,
                         SERVerifier.PruningMode.REACHABILITY,
-                        SERVerifier.SerPropagationMode.WW_GMWR, true));
+                        SERVerifier.SerPropagationMode.WW_GMWR));
     }
 
     private static void assertModeParity(
             History<String, Integer> history,
-            SERVerifier.PruningMode pruning,
-            boolean coalescing) {
+            SERVerifier.PruningMode pruning) {
         var eager = audit(history, SERVerifier.PredicateSolvingMode.EAGER,
-                pruning, SERVerifier.SerPropagationMode.WW_ONLY, coalescing);
+                pruning, SERVerifier.SerPropagationMode.WW_ONLY);
         var gmwr = audit(history, SERVerifier.PredicateSolvingMode.GMWR,
-                pruning, SERVerifier.SerPropagationMode.WW_GMWR, coalescing);
+                pruning, SERVerifier.SerPropagationMode.WW_GMWR);
         assertEquals(eager, gmwr);
     }
 
     private static SERVerifier.AuditResult audit(History<String, Integer> history) {
         return audit(history, SERVerifier.PredicateSolvingMode.EAGER,
                 SERVerifier.PruningMode.REACHABILITY,
-                SERVerifier.SerPropagationMode.WW_ONLY, true);
+                SERVerifier.SerPropagationMode.WW_ONLY);
+    }
+
+    private static SERVerifier.AuditResult audit(
+            History<String, Integer> history,
+            SERVerifier.PredicateSolvingMode predicate,
+            SERVerifier.PruningMode pruning,
+            SERVerifier.SerPropagationMode propagation) {
+        return audit(history, predicate, pruning, propagation, false);
     }
 
     private static SERVerifier.AuditResult audit(
@@ -663,20 +632,7 @@ class SERAcceptanceSuiteTest {
             SERVerifier.PredicateSolvingMode predicate,
             SERVerifier.PruningMode pruning,
             SERVerifier.SerPropagationMode propagation,
-            boolean coalescing) {
-        return audit(history, predicate, pruning, propagation, coalescing, false);
-    }
-
-    private static SERVerifier.AuditResult audit(
-            History<String, Integer> history,
-            SERVerifier.PredicateSolvingMode predicate,
-            SERVerifier.PruningMode pruning,
-            SERVerifier.SerPropagationMode propagation,
-            boolean coalescing,
             boolean detailedMetrics) {
-        SERVerifier.setCoalesceConstraints(coalescing);
-        SERVerifier.setDotOutput(false);
-        SERVerifier.setCompareDerivedPredicateEdges(false);
         var solverSettings = settings(predicate, pruning, propagation);
         return new SERVerifier<String, Integer>(
                 () -> history, solverSettings, detailedMetrics).audit();
