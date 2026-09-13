@@ -1,1 +1,7 @@
 /predicateHistories/kvpredicate/test/
+/predicateHistories
+/SER/ser-result-detector/results
+/History_Generator
+PolySIHistories
+SER/ser-result-detector/tools/__pycache__/
+PolySIHistories/kvpredicate/kvpredicate_repeatable_read_write_skew1_20260706/hist-00000/raw_kvpredicate_trace.jsonl
