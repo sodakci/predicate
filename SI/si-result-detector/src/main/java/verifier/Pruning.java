@@ -1,57 +1,39 @@
 package verifier;
 
 import graph.KnownGraph;
-import history.History;
-import history.Transaction;
 import util.Profiler;
 import graph.Edge;
 import graph.EdgeType;
-import com.google.common.graph.EndpointPair;
 
 import java.util.*;
 
 import org.apache.commons.lang3.tuple.Pair;
 
-import lombok.Getter;
-import lombok.Setter;
-
 public class Pruning {
-    @Getter
-    @Setter
-    private static boolean enablePruning = true;
+    private static final double STOP_THRESHOLD = 0.01;
 
-    @Getter
-    @Setter
-    private static double stopThreshold = 0.01;
-
-    private static Pair<?, ?> lastConflicts = emptyConflicts();
-
-    static <KeyType, ValueType> boolean pruneConstraints(KnownGraph<KeyType, ValueType> knownGraph,
-            Collection<SIConstraint<KeyType, ValueType>> constraints, History<KeyType, ValueType> history) {
-        if (!enablePruning) {
-            return false;
-        }
-
-        lastConflicts = emptyConflicts();
+    static <KeyType, ValueType> Optional<SIConstraint<KeyType, ValueType>> pruneConstraints(
+            KnownGraph<KeyType, ValueType> knownGraph,
+            Collection<SIConstraint<KeyType, ValueType>> constraints) {
         if (constraints.isEmpty()) {
-            return false;
+            return Optional.empty();
         }
 
         var profiler = Profiler.getInstance();
         profiler.startTick("SI_PRUNE");
 
-        int rounds = 1, solvedConstraints = 0, totalConstraints = constraints.size();
-        boolean hasCycle = false;
-        while (!hasCycle) {
+        int rounds = 1, solvedConstraints = 0;
+        SIConstraint<KeyType, ValueType> conflict = null;
+        while (conflict == null) {
             System.err.printf("Pruning round %d\n", rounds);
             var result = pruneConstraintsWithPostChecking(knownGraph, constraints);
 
-            hasCycle = result.getRight();
+            conflict = result.getRight();
             solvedConstraints += result.getLeft();
 
             int remainingConstraints = constraints.size();
             if (remainingConstraints == 0
-                    || result.getLeft() <= stopThreshold * Math.max(1, remainingConstraints)) {
+                    || result.getLeft() <= STOP_THRESHOLD * Math.max(1, remainingConstraints)) {
                 break;
             }
             rounds++;
@@ -61,10 +43,11 @@ public class Pruning {
         System.err.printf("Pruned %d rounds, solved %d constraints\n" + "After prune: graphA: %d, graphB: %d\n", rounds,
                 solvedConstraints, knownGraph.getKnownGraphA().edges().size(),
                 knownGraph.getKnownGraphB().edges().size());
-        return hasCycle;
+        return Optional.ofNullable(conflict);
     }
 
-    private static <KeyType, ValueType> Pair<Integer, Boolean> pruneConstraintsWithPostChecking(
+    private static <KeyType, ValueType> Pair<Integer, SIConstraint<KeyType, ValueType>>
+            pruneConstraintsWithPostChecking(
             KnownGraph<KeyType, ValueType> knownGraph,
             Collection<SIConstraint<KeyType, ValueType>> constraints) {
         var profiler = Profiler.getInstance();
@@ -86,10 +69,9 @@ public class Pruning {
             checked++;
 
             if (!okEither && !okOr) {
-                lastConflicts = Pair.of(Collections.emptyList(), List.of(c));
                 progress.refresh(checked, solvedConstraints.size(), true);
                 profiler.endTick("SI_PRUNE_POST_CHECK");
-                return Pair.of(0, true);
+                return Pair.of(0, c);
             }
 
             if (!okEither) {
@@ -109,7 +91,7 @@ public class Pruning {
         // constraints.removeAll(solvedConstraints);
         // java removeAll has performance bugs; do it manually
         solvedConstraints.forEach(constraints::remove);
-        return Pair.of(solvedConstraints.size(), false);
+        return Pair.of(solvedConstraints.size(), null);
     }
 
     private static final class PostCheckProgress {
@@ -165,92 +147,6 @@ public class Pruning {
                 throw new Error("only WW, RW and PR_RW edges should appear in constraints");
             }
         }
-    }
-
-    private static Pair<?, ?> emptyConflicts() {
-        return Pair.of(Collections.emptyList(), Collections.emptyList());
-    }
-
-    @SuppressWarnings("unchecked")
-    static <KeyType, ValueType> Pair<Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>,
-            Collection<SIConstraint<KeyType, ValueType>>> getLastConflicts() {
-        return (Pair<Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>,
-                Collection<SIConstraint<KeyType, ValueType>>>) lastConflicts;
-    }
-
-    private static <KeyType, ValueType> Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>
-    extractCycleEdges(KnownGraph<KeyType, ValueType> graph) {
-        var adjacency = new HashMap<Transaction<KeyType, ValueType>, Set<Transaction<KeyType, ValueType>>>();
-        addAdjacency(graph.getKnownGraphA(), adjacency);
-        addAdjacency(graph.getKnownGraphB(), adjacency);
-
-        var color = new HashMap<Transaction<KeyType, ValueType>, Integer>();
-        var stack = new ArrayList<Transaction<KeyType, ValueType>>();
-        var stackIndex = new HashMap<Transaction<KeyType, ValueType>, Integer>();
-        for (var txn : graph.getKnownGraphA().nodes()) {
-            if (color.getOrDefault(txn, 0) != 0) {
-                continue;
-            }
-            var cycle = dfsCycle(txn, graph, adjacency, color, stack, stackIndex);
-            if (!cycle.isEmpty()) {
-                return cycle;
-            }
-        }
-        return Collections.emptyList();
-    }
-
-    private static <KeyType, ValueType> void addAdjacency(
-            com.google.common.graph.ValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> known,
-            Map<Transaction<KeyType, ValueType>, Set<Transaction<KeyType, ValueType>>> adjacency) {
-        for (var ep : known.edges()) {
-            adjacency.computeIfAbsent(ep.source(), ignored -> new LinkedHashSet<>()).add(ep.target());
-        }
-    }
-
-    private static <KeyType, ValueType> Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>
-    dfsCycle(Transaction<KeyType, ValueType> node,
-             KnownGraph<KeyType, ValueType> graph,
-             Map<Transaction<KeyType, ValueType>, Set<Transaction<KeyType, ValueType>>> adjacency,
-             Map<Transaction<KeyType, ValueType>, Integer> color,
-             List<Transaction<KeyType, ValueType>> stack,
-             Map<Transaction<KeyType, ValueType>, Integer> stackIndex) {
-        color.put(node, 1);
-        stackIndex.put(node, stack.size());
-        stack.add(node);
-
-        for (var succ : adjacency.getOrDefault(node, Collections.emptySet())) {
-            int succColor = color.getOrDefault(succ, 0);
-            if (succColor == 0) {
-                var cycle = dfsCycle(succ, graph, adjacency, color, stack, stackIndex);
-                if (!cycle.isEmpty()) {
-                    return cycle;
-                }
-            } else if (succColor == 1) {
-                var cycleNodes = new ArrayList<>(stack.subList(stackIndex.get(succ), stack.size()));
-                cycleNodes.add(succ);
-                return cycleEdgesFromNodes(graph, cycleNodes);
-            }
-        }
-
-        stack.remove(stack.size() - 1);
-        stackIndex.remove(node);
-        color.put(node, 2);
-        return Collections.emptyList();
-    }
-
-    private static <KeyType, ValueType> Collection<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>
-    cycleEdgesFromNodes(KnownGraph<KeyType, ValueType> graph,
-                        List<Transaction<KeyType, ValueType>> cycleNodes) {
-        var result = new ArrayList<Pair<EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>();
-        for (int i = 0; i + 1 < cycleNodes.size(); i++) {
-            var from = cycleNodes.get(i);
-            var to = cycleNodes.get(i + 1);
-            var edges = new ArrayList<Edge<KeyType>>();
-            edges.addAll(graph.getKnownGraphA().edgeValue(from, to).orElse(List.of()));
-            edges.addAll(graph.getKnownGraphB().edgeValue(from, to).orElse(List.of()));
-            result.add(Pair.of(EndpointPair.ordered(from, to), edges));
-        }
-        return result;
     }
 
 }

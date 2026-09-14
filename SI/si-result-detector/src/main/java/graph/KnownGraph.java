@@ -365,31 +365,6 @@ public class KnownGraph<KeyType, ValueType> {
         }
     }
 
-    /**
-     * Remove all derived PR_WR edges from knownGraphA and all PR_RW edges
-     * from knownGraphB.  Called at the start of each refresh cycle so that
-     * stale derived edges are not accumulated across rounds.
-     */
-    public void clearDerivedPredicateEdges() {
-        clearEdgesOfType(knownGraphA, EdgeType.PR_WR);
-        clearEdgesOfType(knownGraphB, EdgeType.PR_RW);
-    }
-
-    private void clearEdgesOfType(
-            MutableValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> graph,
-            EdgeType type) {
-        var snapshot = new ArrayList<>(graph.edges());
-        for (var ep : snapshot) {
-            var edgeOpt = graph.edgeValue(ep.source(), ep.target());
-            if (edgeOpt.isEmpty()) continue;
-            var edges = edgeOpt.get();
-            edges.removeIf(e -> e.getType() == type);
-            if (edges.isEmpty()) {
-                graph.removeEdge(ep.source(), ep.target());
-            }
-        }
-    }
-
     private void addEdge(
             MutableValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> graph,
             Transaction<KeyType, ValueType> u,

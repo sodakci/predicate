@@ -127,7 +127,7 @@ txn     = -1
 | row-local EAGER | 已对齐 | 求解前逐 key 编码 |
 | general query refinement | 已对齐 | 预编码 guarded `PR_*`，模型不匹配时加 no-good |
 | predicate source constraint 统计 | 已对齐 | 每个 external `(read,key)` 计数 |
-| `NONE/REACHABILITY/SNAPSHOT/PRUN` | 已对齐 | 模式入口一致，内部 oracle 使用各自图语义 |
+| `NONE/REACHABILITY` | 已对齐 | 正式基线保留 SI-specific induced-graph oracle；NONE 只用于消融 |
 | bottom 过滤 | 已对齐 | 不进入最终真实事务图 |
 | UNSAT constraint 缩减 | 已对齐 | 递归求解禁用冲突提取，外层贪心缩减 WW choices |
 | GMWR | 暂未同步 | SI 当前只有 EAGER，按要求不扩展 |
@@ -165,11 +165,11 @@ KnownGraph
 generateConstraintsSI
   - same-key WW binary choices
   - branch-associated ordinary RW implications
-  - optional transaction-pair coalescing
+  - transaction-pair coalescing
   |
   v
-pruning mode
-  - NONE / REACHABILITY / SNAPSHOT / PRUN
+WW pruning from audit settings
+  - NONE / REACHABILITY
   | inconsistent
   +------------------------------------> REJECT
   |
@@ -378,34 +378,29 @@ Treader --RW(x)--> Twriter
 
 生成的 `SIConstraint` 因此可以同时包含 WW 和 RW。两处消费者行为不同：
 
-- `REACHABILITY/PRUN` 试加一个分支时使用该分支的全部 WW/RW typed edges。
+- `REACHABILITY` 试加一个分支时使用该分支的全部 WW/RW typed edges。
 - 最终 `SISolverInduced` 的 WW 阶段只读取 WW；随后 RW 阶段从 `readFrom + wwOrder` 重新生成相同的 guarded RW。
 
 这样最终公式中的 RW 来源统一，不依赖 constraint 中重复保存的派生边。
 
 ### 8.2 Coalescing
 
-默认把同一 writer 事务对上的多个 key/读依赖合并到一个 `SIConstraint`，共享一个方向 literal。`--no-coalescing` 使用未合并结构，主要用于约束规模对比。
+主路径固定把同一 writer 事务对上的多个 key/读依赖合并到一个 `SIConstraint`，共享一个方向 literal；旧的非合并 WW 生成器和开关已删除。
 
 coalescing 合并的是 choice 组织结构，不会把 A/B 类型抹掉。
 
-## 9. 四种剪枝模式
+## 9. WW 剪枝
 
-CLI 通过：
+一个 audit 的 `SolverSettings.pruningMode` 只允许：
 
 ```text
---pruning-mode NONE|REACHABILITY|SNAPSHOT|PRUN
+NONE
+REACHABILITY
 ```
 
-选择模式，默认 `REACHABILITY`。`--no-pruning` 强制覆盖为 `NONE`。
-
-### 9.1 NONE
-
-不提前固定任何 WW choice，直接进入最终 solver。
-
-### 9.2 REACHABILITY
-
-实现位于 `Pruning.java`。对每个 constraint 的两侧分别调用 `InducedGraph.canAddAll`：
+`NONE` 是必要消融，直接把全部 WW choices 交给 MonoSAT。
+`REACHABILITY` 是正式基线，实现在 `Pruning.java`。它对 constraint
+两侧分别调用同一个 `SIVerifier.InducedGraph.Oracle`：
 
 ```text
 两侧都成环     -> pruning REJECT
@@ -413,40 +408,14 @@ CLI 通过：
 两侧都不成环   -> 保留给 MonoSAT
 ```
 
-`canAddAll` 复制当前 KnownGraph，加入该侧全部 typed edges，再计算：
+oracle 保持 SI 的 A/B 分区，并精确检查 `A ∪ (A ∘ B)`；它不是 SER 的
+普通有向图 reachability。旧 `SNAPSHOT/PRUN` 分派、shared-snapshot
+implementation 与 `Prun.java` 已删除。
 
-```text
-A ∪ (A ∘ B)
-```
-
-它按轮执行，直到本轮固定数量低于阈值或 constraints 为空。
-
-### 9.3 SNAPSHOT
-
-实现位于 `Prun.java`。它根据点读和 recorded predicate source 建立固定 observation，维护 A 的增量传递闭包，传播同一 reader 的共享快照下界，并固定能够推出的 writer 顺序。
-
-关键约束：
-
-- snapshot visibility 只使用 A reachability。
-- 推出的 WW/PR_WR 等 A 边才进入 A closure。
-- 推出的 RW 是 B 边，只写入 B，绝不折叠进 A closure。
-- SNAPSHOT 不执行逐 constraint 的 induced branch 双侧试加。
-
-### 9.4 PRUN
-
-PRUN 在 SNAPSHOT 传播基础上，额外执行 SI induced-graph branch pruning。每轮先检查当前 `A ∪ (A ∘ B)`，再尝试固定只有一侧可行的 constraint，之后继续共享快照传播，直到固定点。
-
-### 9.5 剪枝与最终 verdict
-
-未在剪枝阶段判定 inconsistent 的历史最终都进入同一个 `SISolverInduced`。剪枝只提前物化必然方向、减少剩余 choices；B 始终保持 B 语义，最终公式始终检查同一个 InducedSI。
-
-`constraint-stat` 只运行内部一致性、约束生成和所选剪枝，不启动最终 MonoSAT，用于比较：
-
-```text
-constraints_before / constraints_after
-implications_before / implications_after
-pruning_inconsistent
-```
+剪枝前后的 constraint/implication 数直接记录为
+`WW_INITIAL_CONSTRAINTS`、`WW_AFTER_BASELINE`、
+`WW_INITIAL_IMPLICATIONS`、`WW_AFTER_BASELINE_IMPLICATIONS`，由
+`audit --solver-stats` 输出，不再维护 constraint-only 执行路径。
 
 ## 10. 求解核心：分阶段 MonoSAT 编码
 
@@ -817,54 +786,42 @@ else:
 
 ## 14. CLI
 
-`Main` 提供四个子命令：
+`Main` 只提供：
 
 ```text
-audit
-constraint-stat
-stat
-dump
+audit HISTORY
 ```
 
-### 14.1 audit
-
-```bash
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
-  audit --pruning-mode PRUN /path/to/hist-00000
-```
-
-主要参数：
+公开参数：
 
 ```text
---pruning-mode NONE|REACHABILITY|SNAPSHOT|PRUN
---no-pruning
---no-coalescing
---dot-output
---compare-derived-predicate-edges
---solver monosat
+--solver-timeout-seconds
 --solver-stats
 ```
 
-`--compare-derived-predicate-edges` 创建独立诊断图，只比较旧式物化 `PR_WR/PR_RW` 数量；生产 verdict 不读取该图。
+隐藏实验参数：
 
-`--solver-timeout-seconds` 当前被 CLI 解析，但尚未传入 MonoSAT 后端，不能把它视为已生效的超时机制。
+```text
+--ww-pruning NONE|REACHABILITY
+--[no-]predicate-witness-coalescing
+--[no-]graph-edge-interning
+```
 
-### 14.2 constraint-stat
+输入固定为 PRHIST，backend 固定为 MonoSAT。当前谓词实现固定为
+EAGER/general refinement；`--predicate-encoding EAGER|GMWR` 要等 SI
+GMWR 真正接入后再公开，迁移期间不提前暴露或默认选择 GMWR。旧参数不作为
+别名保留。
 
 ```bash
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
-  constraint-stat --pruning-mode SNAPSHOT /path/to/hist-00000
+  audit --solver-stats /path/to/hist-00000
 ```
-
-该命令要求显式提供 `--pruning-mode`。
-
 ## 15. 关键文件
 
 ```text
 src/main/java/Main.java
-    CLI、pruning mode 和 constraint-stat。
+    单一 audit CLI 与本次运行的 SolverSettings。
 
 src/main/java/history/loaders/PredicateHistoryLoader.java
     PRHIST loader。
@@ -887,9 +844,6 @@ src/main/java/verifier/SISolverInduced.java
 src/main/java/verifier/Pruning.java
     REACHABILITY 模式。
 
-src/main/java/verifier/Prun.java
-    SNAPSHOT/PRUN 固定点传播。
-
 src/main/java/verifier/SIConstraint.java
 src/main/java/verifier/SIEdge.java
     WW choice 与 typed edge 数据结构。
@@ -904,28 +858,19 @@ src/main/java/verifier/SIEdge.java
 - known `PR_WR/PR_RW` 实际进入 verdict 图。
 - row-local 与 relational JOIN/投影/重复行/`DISTINCT`。
 - 六阶段编码 profiler。
-- SNAPSHOT/PRUN 的 A-only closure 与 B 路由。
+- REACHABILITY 的 SI induced-graph branch oracle。
 - predicate source constraint 计数和冲突缩减。
-- CLI 四种 pruning modes 与 `constraint-stat`。
+- 单一 audit CLI、两种 WW pruning modes 和隐藏消融参数。
 - 160 组固定随机种子的三事务 A/B 图差分测试。
 
-差分测试对每个 case 穷举 WW 两个方向，独立计算 `A ∪ (A ∘ B)` 的传递闭包和环，再分别对比 NONE、REACHABILITY、SNAPSHOT、PRUN 与最终 solver verdict。
-
-当前全量结果为：
-
-```text
-144 tests
-0 failures
-0 errors
-2 skipped
-```
+差分测试对每个 case 穷举 WW 两个方向，独立计算 `A ∪ (A ∘ B)` 的传递闭包和环，再分别对比 NONE、REACHABILITY 与最终 solver verdict。
 
 ## 17. 当前边界
 
 - 按要求尚未为 SI 引入 GMWR；当前 predicate solving 为 EAGER/general refinement。
 - general 路径在全部 scope key 都为 INTERNAL 时不创建 `PredicateCheck`：非 row-local 查询没有第二次完整 QueryPlan snapshot check，row-local EAGER 校验失败后的 fallback 也会跳过该检查。
-- REACHABILITY 对每个分支复制 KnownGraph 并重算 MatrixGraph；SNAPSHOT/PRUN 已维护增量 A closure，但 induced branch oracle 仍使用 SI 图试加。
-- `--solver-timeout-seconds` 尚未连接到后端。
+- REACHABILITY 的 BitSet oracle 每个分支复制 `directA/directB` rows 并重算 SI induced graph；不会退化为 SER 普通有向图剪枝。
+- `--solver-timeout-seconds` 已连接到 solve/refinement 的 backend deadline。
 - 只支持结构化 QueryPlan，不接受任意 SQL 文本。
 - 紧凑 PRHIST 要求 `(key,value)` source 唯一。
 - `tools/` 当前只有 `audit-prhist.sh` 和 `run_catalog_experiment.py`，没有 SI 版 `validate_prhist_suite.py`。
@@ -938,6 +883,6 @@ src/main/java/verifier/SIEdge.java
 3. `PredicateHistoryLoader.java`：输入到 History。
 4. `KnownGraph.java`：A/B、readFrom、predicate observations。
 5. `SIVerifier.java`：约束生成、剪枝分派和诊断。
-6. `Pruning.java` 与 `Prun.java`：四种模式的差异。
+6. `Pruning.java`：NONE/REACHABILITY 的调用边界与正式基线。
 7. `SISolverInduced.java`：分阶段编码、predicate frontier、induced graph。
-8. `SISolverInducedStageTest`、`PrunTest`、`SISolverInducedParityTest`、`SISolverInducedDifferentialTest`：用回归测试核对实际语义。
+8. `SISolverInducedStageTest`、`SISolverInducedParityTest`、`SISolverInducedDifferentialTest`：用回归测试核对实际语义。

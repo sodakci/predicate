@@ -32,6 +32,12 @@ class SISolverInduced<KeyType, ValueType> {
     private static final int COMPACT_MATCH_TRUE = 2;
     private static final int MAX_GENERAL_ROW_CONTRIBUTIONS = 32_768;
 
+    private enum PredicateEncodeStatus {
+        ENCODED,
+        UNSUPPORTED,
+        INVALID
+    }
+
     private final History<KeyType, ValueType> history;
     private final KnownGraph<KeyType, ValueType> graph;
     private final Collection<SIConstraint<KeyType, ValueType>> constraints;
@@ -42,6 +48,8 @@ class SISolverInduced<KeyType, ValueType> {
     private final Solver solver;
     private final Graph depGraph;
     private final Graph inducedGraph;
+    private final LatestVisibleChecker<KeyType, ValueType> latestVisibleChecker =
+            new LatestVisibleChecker<>();
     private long solveDeadlineNanos;
     private boolean solverTimedOut;
     private final Map<Transaction<KeyType, ValueType>, Integer> depNodes = new HashMap<>();
@@ -406,8 +414,14 @@ class SISolverInduced<KeyType, ValueType> {
             if (predicate instanceof QueryPlan
                     && ((QueryPlan<?, ?>) predicate).isRowLocal()) {
                 predicateEncodingMetrics.rowLocalAttempts++;
-                if (encodeRowLocalPredicateEager(
-                        observation, scopedEntries, resultSourcesByKey)) {
+                var status = encodeRowLocalPredicateEager(
+                        observation, scopedEntries, resultSourcesByKey);
+                if (status == PredicateEncodeStatus.INVALID) {
+                    solver.assertTrue(Lit.False);
+                    predicateEncodingMetrics.rowLocalEncoded++;
+                    continue;
+                }
+                if (status == PredicateEncodeStatus.ENCODED) {
                     predicateEncodingMetrics.rowLocalEncoded++;
                     continue;
                 }
@@ -424,6 +438,23 @@ class SISolverInduced<KeyType, ValueType> {
                     System.nanoTime() - started;
             predicateEncodingMetrics.generalExternalKeys += frontierEntries.size();
             if (frontierEntries.isEmpty()) {
+                var snapshot = new LinkedHashMap<KeyType, ValueType>();
+                for (var entry : scopedEntries) {
+                    var latestSelf = latestSelfBefore(
+                            entry.getValue(), observation.getTxn(),
+                            observation.getEventIndex());
+                    if (latestSelf == null) {
+                        latestSelf = resultSourcesByKey.get(entry.getKey());
+                    }
+                    if (latestSelf != null) {
+                        snapshot.put(entry.getKey(),
+                                latestSelf.getEvent().getValue());
+                    }
+                }
+                if (!predicateSnapshotMatches(predicateRead, snapshot,
+                        relationResolverFor(predicateRead))) {
+                    solver.assertTrue(Lit.False);
+                }
                 continue;
             }
 
@@ -515,7 +546,7 @@ class SISolverInduced<KeyType, ValueType> {
     }
 
     /** Eagerly materializes every row-local reader-key constraint before solve(). */
-    private boolean encodeRowLocalPredicateEager(
+    private PredicateEncodeStatus encodeRowLocalPredicateEager(
             KnownGraph.PredicateObservation<KeyType, ValueType> observation,
             List<Map.Entry<KeyType, List<KnownGraph.WriteRef<KeyType, ValueType>>>> scopedEntries,
             Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
@@ -527,7 +558,7 @@ class SISolverInduced<KeyType, ValueType> {
         predicateEncodingMetrics.snapshotValidationNanos +=
                 System.nanoTime() - started;
         if (!snapshotValid) {
-            return false;
+            return PredicateEncodeStatus.INVALID;
         }
 
         started = System.nanoTime();
@@ -574,30 +605,14 @@ class SISolverInduced<KeyType, ValueType> {
                 continue;
             }
 
-            var badWriteSet = Collections.newSetFromMap(
-                    new IdentityHashMap<KnownGraph.WriteRef<KeyType, ValueType>, Boolean>());
-            badWriteSet.addAll(badWrites);
             for (var badWrite : badWrites) {
                 var badCandidate = candidateFor(frontier, badWrite);
                 if (badCandidate == null) {
                     continue;
                 }
-                var blockingClause = new ArrayList<Lit>();
-                blockingClause.add(Logic.not(badCandidate.visible));
-                for (var goodCandidate : frontier.candidates) {
-                    if (badWriteSet.contains(goodCandidate.write)) {
-                        continue;
-                    }
-                    var laterVisible = and(goodCandidate.visible,
-                            beforeWrite(badWrite, goodCandidate.write));
-                    if (laterVisible != Lit.False && !laterVisible.isConstFalse()) {
-                        blockingClause.add(laterVisible);
-                    }
-                }
                 predicateEncodingMetrics.blockingClauses++;
-                predicateEncodingMetrics.blockingClauseLiterals +=
-                        Math.max(1, blockingClause.size());
-                solver.assertOr(blockingClause);
+                predicateEncodingMetrics.blockingClauseLiterals++;
+                solver.assertTrue(Logic.not(badCandidate.latest));
             }
         }
 
@@ -609,7 +624,7 @@ class SISolverInduced<KeyType, ValueType> {
         }
         predicateEncodingMetrics.rowLocalKeyScanNanos +=
                 System.nanoTime() - started;
-        return true;
+        return PredicateEncodeStatus.ENCODED;
     }
 
     private boolean rowLocalSnapshotValid(
@@ -735,14 +750,32 @@ class SISolverInduced<KeyType, ValueType> {
             }
             predicateEncodingMetrics.frontierCandidates++;
             return new KeyFrontier<>(key, observation.getTxn(),
-                    List.of(new FrontierCandidate<>(latestSelf, Lit.True)),
+                    List.of(new FrontierCandidate<>(latestSelf, Lit.True, Lit.True)),
                     latestSelf);
         }
 
         var externalWrites = latestExternalWrites(writes, observation.getTxn());
-        var candidates = externalWrites.stream()
-                .map(write -> new FrontierCandidate<>(write,
-                        visibleToPredicateRead(write, observation)))
+        var candidates = latestVisibleChecker.check(
+                        observation.getTxn(), key, externalWrites,
+                        new LatestVisibleChecker.SnapshotOrder<KeyType, ValueType>() {
+                            @Override
+                            public Lit visibleToReader(
+                                    KeyType candidateKey,
+                                    KnownGraph.WriteRef<KeyType, ValueType> writer,
+                                    Transaction<KeyType, ValueType> reader) {
+                                return visibleToPredicateRead(writer, observation);
+                            }
+
+                            @Override
+                            public Lit beforeWriter(
+                                    KeyType candidateKey,
+                                    KnownGraph.WriteRef<KeyType, ValueType> left,
+                                    KnownGraph.WriteRef<KeyType, ValueType> right) {
+                                return beforeWrite(left, right);
+                            }
+                        }).stream()
+                .map(validity -> new FrontierCandidate<>(
+                        validity.writer, validity.visible, validity.latest))
                 .filter(candidate -> candidate.visible != Lit.False)
                 .collect(Collectors.toList());
         predicateEncodingMetrics.frontierCandidates += candidates.size();
@@ -771,7 +804,7 @@ class SISolverInduced<KeyType, ValueType> {
             List<KnownGraph.WriteRef<KeyType, ValueType>> externalWrites,
             Event<KeyType, ValueType> predicateRead) {
         for (var source : frontier.candidates) {
-            var selectedGuard = selectionGuard(frontier, source);
+            var selectedGuard = source.latest;
             if (!isBottomTxn(source.write.getTxn())) {
                 addDependencyEdge(new SIEdge<>(
                         source.write.getTxn(), frontier.reader,
@@ -797,6 +830,7 @@ class SISolverInduced<KeyType, ValueType> {
             FrontierCandidate<KeyType, ValueType> source,
             List<KnownGraph.WriteRef<KeyType, ValueType>> externalWrites,
             Event<KeyType, ValueType> predicateRead) {
+        solver.assertTrue(source.latest);
         if (!isBottomTxn(source.write.getTxn())
                 && !source.write.getTxn().equals(frontier.reader)) {
             addDependencyEdge(new SIEdge<>(
@@ -1010,31 +1044,6 @@ class SISolverInduced<KeyType, ValueType> {
         return refined;
     }
 
-    private Lit selectionGuard(
-            KeyFrontier<KeyType, ValueType> frontier,
-            FrontierCandidate<KeyType, ValueType> selected) {
-        if (frontier.fixedWrite != null) {
-            return Lit.True;
-        }
-        var terms = new ArrayList<Lit>();
-        if (selected == null) {
-            for (var candidate : frontier.candidates) {
-                terms.add(Logic.not(candidate.visible));
-            }
-            return and(terms);
-        }
-
-        terms.add(selected.visible);
-        for (var other : frontier.candidates) {
-            if (other == selected) {
-                continue;
-            }
-            terms.add(Logic.not(and(other.visible,
-                    beforeWrite(selected.write, other.write))));
-        }
-        return and(terms);
-    }
-
     private FrontierCandidate<KeyType, ValueType> selectedCandidate(
             KeyFrontier<KeyType, ValueType> frontier) {
         if (frontier.fixedWrite != null) {
@@ -1042,13 +1051,9 @@ class SISolverInduced<KeyType, ValueType> {
         }
         FrontierCandidate<KeyType, ValueType> selected = null;
         for (var candidate : frontier.candidates) {
-            if (!modelValue(candidate.visible)) {
-                continue;
-            }
-            if (selected == null
-                    || modelValue(beforeWrite(
-                            selected.write, candidate.write))) {
+            if (modelValue(candidate.latest)) {
                 selected = candidate;
+                break;
             }
         }
         return selected;
@@ -1081,17 +1086,7 @@ class SISolverInduced<KeyType, ValueType> {
             return;
         }
 
-        blockingClause.add(Logic.not(selected.visible));
-        for (var other : frontier.candidates) {
-            if (other == selected) {
-                continue;
-            }
-            var laterVisible = and(other.visible,
-                    beforeWrite(selected.write, other.write));
-            if (laterVisible != Lit.False && !laterVisible.isConstFalse()) {
-                blockingClause.add(laterVisible);
-            }
-        }
+        blockingClause.add(Logic.not(selected.latest));
     }
 
     private static boolean modelValue(Lit literal) {
@@ -1721,11 +1716,15 @@ class SISolverInduced<KeyType, ValueType> {
     private static final class FrontierCandidate<KeyType, ValueType> {
         private final KnownGraph.WriteRef<KeyType, ValueType> write;
         private final Lit visible;
+        private final Lit latest;
 
         private FrontierCandidate(
-                KnownGraph.WriteRef<KeyType, ValueType> write, Lit visible) {
+                KnownGraph.WriteRef<KeyType, ValueType> write,
+                Lit visible,
+                Lit latest) {
             this.write = write;
             this.visible = visible;
+            this.latest = latest;
         }
     }
 

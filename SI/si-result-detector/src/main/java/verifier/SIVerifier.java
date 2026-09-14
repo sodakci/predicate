@@ -16,13 +16,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.*;
 import java.util.stream.Collectors;
 
-import lombok.Getter;
-import lombok.Setter;
 import com.google.common.graph.GraphBuilder;
 import com.google.common.graph.MutableGraph;
 import com.google.common.graph.ValueGraph;
 import org.apache.commons.lang3.tuple.Pair;
-import org.apache.commons.lang3.tuple.Triple;
 
 import util.Profiler;
 import util.TriConsumer;
@@ -66,61 +63,20 @@ public class SIVerifier<KeyType, ValueType> {
 
     public enum PruningMode {
         NONE,
-        REACHABILITY,
-        SNAPSHOT,
-        PRUN
-    }
-
-    public static final class ConstraintStats {
-        public final boolean internallyConsistent;
-        public final boolean pruningInconsistent;
-        public final int constraintsBefore;
-        public final int constraintsAfter;
-        public final int implicationsBefore;
-        public final int implicationsAfter;
-
-        private ConstraintStats(boolean internallyConsistent, boolean pruningInconsistent,
-                int constraintsBefore, int constraintsAfter,
-                int implicationsBefore, int implicationsAfter) {
-            this.internallyConsistent = internallyConsistent;
-            this.pruningInconsistent = pruningInconsistent;
-            this.constraintsBefore = constraintsBefore;
-            this.constraintsAfter = constraintsAfter;
-            this.implicationsBefore = implicationsBefore;
-            this.implicationsAfter = implicationsAfter;
-        }
+        REACHABILITY
     }
 
     private final History<KeyType, ValueType> history;
-    private final boolean detailedPredicateMetrics;
-    private final PruningMode pruningMode;
     private final SolverSettings solverSettings;
 
-    @Getter
-    @Setter
-    private static boolean coalesceConstraints = true;
-
-    @Getter
-    @Setter
-    private static boolean dotOutput = false;
-
-    @Getter
-    @Setter
-    private static boolean compareDerivedPredicateEdges = false;
-
     public SIVerifier(HistoryLoader<KeyType, ValueType> loader) {
-        this(loader, false, PruningMode.REACHABILITY);
+        this(loader, SolverSettings.defaults(PruningMode.REACHABILITY), false);
     }
 
     public SIVerifier(HistoryLoader<KeyType, ValueType> loader,
             boolean detailedPredicateMetrics) {
-        this(loader, detailedPredicateMetrics, PruningMode.REACHABILITY);
-    }
-
-    public SIVerifier(HistoryLoader<KeyType, ValueType> loader,
-            boolean detailedPredicateMetrics,
-            PruningMode pruningMode) {
-        this(loader, SolverSettings.defaults(pruningMode), detailedPredicateMetrics);
+        this(loader, SolverSettings.defaults(PruningMode.REACHABILITY),
+                detailedPredicateMetrics);
     }
 
     public SIVerifier(HistoryLoader<KeyType, ValueType> loader,
@@ -132,9 +88,7 @@ public class SIVerifier<KeyType, ValueType> {
             throw new IllegalArgumentException("solverTimeoutSeconds must be >= 0");
         }
         this.solverSettings.detailedPredicateMetrics = detailedPredicateMetrics;
-        this.detailedPredicateMetrics = detailedPredicateMetrics;
-        this.pruningMode = Objects.requireNonNull(
-                solverSettings.pruningMode, "pruningMode");
+        Objects.requireNonNull(solverSettings.pruningMode, "pruningMode");
         System.err.printf("Sessions count: %d\nTransactions count: %d\nEvents count: %d\n",
                 history.getClientSessions().size(), history.getClientTransactions().size(), history.getEvents().size());
     }
@@ -173,36 +127,20 @@ public class SIVerifier<KeyType, ValueType> {
         System.err.printf("Unresolved WW choices: %d\nConditional dependency implications: %d\n", constraints.size(),
                 constraints.stream().map(c -> c.getEdges1().size() + c.getEdges2().size()).reduce(0, Integer::sum));
 
-        if (compareDerivedPredicateEdges) {
-            profiler.startTick("SI_DERIVED_PREDICATE_COMPARE");
-            var derivedPredicateGraph = new KnownGraph<>(history);
-            injectPredicateEdgesSI(history, derivedPredicateGraph);
-            profiler.endTick("SI_DERIVED_PREDICATE_COMPARE");
-            System.err.printf(
-                    "[SI] Derived predicate-edge compare: PR_WR=%d, PR_RW=%d (debug-only, not used by MonoSAT solver)\n",
-                    countEdgesOfType(derivedPredicateGraph.getKnownGraphA(), EdgeType.PR_WR),
-                    countEdgesOfType(derivedPredicateGraph.getKnownGraphB(), EdgeType.PR_RW));
-        }
-
         int wwInitialConstraints = constraints.size();
+        int wwInitialImplications = countConstraintImplications(constraints);
         profiler.addCount("WW_INITIAL_CONSTRAINTS", wwInitialConstraints);
-        boolean pruningRejected;
+        profiler.addCount("WW_INITIAL_IMPLICATIONS", wwInitialImplications);
+        Optional<SIConstraint<KeyType, ValueType>> pruningConflict;
         profiler.startTick("WW_BASELINE_PRUNE_MS");
         try {
-            switch (pruningMode) {
+            switch (solverSettings.pruningMode) {
             case NONE:
-                pruningRejected = false;
-                break;
-            case PRUN:
-                pruningRejected = Prun.prune(history, graph, constraints).inconsistent;
-                break;
-            case SNAPSHOT:
-                pruningRejected = Prun.pruneSnapshotOnly(
-                        history, graph, constraints).inconsistent;
+                pruningConflict = Optional.empty();
                 break;
             case REACHABILITY:
             default:
-                pruningRejected = Pruning.pruneConstraints(graph, constraints, history);
+                pruningConflict = Pruning.pruneConstraints(graph, constraints);
                 break;
             }
         } finally {
@@ -211,14 +149,14 @@ public class SIVerifier<KeyType, ValueType> {
         profiler.addCount("WW_BASELINE_FORCED",
                 wwInitialConstraints - constraints.size());
         profiler.addCount("WW_AFTER_BASELINE", constraints.size());
+        profiler.addCount("WW_AFTER_BASELINE_IMPLICATIONS",
+                countConstraintImplications(constraints));
 
-        if (pruningRejected) {
+        if (pruningConflict.isPresent()) {
             profiler.endTick("ONESHOT_CONS");
-            var conflicts = pruningMode == PruningMode.REACHABILITY
-                    ? Pruning.<KeyType, ValueType>getLastConflicts()
-                    : Pair.<Collection<Pair<com.google.common.graph.EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>,
-                            Collection<SIConstraint<KeyType, ValueType>>>of(
-                                    Collections.emptyList(), Collections.emptyList());
+            var conflicts = Pair.<Collection<Pair<com.google.common.graph.EndpointPair<Transaction<KeyType, ValueType>>, Collection<Edge<KeyType>>>>,
+                    Collection<SIConstraint<KeyType, ValueType>>>of(
+                            Collections.emptyList(), List.of(pruningConflict.get()));
             emitRejectDiagnostics(graph, constraints, conflicts);
             return AuditResult.REJECT;
         }
@@ -230,7 +168,7 @@ public class SIVerifier<KeyType, ValueType> {
         try {
             solver = new SISolverInduced<>(
                     history, graph, constraints, true,
-                    detailedPredicateMetrics, solverSettings);
+                    solverSettings.detailedPredicateMetrics, solverSettings);
         } finally {
             profiler.endTick("SI_GRAPH_ENCODE");
         }
@@ -274,44 +212,7 @@ public class SIVerifier<KeyType, ValueType> {
         }
     }
 
-    public ConstraintStats analyzeConstraintsOnly() {
-        if (!Utils.verifyInternalConsistency(history)) {
-            return new ConstraintStats(false, false, 0, 0, 0, 0);
-        }
-
-        var graph = new KnownGraph<>(history);
-        var constraints = generateConstraintsSI(history, graph);
-        int constraintsBefore = constraints.size();
-        int implicationsBefore = countConstraintImplications(constraints);
-
-        boolean pruningInconsistent;
-        switch (pruningMode) {
-        case NONE:
-            pruningInconsistent = false;
-            break;
-        case PRUN:
-            pruningInconsistent = Prun.prune(history, graph, constraints).inconsistent;
-            break;
-        case SNAPSHOT:
-            pruningInconsistent = Prun.pruneSnapshotOnly(
-                    history, graph, constraints).inconsistent;
-            break;
-        case REACHABILITY:
-        default:
-            pruningInconsistent = Pruning.pruneConstraints(graph, constraints, history);
-            break;
-        }
-
-        return new ConstraintStats(
-                true,
-                pruningInconsistent,
-                constraintsBefore,
-                constraints.size(),
-                implicationsBefore,
-                countConstraintImplications(constraints));
-    }
-
-    private int countConstraintImplications(
+    private static <KeyType, ValueType> int countConstraintImplications(
             Collection<SIConstraint<KeyType, ValueType>> constraints) {
         return constraints.stream()
                 .mapToInt(constraint -> constraint.getEdges1().size()
@@ -327,16 +228,7 @@ public class SIVerifier<KeyType, ValueType> {
         var txns = conflictTransactions(conflicts);
         var cycleWitness = buildCycleWitness(graph, constraints, txns);
         printRejectReason(graph, constraints, conflicts, cycleWitness);
-
-        if (dotOutput) {
-            cycleWitness.ifPresent(cycle -> System.err.print(formatCycleWitness(cycle)));
-            System.out.print(Utils.conflictsToDot(txns, conflicts.getLeft(), conflicts.getRight()));
-        } else {
-            cycleWitness.ifPresent(cycle -> System.out.print(formatCycleWitness(cycle)));
-            if (cycleWitness.isEmpty() || !conflicts.getLeft().isEmpty() || !conflicts.getRight().isEmpty()) {
-                System.out.print(Utils.conflictsToLegacy(txns, conflicts.getLeft(), conflicts.getRight()));
-            }
-        }
+        cycleWitness.ifPresent(cycle -> System.out.print(formatCycleWitness(cycle)));
     }
 
 
@@ -593,37 +485,6 @@ public class SIVerifier<KeyType, ValueType> {
         }
         Collections.reverse(result);
         return Optional.of(result);
-    }
-
-    private Optional<List<CycleEdge<KeyType, ValueType>>> dfsCycle(
-            Transaction<KeyType, ValueType> node,
-            Map<Transaction<KeyType, ValueType>, LinkedHashSet<Transaction<KeyType, ValueType>>> adjacency,
-            Map<Pair<Transaction<KeyType, ValueType>, Transaction<KeyType, ValueType>>, List<String>> labelsByPair,
-            Map<Transaction<KeyType, ValueType>, Integer> color,
-            List<Transaction<KeyType, ValueType>> stack,
-            Map<Transaction<KeyType, ValueType>, Integer> stackIndex) {
-        color.put(node, 1);
-        stackIndex.put(node, stack.size());
-        stack.add(node);
-
-        for (var succ : adjacency.getOrDefault(node, new LinkedHashSet<>())) {
-            int succColor = color.getOrDefault(succ, 0);
-            if (succColor == 0) {
-                var cycle = dfsCycle(succ, adjacency, labelsByPair, color, stack, stackIndex);
-                if (cycle.isPresent()) {
-                    return cycle;
-                }
-            } else if (succColor == 1) {
-                var cycleNodes = new ArrayList<>(stack.subList(stackIndex.get(succ), stack.size()));
-                cycleNodes.add(succ);
-                return Optional.of(cycleEdgesFromNodes(cycleNodes, labelsByPair));
-            }
-        }
-
-        stack.remove(stack.size() - 1);
-        stackIndex.remove(node);
-        color.put(node, 2);
-        return Optional.empty();
     }
 
     private List<CycleEdge<KeyType, ValueType>> cycleEdgesFromNodes(
@@ -1029,56 +890,6 @@ public class SIVerifier<KeyType, ValueType> {
         return constraints;
     }
 
-    private static <KeyType, ValueType> Collection<SIConstraint<KeyType, ValueType>> generateConstraintsNoCoalesce(
-            History<KeyType, ValueType> history, KnownGraph<KeyType, ValueType> graph) {
-        var readFrom = graph.getReadFrom();
-        var writes = new HashMap<KeyType, Set<Transaction<KeyType, ValueType>>>();
-
-        history.getEvents().stream().filter(e -> e.getType() == Event.EventType.WRITE).forEach(ev -> {
-            writes.computeIfAbsent(ev.getKey(), k -> new HashSet<>()).add(ev.getTransaction());
-        });
-
-        var constraints = new HashSet<SIConstraint<KeyType, ValueType>>();
-        var constraintId = 0;
-        for (var a : history.getTransactions()) {
-            for (var b : readFrom.successors(a)) {
-                for (var edge : readFrom.edgeValue(a, b).get()) {
-                    for (var c : writes.get(edge.getKey())) {
-                        if (a == c || b == c) {
-                            continue;
-                        }
-
-                        constraints.add(new SIConstraint<>(
-                                List.of(new SIEdge<>(a, c, EdgeType.WW, edge.getKey()),
-                                        new SIEdge<>(b, c, EdgeType.RW, edge.getKey())),
-                                List.of(new SIEdge<>(c, a, EdgeType.WW, edge.getKey())), a, c, constraintId++));
-                    }
-                }
-            }
-        }
-        for (var write : writes.entrySet()) {
-            var list = new ArrayList<>(write.getValue());
-            for (int i = 0; i < list.size(); i++) {
-                for (int j = i + 1; j < list.size(); j++) {
-                    var a = list.get(i);
-                    var c = list.get(j);
-                    constraints.add(new SIConstraint<>(List.of(new SIEdge<>(a, c, EdgeType.WW, write.getKey())),
-                            List.of(new SIEdge<>(c, a, EdgeType.WW, write.getKey())), a, c, constraintId++));
-                }
-            }
-        }
-
-        return constraints;
-    }
-
-    private static <KeyType, ValueType> Collection<SIConstraint<KeyType, ValueType>> generateConstraints(
-            History<KeyType, ValueType> history, KnownGraph<KeyType, ValueType> graph) {
-        if (coalesceConstraints) {
-            return generateConstraintsCoalesce(history, graph);
-        }
-        return generateConstraintsNoCoalesce(history, graph);
-    }
-
     /**
      * SI direct-edge constraint generation.
      *
@@ -1089,270 +900,8 @@ public class SIVerifier<KeyType, ValueType> {
      */
     static <KeyType, ValueType> Collection<SIConstraint<KeyType, ValueType>> generateConstraintsSI(
             History<KeyType, ValueType> history, KnownGraph<KeyType, ValueType> graph) {
-        return generateConstraints(history, graph);
+        return generateConstraintsCoalesce(history, graph);
     }
-
-    /**
-     * Diagnostic predicate-edge derivation.
-     *
-     * <p>The main SI path encodes predicate frontiers directly in
-     * {@link SISolverInduced} and does not consume these materialized
-     * PR_WR / PR_RW graph edges. This helper is kept only for explicit
-     * compare/debug runs and tests of the derived-edge layer.</p>
-     */
-    static <KeyType, ValueType> void injectPredicateEdgesSI(
-            History<KeyType, ValueType> history,
-            KnownGraph<KeyType, ValueType> graph) {
-        refreshDerivedPredicateEdges(history, graph);
-        injectConservativePredicateCandidatesSI(graph);
-    }
-
-    /* ================================================================
-     * PR_WR / PR_RW derivation — debug-only materialized-edge layer
-     *
-     * PR_WR and PR_RW cannot be trusted as main-path KnownGraph edges because
-     * they depend on the per-key total write ordering, which is ultimately
-     * selected by MonoSAT. The production SI solver encodes this dependency
-     * directly instead of consuming this materialized graph.
-     *
-     * Each call to refreshDerivedPredicateEdges:
-     *   1) clears all previously derived PR_WR / PR_RW edges
-     *   2) rebuilds the current confirmed write ordering per key
-     *   3) for each predicate read and key, resolves the latest visible write
-     *      frontier and emits current-effective PR_WR / PR_RW
-     *
-     * Version/source changes are internal metadata only. PR_RW is emitted only
-     * when the frontier write and later write differ under the canonical
-     * predicate-result transition:
-     *     PT(x,v') xor PT(x,vs), or both true with v' != vs.
-     * ================================================================ */
-
-    /* ================================================================
-     * PR_WR / PR_RW derivation — latest-visible frontier variant (debug only)
-     *
-     * - PR_WR: the latest visible write T for key x emits PR_WR(T→S, x).
-     * - PR_RW: if T' is the PR_WR frontier for reader T, and T' WW(x)→S, then T emits
-     *           PR_RW(T→S, x) when Δ(T',T,S,x) holds.
-     *
-     *   Δ(T',T,S,x) compares only the canonical key/value rows produced by
-     *   T' and S for P; T is carried by the dependency shape and is not part
-     *   of the value comparison.
-     * ================================================================ */
-
-    private static final int OBS_INITIAL_STATE = -1;
-
-    private static <KeyType, ValueType> long countEdgesOfType(
-            com.google.common.graph.ValueGraph<Transaction<KeyType, ValueType>, Collection<Edge<KeyType>>> graph,
-            EdgeType type) {
-        return graph.edges().stream()
-                .flatMap(ep -> graph.edgeValue(ep).orElse(List.of()).stream())
-                .filter(edge -> edge.getType() == type)
-                .count();
-    }
-
-    private static <KeyType, ValueType> void injectConservativePredicateCandidatesSI(
-            KnownGraph<KeyType, ValueType> graph) {
-        var observations = graph.getPredicateObservations();
-        if (observations.isEmpty()) {
-            return;
-        }
-
-        var writesByKey = buildWritesByKey(graph);
-        if (writesByKey.isEmpty()) {
-            return;
-        }
-
-        var unresolvedByKey = new HashMap<KeyType, List<KnownGraph.WriteRef<KeyType, ValueType>>>();
-        for (var entry : writesByKey.entrySet()) {
-            var confirmedOrder = buildConfirmedWriteOrder(entry.getKey(), entry.getValue(), graph);
-            if (confirmedOrder == null && !entry.getValue().isEmpty()) {
-                unresolvedByKey.put(entry.getKey(), entry.getValue());
-            }
-        }
-        if (unresolvedByKey.isEmpty()) {
-            return;
-        }
-
-        var emittedPrWr = new HashSet<Triple<Transaction<KeyType, ValueType>,
-                Transaction<KeyType, ValueType>, KeyType>>();
-        var emittedPrRw = new HashSet<Triple<Transaction<KeyType, ValueType>,
-                Transaction<KeyType, ValueType>, KeyType>>();
-        int conservativePrWr = 0;
-        int conservativePrRw = 0;
-
-        for (var obs : observations) {
-            var predicateRead = obs.getPredicateReadEvent();
-            if (predicateRead.getPredicate() == null) {
-                continue;
-            }
-
-            var reader = obs.getTxn();
-            var resultKeys = obs.getTupleSources().stream()
-                    .map(KnownGraph.PredicateTupleSource::getKey)
-                    .collect(Collectors.toSet());
-
-            for (var entry : unresolvedByKey.entrySet()) {
-                var key = entry.getKey();
-                if (obs.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
-                    continue;
-                }
-                var writesOnKey = entry.getValue();
-                boolean keyCanAffectObservation = resultKeys.contains(key)
-                        || writesOnKey.stream().anyMatch(w -> writeRowIsInPredicateResult(w, predicateRead));
-                if (!keyCanAffectObservation) {
-                    continue;
-                }
-
-                for (var writer : writesOnKey) {
-                    var writerTxn = writer.getTxn();
-                    if (writerTxn.equals(reader)) {
-                        continue;
-                    }
-
-                    if (emittedPrWr.add(Triple.of(writerTxn, reader, key))) {
-                        graph.putEdge(writerTxn, reader, new Edge<>(EdgeType.PR_WR, key));
-                        conservativePrWr++;
-                    }
-                    if (emittedPrRw.add(Triple.of(reader, writerTxn, key))) {
-                        graph.putEdge(reader, writerTxn, new Edge<>(EdgeType.PR_RW, key));
-                        conservativePrRw++;
-                    }
-                }
-            }
-        }
-
-        if (conservativePrWr > 0 || conservativePrRw > 0) {
-            System.err.printf(
-                    "[SI] Recorded conservative predicate candidates: PR_WR=%d, PR_RW=%d%n",
-                    conservativePrWr, conservativePrRw);
-        }
-    }
-
-    /**
-     * Clear and rebuild all derived PR_WR / PR_RW edges.
-     *
-     * Algorithm:
-     * 1. For each predicate observation S ⊢ PR(P,M,x):
-     *    Resolve T = max snapshot-visible write for key x.
-     *    If T exists and T != S, emit PR_WR(T→S, x).
-     *
-     * 2. For each later writer U with T WW(x)→U:
-     *    If Δ(T,S,U,x) holds, emit PR_RW(S→U, x).
-     */
-    static <KeyType, ValueType> void refreshDerivedPredicateEdges(
-            History<KeyType, ValueType> history,
-            KnownGraph<KeyType, ValueType> graph) {
-
-        graph.clearDerivedPredicateEdges();
-
-        var observations = graph.getPredicateObservations();
-        if (observations.isEmpty()) return;
-
-        var writesByKey = buildWritesByKey(graph);
-
-        var emittedPrWr = new HashSet<Triple<Transaction<KeyType, ValueType>,
-                Transaction<KeyType, ValueType>, KeyType>>();
-        var emittedPrRw = new HashSet<Triple<Transaction<KeyType, ValueType>,
-                Transaction<KeyType, ValueType>, KeyType>>();
-
-        // Predicate result sources are SI snapshot frontier dependencies. They
-        // do not require a pre-existing per-key WW total order.
-        for (var obs : observations) {
-            var reader = obs.getTxn();
-            var pr = obs.getPredicateReadEvent();
-            if (pr.getPredicate() == null) continue;
-
-            for (var ts : obs.getTupleSources()) {
-                var source = ts.getSourceWrite();
-                var sourceTxn = source.getTxn();
-                var key = ts.getKey();
-                if (!sourceTxn.equals(reader)
-                        && emittedPrWr.add(Triple.of(sourceTxn, reader, key))) {
-                    graph.putEdge(sourceTxn, reader, new Edge<>(EdgeType.PR_WR, key));
-                }
-            }
-        }
-
-        // Only keys whose writers have a unique confirmed total ordering
-        // are eligible for PR derivation.
-        var orderedWritesByKey = new HashMap<KeyType,
-                List<KnownGraph.WriteRef<KeyType, ValueType>>>();
-        for (var entry : writesByKey.entrySet()) {
-            var order = buildConfirmedWriteOrder(
-                    entry.getKey(), entry.getValue(), graph);
-            if (order != null) {
-                orderedWritesByKey.put(entry.getKey(), order);
-            }
-        }
-        var depReachability = InducedGraph.depReachability(graph);
-
-        for (var obs : observations) {
-            var pr = obs.getPredicateReadEvent();
-            var b = obs.getTxn();          // S in pseudocode (predicate reader)
-            if (pr.getPredicate() == null) continue;
-
-            // Result key → source WriteRef for observation-point resolution.
-            var resultSourceByKey = new HashMap<KeyType,
-                    KnownGraph.WriteRef<KeyType, ValueType>>();
-            for (var ts : obs.getTupleSources()) {
-                resultSourceByKey.put(ts.getKey(), ts.getSourceWrite());
-            }
-
-            // Iterate over keys with confirmed total write order.
-            for (var entry : orderedWritesByKey.entrySet()) {
-                var key = entry.getKey();
-                if (obs.getPredicateReadType(key) != KnownGraph.PredicateReadType.EXTERNAL) {
-                    continue;
-                }
-                var orderedWrites = entry.getValue();
-                boolean keyInResult = resultSourceByKey.containsKey(key);
-                if (!keyInResult
-                        && orderedWrites.stream().noneMatch(w -> writeRowIsInPredicateResult(w, pr))) {
-                    continue;
-                }
-
-                int obsIdx;
-                if (keyInResult) {
-                    obsIdx = orderedWrites.indexOf(resultSourceByKey.get(key));
-                    if (obsIdx < 0) continue;
-                } else {
-                    obsIdx = latestVisibleWriteIndex(b, pr, orderedWrites, obs, depReachability);
-                }
-
-                KnownGraph.WriteRef<KeyType, ValueType> frontier =
-                        obsIdx == OBS_INITIAL_STATE ? null : orderedWrites.get(obsIdx);
-                Transaction<KeyType, ValueType> frontierTxn =
-                        frontier == null ? null : frontier.getTxn();
-
-                // ---- Phase 1: PR_WR derivation ----
-                // T = max snapshot-visible write for key x.
-                if (frontierTxn != null
-                        && !frontierTxn.equals(b)
-                        && emittedPrWr.add(Triple.of(frontierTxn, b, key))) {
-                    graph.putEdge(frontierTxn, b, new Edge<>(EdgeType.PR_WR, key));
-                }
-
-                // ---- Phase 2: PR_RW derivation ----
-                // For each later writer U where frontier WW(x)→U:
-                //   If Δ(frontier,b,U,x) holds, emit PR_RW(b→U, x).
-                int firstLater = obsIdx == OBS_INITIAL_STATE ? 0 : obsIdx + 1;
-                for (int uIdx = firstLater; uIdx < orderedWrites.size(); uIdx++) {
-                    var later = orderedWrites.get(uIdx);
-                    var u = later.getTxn();
-                    if (u.equals(b)) continue;            // No self-loop PR_RW(S→S,x)
-                    if (u.equals(frontierTxn)) continue;  // WW is inter-transactional here
-
-                    if (predicateTransitionDelta(frontier, later, pr)) {
-                        if (emittedPrRw.add(Triple.of(b, u, key))) {
-                            graph.putEdge(b, u, new Edge<>(EdgeType.PR_RW, key));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /* ---------- helper: writes-by-key index ---------- */
 
     private static <KeyType, ValueType> Map<KeyType,
             List<KnownGraph.WriteRef<KeyType, ValueType>>> buildWritesByKey(
@@ -1364,179 +913,6 @@ public class SIVerifier<KeyType, ValueType> {
                     k -> new ArrayList<>()).add(write);
         }
         return result;
-    }
-
-    /* ---------- helper: confirmed write ordering ---------- */
-
-    /**
-     * Build a total write ordering for {@code key} using confirmed edges
-     * in knownGraphA.  Returns {@code null} if the ordering among the
-     * writers is not yet uniquely determined (conservative: skip).
-     *
-     * <p>Within a single transaction, writes on the same key are ordered
-     * by their event index (program order).  Across transactions, any
-     * edge in knownGraphA (SO, WW, WR, PR_WR) implies a confirmed
-     * precedence that constrains the per-key version order.
-     */
-    private static <KeyType, ValueType>
-            List<KnownGraph.WriteRef<KeyType, ValueType>> buildConfirmedWriteOrder(
-                    KeyType key,
-                    List<KnownGraph.WriteRef<KeyType, ValueType>> writesOnKey,
-                    KnownGraph<KeyType, ValueType> graph) {
-
-        if (writesOnKey.isEmpty()) return null;
-        if (writesOnKey.size() == 1) return new ArrayList<>(writesOnKey);
-
-        // Group by transaction; within-txn writes sorted by event index
-        var txnToWrites = new LinkedHashMap<Transaction<KeyType, ValueType>,
-                List<KnownGraph.WriteRef<KeyType, ValueType>>>();
-        for (var wr : writesOnKey) {
-            txnToWrites.computeIfAbsent(wr.getTxn(),
-                    t -> new ArrayList<>()).add(wr);
-        }
-        txnToWrites.values().forEach(list ->
-                list.sort(Comparator.comparingInt(
-                        KnownGraph.WriteRef::getIndex)));
-
-        var txns = new ArrayList<>(txnToWrites.keySet());
-        if (txns.size() == 1) {
-            return txnToWrites.get(txns.get(0));
-        }
-
-        var txnSet = new HashSet<>(txns);
-
-        // Collect all confirmed ordering edges between these transactions.
-        var successors = new HashMap<Transaction<KeyType, ValueType>,
-                Set<Transaction<KeyType, ValueType>>>();
-        for (var ep : graph.getKnownGraphA().edges()) {
-            var source = ep.source();
-            var target = ep.target();
-            if (source == target) continue;
-            if (!txnSet.contains(source) || !txnSet.contains(target)) continue;
-            successors.computeIfAbsent(source,
-                    x -> new HashSet<>()).add(target);
-        }
-
-        var sorted = uniqueTopologicalSort(txns, successors);
-        if (sorted == null) return null;
-
-        var result = new ArrayList<KnownGraph.WriteRef<KeyType, ValueType>>();
-        for (var txn : sorted) {
-            result.addAll(txnToWrites.get(txn));
-        }
-        return result;
-    }
-
-    /**
-     * Returns a topological ordering of {@code nodes} iff it is unique
-     * (total order).  Returns {@code null} if a cycle is detected or if
-     * multiple valid orderings exist (i.e. some nodes are incomparable).
-     */
-    private static <T> List<T> uniqueTopologicalSort(
-            List<T> nodes, Map<T, Set<T>> successors) {
-        var inDegree = new HashMap<T, Integer>();
-        for (var n : nodes) inDegree.put(n, 0);
-        for (var entry : successors.entrySet()) {
-            if (!inDegree.containsKey(entry.getKey())) continue;
-            for (var succ : entry.getValue()) {
-                if (inDegree.containsKey(succ)) {
-                    inDegree.merge(succ, 1, Integer::sum);
-                }
-            }
-        }
-
-        var result = new ArrayList<T>();
-        var queue = new ArrayDeque<T>();
-        for (var entry : inDegree.entrySet()) {
-            if (entry.getValue() == 0) queue.add(entry.getKey());
-        }
-
-        while (!queue.isEmpty()) {
-            if (queue.size() > 1) return null;
-            var node = queue.poll();
-            result.add(node);
-            for (var succ : successors.getOrDefault(
-                    node, Collections.emptySet())) {
-                if (inDegree.containsKey(succ)) {
-                    int d = inDegree.get(succ) - 1;
-                    inDegree.put(succ, d);
-                    if (d == 0) queue.add(succ);
-                }
-            }
-        }
-        return (result.size() == nodes.size()) ? result : null;
-    }
-
-    /* ---------- helper: observation index ---------- */
-
-    private static <KeyType, ValueType> int latestVisibleWriteIndex(
-            Transaction<KeyType, ValueType> reader,
-            Event<KeyType, ValueType> predicateRead,
-            List<KnownGraph.WriteRef<KeyType, ValueType>> orderedWrites,
-            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
-            MatrixGraph<Transaction<KeyType, ValueType>> depReachability) {
-        for (int i = orderedWrites.size() - 1; i >= 0; i--) {
-            if (visibleToSnapshot(reader, predicateRead, orderedWrites.get(i), observation, depReachability)) {
-                return i;
-            }
-        }
-        return OBS_INITIAL_STATE;
-    }
-
-    private static <KeyType, ValueType> boolean visibleToSnapshot(
-            Transaction<KeyType, ValueType> reader,
-            Event<KeyType, ValueType> predicateRead,
-            KnownGraph.WriteRef<KeyType, ValueType> write,
-            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
-            MatrixGraph<Transaction<KeyType, ValueType>> depReachability) {
-        if (write.getTxn().equals(reader)) {
-            return write.getIndex() < observation.getEventIndex()
-                    && observation.getPredicateReadEvent() == predicateRead;
-        }
-        return InducedGraph.reaches(depReachability, write.getTxn(), reader);
-    }
-
-    /* ---------- helper: PredicateResult transition checks ---------- */
-
-    private static <KeyType, ValueType> boolean predicateTransitionDelta(
-            KnownGraph.WriteRef<KeyType, ValueType> source,
-            KnownGraph.WriteRef<KeyType, ValueType> later,
-            Event<KeyType, ValueType> predicateReadEvent) {
-        return writeChangesPredicateResultSet(later, source, predicateReadEvent);
-    }
-
-    /**
-     * A write {@code w} triggers PR_* only when applying that write changes the
-     * canonical PredicateResult set. Source/version metadata used to locate
-     * rows is not the deciding condition.
-     *
-     * <p>When {@code prev} is {@code null} (initial state before any
-     * write), the initial PredicateResult is the empty result.
-     */
-    private static <KeyType, ValueType> boolean writeChangesPredicateResultSet(
-            KnownGraph.WriteRef<KeyType, ValueType> writeRef,
-            KnownGraph.WriteRef<KeyType, ValueType> predecessor,
-            Event<KeyType, ValueType> predicateReadEvent) {
-        if (predecessor == null) {
-            return writeRowIsInPredicateResult(writeRef, predicateReadEvent);
-        }
-        return !samePredicateResultSetAfterWrite(writeRef, predecessor, predicateReadEvent);
-    }
-
-    private static <KeyType, ValueType> boolean samePredicateResultSetAfterWrite(
-            KnownGraph.WriteRef<KeyType, ValueType> left,
-            KnownGraph.WriteRef<KeyType, ValueType> right,
-            Event<KeyType, ValueType> predicateReadEvent) {
-        boolean leftInResult = writeRowIsInPredicateResult(left, predicateReadEvent);
-        boolean rightInResult = writeRowIsInPredicateResult(right, predicateReadEvent);
-        if (!leftInResult && !rightInResult) {
-            return true;
-        }
-        if (leftInResult != rightInResult) {
-            return false;
-        }
-        return Objects.equals(left.getEvent().getKey(), right.getEvent().getKey())
-                && Objects.equals(left.getEvent().getValue(), right.getEvent().getValue());
     }
 
     /**

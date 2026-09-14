@@ -17,6 +17,7 @@ import history.query.MapVisibleState;
 import history.query.RelationResolver;
 import history.query.RowLocalRecordedQueryResult;
 import verifier.PredicateFixtures;
+import verifier.SIVerifier;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -40,7 +41,7 @@ public class TestPredicateHistoryLoader {
         var invalidCompact = rowLocal.replace("\"value\":7}]}}",
                 "\"value\":8}]}}");
         var historyDir = dataset(input, List.of(
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":["
                         + rowLocal + "," + distinct + "," + invalidCompact + "]}"));
 
         var events = new PredicateHistoryLoader(historyDir).loadHistory()
@@ -65,18 +66,18 @@ public class TestPredicateHistoryLoader {
     @Test
     void loadsCompactKvRelationalPredicateHistory() throws Exception {
         var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0},{\"key\":\"kv:1\",\"value\":1}]", List.of(
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":["
                         + predicateOp("value = 0", "[{\"key\":\"kv:0\",\"value\":0}]") + ","
                         + "{\"type\":\"w\",\"key\":\"kv:1\",\"value\":2}]}",
-                "{\"session\":0,\"txn\":1,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":2,\"txn\":1,\"status\":\"commit\",\"ops\":["
                         + predicateOp("TRUE", "[{\"key\":\"kv:0\",\"value\":0},{\"key\":\"kv:1\",\"value\":2}]") + ","
                         + "{\"type\":\"r\",\"key\":\"kv:1\",\"value\":2}]}",
-                "{\"session\":0,\"txn\":2,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":3,\"txn\":2,\"status\":\"commit\",\"ops\":["
                         + predicateOp("value % 2 = 0", "[{\"key\":\"kv:1\",\"value\":2}]") + "]}",
-                "{\"session\":0,\"txn\":3,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":4,\"txn\":3,\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"kv:0\",\"value\":5},"
                         + predicateOp("value > 3", "[{\"key\":\"kv:0\",\"value\":5}]") + "]}",
-                "{\"session\":0,\"txn\":4,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":5,\"txn\":4,\"status\":\"commit\",\"ops\":["
                         + predicateOp("value < 1", "[{\"key\":\"kv:0\",\"value\":0}]") + "]}"));
 
         var history = new PredicateHistoryLoader(historyDir).loadHistory();
@@ -124,7 +125,7 @@ public class TestPredicateHistoryLoader {
     @Test
     void classifiesPredicateReadsPerCoveredKey() throws Exception {
         var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0},{\"key\":\"kv:1\",\"value\":1}]", List.of(
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"kv:0\",\"value\":2},"
                         + predicateOp("TRUE", "[{\"key\":\"kv:0\",\"value\":2},{\"key\":\"kv:1\",\"value\":1}]") + ","
                         + predicateOp("TRUE", "[{\"key\":\"kv:0\",\"value\":2},{\"key\":\"kv:1\",\"value\":1}]") + "]}"));
@@ -150,7 +151,7 @@ public class TestPredicateHistoryLoader {
     @Test
     void differentPredicateKeepsCoveredKeysExternal() throws Exception {
         var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0},{\"key\":\"kv:1\",\"value\":1}]", List.of(
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":["
                         + predicateOp("value > 100", "[]") + ","
                         + predicateOp("TRUE", "[{\"key\":\"kv:0\",\"value\":0},{\"key\":\"kv:1\",\"value\":1}]") + "]}"));
 
@@ -202,13 +203,86 @@ public class TestPredicateHistoryLoader {
     }
 
     @Test
+    void sessionSeqDeterminesOrderIndependentOfJsonLineOrder() throws Exception {
+        var first = dataset("[]", List.of(
+                transaction(7, 3, 30),
+                transaction(8, 2, 82),
+                transaction(7, 1, 10),
+                transaction(8, 1, 81),
+                transaction(7, 2, 20)));
+        var shuffled = dataset("[]", List.of(
+                transaction(7, 2, 20),
+                transaction(8, 1, 81),
+                transaction(7, 3, 30),
+                transaction(7, 1, 10),
+                transaction(8, 2, 82)));
+
+        var firstHistory = new PredicateHistoryLoader(first).loadHistory();
+        var shuffledHistory = new PredicateHistoryLoader(shuffled).loadHistory();
+
+        assertEquals(List.of(10L, 20L, 30L), transactionIds(firstHistory, 7L));
+        assertEquals(List.of(81L, 82L), transactionIds(firstHistory, 8L));
+        assertEquals(transactionIds(firstHistory, 7L), transactionIds(shuffledHistory, 7L));
+        assertEquals(transactionIds(firstHistory, 8L), transactionIds(shuffledHistory, 8L));
+
+        var firstGraph = new KnownGraph<>(firstHistory).getKnownGraphA();
+        var shuffledGraph = new KnownGraph<>(shuffledHistory).getKnownGraphA();
+        assertTrue(firstGraph.hasEdgeConnecting(
+                firstHistory.getTransaction(10L), firstHistory.getTransaction(20L)));
+        assertTrue(firstGraph.hasEdgeConnecting(
+                firstHistory.getTransaction(20L), firstHistory.getTransaction(30L)));
+        assertTrue(shuffledGraph.hasEdgeConnecting(
+                shuffledHistory.getTransaction(10L), shuffledHistory.getTransaction(20L)));
+        assertTrue(shuffledGraph.hasEdgeConnecting(
+                shuffledHistory.getTransaction(20L), shuffledHistory.getTransaction(30L)));
+        assertEquals(
+                new SIVerifier<>(new PredicateHistoryLoader(first)).auditResult(),
+                new SIVerifier<>(new PredicateHistoryLoader(shuffled)).auditResult());
+    }
+
+    @Test
+    void duplicateSessionSeqWithinOneSessionIsRejected() throws Exception {
+        var historyDir = dataset("[]", List.of(
+                transaction(7, 1, 10),
+                transaction(7, 1, 20)));
+
+        assertThrows(InvalidHistoryError.class,
+                () -> new PredicateHistoryLoader(historyDir).loadHistory());
+    }
+
+    @Test
+    void sessionSeqMustBeIntegralLong() throws Exception {
+        var text = dataset("[]", List.of(
+                "{\"session\":7,\"session_seq\":\"first\",\"txn\":10,"
+                        + "\"status\":\"commit\",\"ops\":[]}"));
+        var fractional = dataset("[]", List.of(
+                "{\"session\":7,\"session_seq\":1.5,\"txn\":10,"
+                        + "\"status\":\"commit\",\"ops\":[]}"));
+
+        assertThrows(InvalidHistoryError.class,
+                () -> new PredicateHistoryLoader(text).loadHistory());
+        assertThrows(InvalidHistoryError.class,
+                () -> new PredicateHistoryLoader(fractional).loadHistory());
+    }
+
+    @Test
+    void missingSessionSeqIsRejected() throws Exception {
+        var historyDir = dataset("[]", List.of(
+                "{\"session\":7,\"txn\":10,"
+                        + "\"status\":\"commit\",\"ops\":[]}"));
+
+        assertThrows(InvalidHistoryError.class,
+                () -> new PredicateHistoryLoader(historyDir).loadHistory());
+    }
+
+    @Test
     void acceptsDirectHistoryFilePathWithSiblingInitialState() throws Exception {
         var historyDir = Files.createTempDirectory("single-prhist");
         Files.writeString(historyDir.resolve("initial_state.json"),
                 "[{\"key\":\"kv:0\",\"value\":0}]");
         var file = historyDir.resolve("history.prhist.jsonl");
         Files.writeString(file,
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"r\",\"key\":\"kv:0\",\"value\":0},"
                         + "{\"type\":\"w\",\"key\":\"kv:0\",\"value\":1}]}");
 
@@ -222,7 +296,7 @@ public class TestPredicateHistoryLoader {
     void missingInitialStateFailsByDefault() throws Exception {
         var historyDir = Files.createTempDirectory("prhist-no-init");
         Files.writeString(historyDir.resolve("history.prhist.jsonl"),
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":[]}");
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":[]}");
 
         assertThrows(InvalidHistoryError.class, () -> new PredicateHistoryLoader(historyDir).loadHistory());
     }
@@ -230,7 +304,7 @@ public class TestPredicateHistoryLoader {
     @Test
     void legacyPredicateResultsFormIsRejected() throws Exception {
         var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0}]", List.of(
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\"},\"results\":[]}]}"));
 
         assertThrows(InvalidHistoryError.class, () -> new PredicateHistoryLoader(historyDir).loadHistory());
@@ -239,7 +313,7 @@ public class TestPredicateHistoryLoader {
     @Test
     void sourceMetadataFieldsAreRejected() throws Exception {
         var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0,\"source_write_id\":1}]", List.of(
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":[]}"));
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":[]}"));
 
         assertThrows(InvalidHistoryError.class, () -> new PredicateHistoryLoader(historyDir).loadHistory());
     }
@@ -247,7 +321,7 @@ public class TestPredicateHistoryLoader {
     @Test
     void writeIdFieldsAreRejected() throws Exception {
         var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0}]", List.of(
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"kv:0\",\"value\":1,\"write_id\":10}]}"));
 
         assertThrows(InvalidHistoryError.class, () -> new PredicateHistoryLoader(historyDir).loadHistory());
@@ -256,7 +330,7 @@ public class TestPredicateHistoryLoader {
     @Test
     void duplicateKeyValueWritesAreRejected() throws Exception {
         var historyDir = dataset("[{\"key\":\"kv:0\",\"value\":0}]", List.of(
-                "{\"session\":0,\"txn\":0,\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"kv:0\",\"value\":0}]}"));
 
         assertThrows(InvalidHistoryError.class, () -> new PredicateHistoryLoader(historyDir).loadHistory());
@@ -267,6 +341,20 @@ public class TestPredicateHistoryLoader {
                 + "\"select\":{\"columns\":[\"k\",\"value\"],\"distinct\":false},"
                 + "\"where\":[\"" + whereClause + "\"]},"
                 + "\"result\":{\"inputs\":" + inputsJson + ",\"values\":[]}}";
+    }
+
+    private static String transaction(long session, long sessionSeq, long txn) {
+        return String.format(
+                "{\"session\":%d,\"session_seq\":%d,\"txn\":%d,"
+                        + "\"status\":\"commit\",\"ops\":[]}",
+                session, sessionSeq, txn);
+    }
+
+    private static List<Long> transactionIds(History<String,
+            PredicateHistoryLoader.PredicateValue> history, long sessionId) {
+        return history.getSession(sessionId).getTransactions().stream()
+                .map(Transaction::getId)
+                .collect(java.util.stream.Collectors.toList());
     }
 
     private static PredicateFixtures.RowPredicate<String, Integer> scopedPredicate(String coveredKey) {

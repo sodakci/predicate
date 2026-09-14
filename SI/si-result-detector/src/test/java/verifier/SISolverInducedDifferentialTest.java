@@ -19,7 +19,7 @@ class SISolverInducedDifferentialTest {
     private static final int CASES = 160;
 
     @Test
-    void solverAndEveryPruningModeMatchBruteForceInducedGraphOracle() {
+    void solverAndBothPruningModesMatchBruteForceInducedGraphOracle() {
         var random = new Random(0x51AD7A);
         for (int caseId = 0; caseId < CASES; caseId++) {
             var specification = CaseSpecification.random(random);
@@ -46,19 +46,8 @@ class SISolverInducedDifferentialTest {
             rejected = false;
             break;
         case REACHABILITY:
-            Pruning.setEnablePruning(true);
             rejected = Pruning.pruneConstraints(
-                    instance.graph, instance.constraints, instance.history);
-            break;
-        case SNAPSHOT:
-            rejected = Prun.pruneSnapshotOnly(
-                    instance.history, instance.graph,
-                    instance.constraints).inconsistent;
-            break;
-        case PRUN:
-            rejected = Prun.prune(
-                    instance.history, instance.graph,
-                    instance.constraints).inconsistent;
+                    instance.graph, instance.constraints).isPresent();
             break;
         default:
             throw new IllegalStateException("unknown mode " + mode);

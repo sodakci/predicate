@@ -258,6 +258,18 @@ selected(S,R,k)
     AND 不存在另一个在 S 后、同时仍位于 R 前的同 key writer
 ```
 
+当同一个 key 有多个候选 writer `S1...Sn` 时，checker 不会预先任选一个 source，也不会再建立一组与 serialization order 无关的 source-choice 变量。它会为每个候选分别构造：
+
+```text
+visible_i  = beforeReader(k,Si,R)
+selected_i = visible_i
+             AND 对所有 j != i：NOT(beforeWrite(Si,Sj) AND visible_j)
+```
+
+因此，source 由 MonoSAT 求出的全局 serialization order 决定：若 `S1 < S2 < R`，则 `S2` 遮蔽 `S1`，只有 `selected(S2,R,k)` 成立；若 `S2 < S1 < R`，结果反过来；排在 `R` 后的 writer 不可见，也不会遮蔽 source。在 serialization order 为全序且至少存在一个可见 writer 时，这些公式自然保证恰好一个 AR-max writer 被选中，而不是靠额外的任意选择。每个 writer transaction 对该 key 只有最后一次写可以进入 external source 候选集，同事务内更早的写不会成为 external source。
+
+若谓词结果已经记录了 `(k,value)`，紧凑历史先按唯一 `(k,value)` 解析出 `recordedSource`，随后直接断言该候选的 `selected` 条件；其他 writer 的相对顺序只能服从这一条件，否则模型不可满足。同一 `(k,value)` 对应多个 write 会被内部一致性检查判为 source 歧义。若没有 recorded source（例如未返回的 key），则由 serialization order 产生的 AR-max writer 与结果合法性 clause/GMWR obligation 共同决定哪些选择可行；不符合记录谓词结果的 frontier 会被约束或 refinement 排除。
+
 当 `S` 被选为 source 时：
 
 ```text
@@ -275,9 +287,246 @@ selected(S,R,k) AND beforeWrite(S,U)
 
 row-local 查询可以逐 key 预编码。JOIN、DISTINCT 或其他 general query 会在 SAT 给出候选 frontier 后执行完整 `QueryPlan`；若模型结果与记录不一致，则加入 no-good 后继续求解。refinement 改变的是 frontier 组合的合法性，不会在模型验证阶段临时发明新的边类型。
 
-## 6. 边的收集、合并和最终物化
+## 6. 核心算法一：谓词语义驱动的 WW 剪枝
 
-### 6.1 语义对象：`SEREdge`
+### 6.1 它比普通 WW 剪枝多知道什么
+
+设当前已经确定：
+
+$$
+T_b \prec T_r.
+$$
+
+令 bad writer $T_b$ 写入会让查询返回 `x` 的值 80，good writer $T_g$ 写入不会让查询返回 `x` 的值 20，而读取事务 $T_r$ 实际没有返回 `x`。此时 $T_b$ 与 $T_g$ 的 WW 顺序还没有决定。只看现有顺序图，以下两种顺序都可能无环：
+
+$$
+T_g \prec T_b \prec T_r,
+$$
+
+以及：
+
+$$
+T_b \prec T_g \prec T_r.
+$$
+
+然而，它们对查询的含义不同。在第一种顺序中，读取时 `x` 的最新值是 80，应该返回 `x`，与观察不符；在第二种顺序中，最新值是 20，没有返回 `x` 才合理。因此，谓词语义可以进一步推出：
+
+$$
+\boxed{T_b \prec T_g}
+\qquad\text{以及}\qquad
+\boxed{T_g \prec T_r}.
+$$
+
+原来未决的 WW 方向由此确定。这不是把可达性算法写得更快，而是给可达性剪枝增加了原本没有利用的谓词观察语义。
+
+### 6.2 核心过程：删候选、推事实、反馈 WW
+
+算法状态可以分成三部分：
+
+$$
+P=\text{已确定的顺序事实},
+\qquad
+U=\text{未决的 WW 选择},
+\qquad
+\mathcal O=\text{尚未解决的谓词义务}.
+$$
+
+对 reader $r$、bad writer $b$ 和 good writer 候选集合 $G$，单个谓词义务可写为：
+
+$$
+(r\prec b)\;\lor\;\bigvee_{g\in G}\bigl[(b\prec g)\land(g\prec r)\bigr]. \tag{1}
+$$
+
+首先用 $P$ 化简式（1）。好写者 $g$ 必须能够放在区间：
+
+$$
+b\prec g\prec r
+$$
+
+之中。若已经知道 $g\prec b$ 或 $r\prec g$，它就不可能完成这次覆盖，可以从候选集合中删除。
+
+随后根据剩余候选传播：
+
+| 当前已知情况 | 可以推出什么 |
+| --- | --- |
+| 已知 $r\prec b$ | 该 bad writer 对应的义务已满足 |
+| 已知某个 $b\prec g\prec r$ | 该义务已被确定的覆盖关系满足 |
+| 已无可行 good writer | 必须有 $r\prec b$ |
+| 已知 $b\prec r$，且只剩一个 good writer $g$ | 必须有 $b\prec g\prec r$ |
+| 已知 $b\prec r$，但没有可行 good writer | 当前约束发生矛盾 |
+
+这里必须遵守一个原则：只能删除已证明不可能的候选，不能把“当前没有可达路径”当成“不可能”。
+
+推导出的新顺序进入 $P$，然后重新检查 WW 选择。某个 WW 分支及其伴随依赖可能因此与新事实形成环，于是该分支被排除；固定的 WW 方向又可能让更多覆盖候选变得不可能。由此形成固定点传播：
+
+$$
+\boxed{
+\text{WW 顺序事实}
+\;\longrightarrow\;
+\text{谓词义务化简}
+\;\longrightarrow\;
+\text{新顺序事实}
+\;\longrightarrow\;
+\text{更多 WW 剪枝}
+}
+$$
+
+这一过程持续到没有新事实、候选删除或 WW 定向为止。
+
+### 6.3 输出是更小的搜索问题，而不是完整答案
+
+到达固定点不代表已经决定所有事务顺序。例如仍可能存在：
+
+$$
+(b\prec g_1\prec r)\;\lor\;(b\prec g_2\prec r).
+$$
+
+两个候选都可行时，传播过程不能擅自选择其中一个；这个选择仍交给求解器。因此，该算法的职责是提前确定必然成立的事实、排除必然错误的分支，并保留真正无法确定的部分。
+
+一条已有实验记录将这种增量效果区分为：
+
+| 阶段 | WW choices |
+| --- | ---: |
+| 初始 | 112,032 |
+| WW reachability 之后 | 1,742 |
+| GMWR 之后 | 1,565 |
+
+该记录中的 `GMWR_TO_WW_FORCED=177` 对应最后一段额外定向，而不是把基础 WW 剪枝的全部收益也计入 GMWR。第一个算法贡献可以概括为：利用谓词观察强化 WW 推理，在进入完整求解之前缩小未决搜索空间。
+
+## 7. 核心算法二：因子化谓词编码与延迟物化
+
+### 7.1 为什么直接展开会产生冗余
+
+回到式（1）：
+
+$$
+(r\prec b)\;\lor\;\bigvee_g\bigl[(b\prec g)\land(g\prec r)\bigr].
+$$
+
+一个读取事务可能执行多个谓词，一个写事务也可能修改多个 key。于是多个语义义务会重复涉及同样的：
+
+$$
+r\prec b,
+\qquad
+b\prec g,
+\qquad
+g\prec r.
+$$
+
+如果逐个义务独立处理，就可能反复构造顺序表达式、覆盖条件和条件依赖；有些义务最后还会被已知事实完全解决。问题不只是最终出现重复边，而是在知道这些结构是否必要之前，就已经付出了展开和构造成本。
+
+### 7.2 第一层：把共享结构组织成 bundle
+
+假设多个义务具有相同的读取事务 $r$ 和 bad writer $b$。记：
+
+$$
+a=(r\prec b),
+$$
+
+并令 $R_i$ 表示第 $i$ 个义务自己的覆盖条件。它们原本是：
+
+$$
+(a\lor R_1)\land(a\lor R_2)\land\cdots\land(a\lor R_m).
+$$
+
+利用布尔等价关系：
+
+$$
+\boxed{
+\bigwedge_{i=1}^{m}(a\lor R_i)
+\equiv
+a\lor\bigwedge_{i=1}^{m}R_i
+} \tag{2}
+$$
+
+可以把它们组织成一个共享结构：要么整个写事务 $b$ 在读取之后；否则，它带来的每一项问题都必须分别得到修复。这就是 bundle 的核心含义：共享公共条件，同时保留各个 item 的独立语义。
+
+特别需要注意：
+
+$$
+a\lor(R_1\land R_2)
+$$
+
+不能改成：
+
+$$
+a\lor(R_1\lor R_2).
+$$
+
+后者只要求修复其中一个问题，会漏掉另一个 key 上的错误。同样，不同 item 可以由不同 good writer 修复，不能强行要求它们共享同一个 repair witness。
+
+### 7.3 第二层：删除重复和被包含的义务
+
+因子化之后，还可以在语义表示上继续化简。例如：
+
+$$
+C_1=a\lor x\lor y,
+\qquad
+C_2=a\lor x\lor y\lor z.
+$$
+
+因为：
+
+$$
+C_1\Rightarrow C_2,
+$$
+
+两者同时要求成立时，只保留 $C_1$ 即可。这里的 $x,y,z$ 可以代表完整的覆盖条件，例如：
+
+$$
+x=(b\prec g_1)\land(g_1\prec r).
+$$
+
+包含判断比较的必须是实际逻辑条件，不能仅凭两个候选列表的事务编号相似，就认定它们等价。已有运行记录中的 `BUNDLES`、`DUPLICATE_ITEM_CLAUSES`、`SUBSUMED_ITEM_CLAUSES` 和 `RESIDUAL_CLAUSES` 分别记录这些不同层次的数量，不能统称为“图边去重”。
+
+### 7.4 第三层：只物化化简后仍然需要的部分
+
+延迟物化的重点是改变构造顺序：
+
+```text
+直接展开：
+枚举候选
+  -> 构造完整公式和条件依赖
+  -> 后续处理再发现其中一部分不需要
+
+GMWR：
+建立语义义务和 bundle
+  -> 用已知顺序删除不可能的候选
+  -> 消解已满足义务、合并重复项、执行包含消除
+  -> 只为剩余部分构造 SAT 公式和必要的条件依赖
+```
+
+例如，一个义务最初包含：
+
+$$
+a\lor x_1\lor x_2\lor\cdots\lor x_{100}.
+$$
+
+假设化简证明其中 98 个覆盖候选不可能，最终只需要编码：
+
+$$
+a\lor x_7\lor x_{42}.
+$$
+
+若进一步证明 $a$ 已成立，这个剩余选择公式也不再需要；但使 $a$ 成立的必然顺序仍需保留，不能把它的语义一并删除。
+
+因此，延迟物化不是“少检查一些谓词”，也不必然意味着“等求解出错后再补约束”。它首先意味着：先在紧凑语义层完成能够完成的推理，再支付底层编码成本。
+
+### 7.5 为什么它不等于 witness coalescing 或 edge interning
+
+三者发生的位置和消除的冗余不同：
+
+| 技术 | 主要处理的对象 |
+| --- | --- |
+| GMWR 因子化与延迟物化 | 语义义务及其公式结构，避免不必要的展开 |
+| Witness coalescing | 多个 witness 对同一逻辑依赖的重复支持 |
+| Edge interning | 同一物理图中重复创建的边对象 |
+
+GMWR 可以让某些候选、公式和依赖从一开始就不被构造；后两者主要避免已经进入相应构造阶段的重复表示。所以第二个算法贡献应概括为：通过共享公共条件、消除冗余义务，并延迟实例化残余依赖，构造等价但更紧凑的谓词约束表示。
+
+## 8. 边的收集、合并和最终物化
+
+### 8.1 语义对象：`SEREdge`
 
 编码期的边对象包含：
 
@@ -292,7 +541,7 @@ keys
 
 非谓词依赖按同一个 guard 下的完整 `SEREdge` 去重。谓词依赖先用 `(from,to,type,key,guard identity)` 去掉完全重复的 witness，再进入 predicate candidate 队列。
 
-### 6.2 谓词 witness coalescing：按 `(from,to,type)`
+### 8.2 谓词 witness coalescing：按 `(from,to,type)`
 
 `prunePredicateDependencies` 的分组键明确包含 `type`：
 
@@ -325,7 +574,7 @@ guard = g1 OR g2
 
 这个内部设置是 `predicateWitnessCoalescing`，生产 G2/E2 均开启；隐藏参数 `--predicate-witness-coalescing` 仅供实验覆盖。WW constraint 始终由 `generateConstraintsCoalesce()` 按事务对合并。
 
-### 6.3 Serialization graph-edge interning：按 `(from,to)`
+### 8.3 Serialization graph-edge interning：按 `(from,to)`
 
 `encodeDependencyEdge` 最终把 typed edge 投影到 MonoSAT：
 
@@ -359,7 +608,7 @@ g2 -> E(a,b)
 
 <a id="711-紧凑编码的设计范围与处理范围"></a>
 
-### 6.4 为什么这种“省边”不改变判环
+### 8.4 为什么这种“省边”不改变判环
 
 对一个 SAT 模型 `M`，定义激活的语义依赖：
 
@@ -390,7 +639,7 @@ D_M 有有向环  <=>  π(D_M) 有有向环
 
 从 Adya 的语义记录看，typed witness 没有被改写；从 MonoSAT 的图论判环看，只需要每个激活的 `(from,to)` 一条边。这就是当前压缩成立的边界。
 
-## 7. 哪些边会被真正跳过
+## 9. 哪些边会被真正跳过
 
 除了平行边复用，当前代码还会跳过以下不需要物化的候选：
 
@@ -408,11 +657,11 @@ D_M 有有向环  <=>  π(D_M) 有有向环
 
 已知顺序的传递约简进入 `serializationGraph`。所有已知 typed dependencies 仍经过 `encodeKnownTypedEdges` 保留元数据并施加同方向的 serialization 约束；传递约简不会删除 logical dependency metadata。
 
-## 8. 当前开关、默认值和各自解决的问题
+## 10. 当前开关、默认值和各自解决的问题
 
 本节的“默认值”指 `audit` 命令的实际默认路径。CLI 会调用 `SolverSettings.forModes(...)`，而不是直接使用一个未初始化的裸 `SolverSettings` 对象。若测试或外部调用方自行 `new SolverSettings()` 且不再赋值，Java 的 boolean 字段初值是 `false`；这不是 `audit` CLI 的默认配置。
 
-### 8.1 不传任何可选参数时的实际配置
+### 10.1 不传任何可选参数时的实际配置
 
 ```text
 history type                    PRHIST
@@ -446,7 +695,7 @@ GMWR prepropagation            false
 
 WW reachability、predicate witness coalescing 和 graph-edge interning 仍开启。E1/G1 所需的物理展开或 one-way propagation 只通过隐藏 experimental flags 保留给 benchmark。
 
-### 8.2 两个物理压缩实验开关
+### 10.2 两个物理压缩实验开关
 
 下表 CLI 均为隐藏 experimental 参数；生产 G2/E2 不要求用户指定。
 
@@ -503,7 +752,7 @@ audit --graph-edge-interning history
 
 关闭后，Java 语义层没有变化，只是 MonoSAT 中重新出现同向平行边；预期 verdict 不变，native edge 数量和求解成本可能增大。
 
-### 8.3 隐藏实验 WW/RW pruning 开关
+### 10.3 隐藏实验 WW/RW pruning 开关
 
 | CLI | 默认 | 解决的问题 | 对 Adya 图的影响 |
 | --- | --- | --- | --- |
@@ -512,7 +761,7 @@ audit --graph-edge-interning history
 
 这些开关发生在 `SERSolverAR` 构造之前，主要减少残余 `SERConstraint`。它们不会把某种 typed edge 改成另一种类型。
 
-### 8.4 谓词编码模式
+### 10.4 谓词编码模式
 
 | CLI | 默认 | 解决的问题 | 保留的语义 |
 | --- | --- | --- | --- |
@@ -523,7 +772,7 @@ audit --graph-edge-interning history
 
 `predicateWitnessCoalescing` 与该模式独立，CLI 默认在 EAGER 和 GMWR 下都开启；不要把“选择 GMWR”误解为“才会开启 `(from,to,type)` witness 合并”。
 
-### 8.5 GMWR prepropagation 与 WW feedback
+### 10.5 GMWR prepropagation 与 WW feedback
 
 内部 `gmwrPrepropagation` 控制是否在 SAT 编码前运行 GMWR 化简；生产 G2 固定开启，`--[no-]gmwr-prepropagation` 仅为隐藏实验覆盖：
 
@@ -544,7 +793,7 @@ audit --graph-edge-interning history
 
 当前 `SERSolverAR` 中只有 `WW_GMWR` 会进入 `GmwrWwBridge`；`WW_ONLY` 和 `WW_GMWR_ONEWAY` 都不会反向物化 WW。并且只有 `predicate mode=GMWR` 时才会构造 GMWR propagation state。
 
-### 8.6 公开运行控制与隐藏实验开关
+### 10.6 公开运行控制与隐藏实验开关
 
 | CLI | 默认 | 作用 | 是否进入正常 Adya verdict 语义 |
 | --- | --- | --- | --- |
@@ -554,7 +803,7 @@ audit --graph-edge-interning history
 
 普通 `audit --help` 只展示以上三项。E1/G1 和剪枝消融使用的 `--ser-propagation-mode`、GMWR prepropagation、witness coalescing、edge interning 与 WW pruning 仍可解析，但均隐藏并标记 experimental。固定 backend/loader、旧谓词参数和诊断参数已经删除。
 
-### 8.7 如何通过隐藏实验参数验证某个压缩开关
+### 10.7 如何通过隐藏实验参数验证某个压缩开关
 
 若只想确认 `PR_WR/WR` 的 native edge 共享是否影响结果，应保持其他参数不变，只切换 graph-edge interning：
 
@@ -574,7 +823,7 @@ audit \
 
 前一组只隔离 `(from,to)` native edge 复用；后一组会同时扩大 predicate witness 队列和 MonoSAT native 图，不能把性能差异只归因于 graph-edge interning。
 
-## 9. 完整例子
+## 11. 完整例子
 
 假设事务 `A` 同时写 `k1/k2`，事务 `B` 的谓词读在两个 key 上都选择 `A` 为 source，并且 `B` 还有一个点读也读自 `A`：
 
@@ -621,7 +870,7 @@ g3 -> E(B,A)
 
 当 `g3=true` 时，`E(A,B)` 与 `E(B,A)` 构成二环，`serializationGraph.acyclic()` 会使该模型 UNSAT。这说明实现省掉的是平行表示，不是相反方向或新的可达关系。
 
-## 10. ACCEPT / REJECT 的准确含义
+## 12. ACCEPT / REJECT 的准确含义
 
 `ACCEPT` 表示存在一个 SAT 模型，使得：
 
@@ -636,7 +885,7 @@ g3 -> E(B,A)
 
 `REJECT` 表示内部一致性直接矛盾、pruning 已证明冲突，或者不存在同时满足上述条件的模型。`TIMEOUT` 与 `REJECT` 分开返回，不会把求解超时误报为不可串行化。
 
-## 11. 关键实现位置
+## 13. 关键实现位置
 
 | 文件 | 与 Adya 图相关的职责 |
 | --- | --- |

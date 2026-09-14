@@ -119,6 +119,8 @@ hist-00000/
 {"session":0,"session_seq":1,"txn":1001,"status":"commit","ops":[{"type":"r","key":"kv:0","value":0},{"type":"w","key":"kv:0","value":10}]}
 ```
 
+`session_seq` 是必填的 long 整数，同一 session 内不得重复。loader 先读取并验证所有事务头，再按 `session -> session_seq` 建立会话顺序；JSONL 行序和 `txn` 编号不参与会话排序。
+
 支持的操作类型：
 
 - `r`：点读，包含 `key` 和读到的 `value`。
@@ -167,22 +169,18 @@ select.distinct
 
 ## 运行单个历史
 
-先构建 jar，然后运行：
+先构建 jar，然后运行唯一的检测入口：
 
 ```bash
 cd SI/si-result-detector
 java -Djava.library.path=build/monosat -Xmx8g \
   -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
-  audit -t PRHIST /absolute/path/to/hist-00000
-```
-
-`-t PRHIST` 可以省略，因为默认类型就是 PRHIST：
-
-```bash
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
   audit /absolute/path/to/hist-00000
 ```
+
+输入固定为紧凑 PRHIST，求解后端固定为 MonoSAT。主入口不再提供
+`constraint-stat`、`stat`、`dump`，也不再接受单选的 `--type` 或
+`--solver`。
 
 SI detector 正常运行时会打印：
 
@@ -190,58 +188,48 @@ SI detector 正常运行时会打印：
 Mode: SI, solving Adya typed dependency graphs A/B and checking the induced SI graph
 ```
 
-如果输出里出现 `Mode: SER`，说明当前命令使用的是 SER jar，而不是 SI jar。
-
 输出末尾会包含稳定 verdict 标记：
 
 ```text
 [[[[ ACCEPT ]]]]
 [[[[ REJECT ]]]]
+[[[[ TIMEOUT ]]]]
 ```
-
-含义：
 
 - `ACCEPT`：存在一个满足点读、写入和谓词读可见性的 SI 解释。
 - `REJECT`：当前历史在检测器模型下不存在合法 SI 解释。
+- `TIMEOUT`：MonoSAT 在配置的求解期限内没有完成，退出码为 124。
 
-`REJECT` 时程序返回非零退出码；如果在 shell 脚本里批量跑，需要用输出标记判断结果。
+## audit 参数
 
-## 常用 audit 参数
+普通 `audit --help` 公开：
 
 ```text
---pruning-mode NONE|REACHABILITY|SNAPSHOT|PRUN
-    选择 WW/RW 剪枝模式，默认 REACHABILITY。
-
---no-pruning
-    强制使用 NONE；优先级高于 --pruning-mode。
-
---no-coalescing
-    关闭相同事务对上的 WW choice 合并。用于调试约束规模。
-
---dot-output
-    以 DOT 格式输出冲突图，便于可视化。
-
---compare-derived-predicate-edges
-    额外打印按旧方式派生的 PR_WR / PR_RW 边数量。当前 SAT 求解不会依赖这些派生边。
-
---solver monosat
-    指定 SAT solver 后端。当前只支持 monosat。
+--solver-timeout-seconds
+    MonoSAT 求解与 refinement 的总超时秒数；0 禁用后端超时。
 
 --solver-stats
-    打印 SAT 后端标识，并启用详细谓词编码计数。
-
---solver-timeout-seconds
-    当前仅完成 CLI 参数解析，尚未传入 MonoSAT 后端，不能作为已生效的超时机制。
+    打印 MonoSAT/CNF、谓词编码、WW constraint 和 implication 统计。
 ```
 
-四种剪枝模式的含义：
+当前 SI 谓词编码固定为 EAGER/general refinement。row-local EAGER 使用
+`ENCODED/UNSUPPORTED/INVALID` 三态：只有 `UNSUPPORTED` 转 general，`INVALID`
+直接加入矛盾约束。`--predicate-encoding`
+将在 SI 的 GMWR 实现接入后再公开；当前不会把未完成的 GMWR 作为默认值或
+可选值。
 
-- `NONE`：不预先固定 WW 方向，全部交给 MonoSAT。
-- `REACHABILITY`：逐个试加 constraint 两侧的 typed edges，以 `A ∪ (A ∘ B)` 是否成环固定单侧可行的方向。
-- `SNAPSHOT`：只执行共享快照传播；快照闭包只使用 A，可推出的 RW 仍写入 B。
-- `PRUN`：在 SNAPSHOT 传播基础上，再执行 induced-graph 分支剪枝。
+实验消融参数仍可解析，但在帮助中隐藏：
 
-未在剪枝阶段拒绝的历史，最终都由同一个 `SISolverInduced` 完成 typed-edge 编码和 induced-graph 判定；剪枝只减少待求解的 WW choices，不改变图语义。
+```text
+--ww-pruning NONE|REACHABILITY
+--[no-]predicate-witness-coalescing
+--[no-]graph-edge-interning
+```
+
+`REACHABILITY` 是正式 WW 基线：每个候选分支仍由
+`SIVerifier.InducedGraph.Oracle` 按 `A ∪ (A ∘ B)` 检查；`NONE`
+仅用于跳过这一步的必要消融。WW constraint 始终按 writer transaction pair
+合并，predicate witness coalescing 和 graph-edge interning 默认开启。
 
 求解器构造分为六个可单独计时的阶段：
 
@@ -254,22 +242,19 @@ SI_GRAPH_ENCODE_PREDICATE
 SI_GRAPH_ENCODE_ACYCLIC
 ```
 
-其中 WW 阶段只编码分支的 WW 方向，普通 RW 在下一阶段由 `readFrom + wwOrder` 统一生成。运行时输出的 `Predicate source constraints` 表示 external `(predicate read,key)` frontier 约束数，不是谓词读事件数。
+`--solver-stats` 会同时输出
+`WW_INITIAL_CONSTRAINTS`、`WW_AFTER_BASELINE`、
+`WW_INITIAL_IMPLICATIONS` 和 `WW_AFTER_BASELINE_IMPLICATIONS`；
+不再需要独立 constraint-only 加载和遍历。REJECT 使用统一的文本 cycle
+witness，不再提供 DOT/legacy 两套输出。
 
-结构化谓词会按 SAT 模型构造 latest-visible 快照并执行完整查询。错误的 JOIN、投影、重复行或遗漏行都会被拒绝；改变查询结果的后续写会生成相应的 `PR_RW` anti-dependency。
+结构化谓词会按 SAT 模型构造 latest-visible 快照并执行完整查询。错误的 JOIN、
+投影、重复行或遗漏行都会被拒绝；改变查询结果的后续写会生成相应的
+`PR_RW` anti-dependency。谓词依赖只由实际 MonoSAT 编码路径产生，不再额外
+构造或比较 debug-only 派生谓词图。
 
-谓词编码分为两条路径：row-local `QueryPlan` 在求解前逐 key EAGER 编码；JOIN、`DISTINCT` 等 general query 预先编码带 frontier guard 的 `PR_WR/PR_RW`，求解后只对不匹配的完整快照加入 no-good clause。谓词边不是诊断标签：它们通过统一 typed-edge 入口进入 A/B，并实际参与冲突判断。
-
-示例：
-
-```bash
-java -Djava.library.path=build/monosat -Xmx12g \
-  -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
-  audit --compare-derived-predicate-edges --solver-stats \
-  ../../predicateHistories/kvpredicate/kvpredicate_repeatable_read_write_skew1_20260706/hist-00000
-```
-
-当前 SI detector 也可直接审计 `History_Generator` 生成的结构化 MultiKV JOIN 历史：
+当前 SI detector 也可直接审计 `History_Generator` 生成的结构化 MultiKV
+JOIN 历史：
 
 ```bash
 java -Djava.library.path=build/monosat -Xmx12g \
@@ -277,39 +262,8 @@ java -Djava.library.path=build/monosat -Xmx12g \
   audit ../../predicateHistories/multikv/<case>/hist-00000
 ```
 
-TPC-C StockLevel 当前仍输出 SQL 文本而不是结构化 `query`，因此不属于已完整支持的输入。
-
-当前 SI 未引入 SER 的 GMWR 路径；谓词求解保持 EAGER/general refinement。general 路径在全部 scope key 都为 INTERNAL 时不会创建 `PredicateCheck`：非 row-local 查询不会再次执行完整 JOIN/`DISTINCT` snapshot 求值；row-local 查询若 EAGER 校验失败后回退到该路径，也存在同一跳过边界。
-
-## 查看统计和 dump
-
-只统计剪枝前后约束规模、不启动最终 MonoSAT 求解：
-
-```bash
-cd SI/si-result-detector
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
-  constraint-stat --pruning-mode PRUN /absolute/path/to/hist-00000
-```
-
-输出字段包括 `constraints_before/after`、`implications_before/after`、内部一致性和剪枝冲突状态。
-
-统计历史规模：
-
-```bash
-cd SI/si-result-detector
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
-  stat /absolute/path/to/hist-00000
-```
-
-打印 loader 解析后的事务和操作：
-
-```bash
-java -Djava.library.path=build/monosat -Xmx8g \
-  -jar build/libs/si-result-detector-1.0.0-SNAPSHOT.jar \
-  dump /absolute/path/to/hist-00000
-```
+TPC-C StockLevel 当前仍输出 SQL 文本而不是结构化 `query`，因此不属于已完整
+支持的输入。
 
 ## 批量审计历史目录
 

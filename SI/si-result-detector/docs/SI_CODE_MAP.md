@@ -9,7 +9,7 @@ InducedSI = A ∪ (A ∘ B)
 verdict = InducedSI 是否存在无环的 WW / predicate-source assignment
 ```
 
-审计日期：2026-09-11。
+审计日期：2026-09-13。
 
 ## 1. 可执行入口与最终结果
 
@@ -19,9 +19,9 @@ verdict = InducedSI 是否存在无环的 WW / predicate-source assignment
 | --- | --- | --- |
 | `Main.main()` | Picocli -> `Audit.call()` | 进程退出码与 marker。 |
 | `audit` | loader -> `SIVerifier.auditResult()` | `ACCEPT=0`、`REJECT=-1`、`TIMEOUT=124`。 |
-| `constraint-stat` | `SIVerifier.analyzeConstraintsOnly()` | 剪枝前后 WW constraint/implication 数，不启动 MonoSAT。 |
-| `stat` | loader -> history 统计 | session、transaction、event、key 写频率。 |
-| `dump` | loader -> transaction/event 遍历 | 文本 history。 |
+
+输入固定为 PRHIST，backend 固定为 MonoSAT。主入口不再保留独立的
+`constraint-stat`、`stat`、`dump` 加载/遍历路径。
 
 `SIVerifier.audit()` 是兼容旧调用方的 boolean 包装：只有 `ACCEPT` 返回 true；CLI 和需要区分超时的调用方使用 `auditResult()`。
 
@@ -85,8 +85,7 @@ loader 仍拒绝旧 source metadata 字段。point/predicate source 解析依赖
 | --- | --- | --- |
 | `verifier/SIEdge.java` | `SIEdge` | `(from,to,type,keys)` typed logical edge；可保留多个 witness key。 |
 | `verifier/SIConstraint.java` | `SIConstraint` | `edges1 OR edges2` 的 writer-order 二选一。 |
-| `verifier/SIVerifier.java` | `generateConstraintsCoalesce()` | 默认将同一 writer transaction pair 的多 key 方向合并。 |
-| 同上 | `generateConstraintsNoCoalesce()` | `--no-coalescing` 的非合并生成。 |
+| `verifier/SIVerifier.java` | `generateConstraintsCoalesce()` | 将同一 writer transaction pair 的多 key 方向合并；主路径固定使用。 |
 
 constraint 生成复杂度主要为每个 key 的 writer pair 与 `WR × competing writer`：
 
@@ -116,21 +115,8 @@ KnownGraph A/B
 
 旧实现为每个 branch 重建 `History -> KnownGraph -> Guava graph -> MatrixGraph`；当前 oracle 只复制紧凑 `BitSet[]`。它不是 SER 的 A+B reachability oracle：SI 必须显式保持 A/B 分区并检查 `A∘B`。
 
-### 6.2 SNAPSHOT / PRUN
-
-文件：`src/main/java/verifier/Prun.java`
-
-| 函数 / 结构 | 作用 |
-| --- | --- |
-| `pruneSnapshotOnly()` | shared-snapshot fixed point，不做通用 branch 双侧试加。 |
-| `prune()` | 在 shared-snapshot fixed point 前加入 SI induced branch pruning。 |
-| `buildFixedObservations()` | 收集 point WR 与 external recorded predicate tuple source。 |
-| `buildSharedLowerBounds()` | 组合 reader 的 A-predecessors、source 及 source predecessors。 |
-| `IncrementalOrder` | 只维护 A 的 direct/reachability/predecessor BitSet。 |
-| `resolveInducedConstraints()` | 复用同一个 SI `InducedGraph.Oracle` 检查并提交 branch。 |
-| `resolveSnapshotConstraints()` | 将本轮 shared-snapshot 推出的 writer direction 物化到 A/B。 |
-
-关键边界：snapshot visibility 只读取 A reachability；RW/PR_RW 仍属于 B，不能放入 A closure。当前实现也处理“本轮没有新增 order、但已有 snapshot writer direction 可以解决 constraint”的收尾分支。
+`NONE` 只跳过上述调用；`Pruning` 本身不再使用进程级静态 enable
+开关。旧 `SNAPSHOT/PRUN` 分派与 `Prun.java` 已删除。
 
 ## 7. SISolverInduced 编码顺序
 
@@ -257,15 +243,13 @@ timeout 从 `solveStatus()` 开始计时，不覆盖 parse、consistency、pruni
 
 | CLI | 默认 | 消费位置 |
 | --- | --- | --- |
-| `--pruning-mode` | `REACHABILITY` | `SIVerifier.auditResult()`。 |
-| `--no-pruning` | false | 覆盖 pruning mode 为 NONE。 |
-| `--no-coalescing` | false | ordinary WW constraint generation。 |
-| `--[no-]predicate-witness-coalescing` | true | PR_WR/PR_RW typed witness 合并。 |
-| `--[no-]graph-edge-interning` | true | 两张 MonoSAT 图各自的 endpoint edge 复用。 |
 | `--solver-timeout-seconds` | 600 | solve/refinement 总 backend deadline；0 禁用。 |
 | `--solver-stats` | false | 输出详细 predicate/physical edge/CNF counts。 |
-| `--dot-output` | false | REJECT 诊断格式。 |
-| `--compare-derived-predicate-edges` | false | 只运行 diagnostic predicate edge derivation。 |
+
+隐藏实验参数为 `--ww-pruning NONE|REACHABILITY`、
+`--[no-]predicate-witness-coalescing` 和 `--[no-]graph-edge-interning`。
+当前谓词编码固定为 EAGER/general refinement；SI GMWR 接入前不公开
+`--predicate-encoding`。
 
 ## 13. Statistics / timing
 
@@ -290,7 +274,10 @@ SI_GRAPH_SOLVE
   SI_GRAPH_CONFLICT_EXTRACTION
 ```
 
-counts 包含 initial/residual WW、SAT variables/clauses、predicate candidates/physical/coalesced edges、dep/induced physical edge 数、frontier、cache、blocking clause 等。
+counts 包含 `WW_INITIAL_CONSTRAINTS/WW_AFTER_BASELINE`、
+`WW_INITIAL_IMPLICATIONS/WW_AFTER_BASELINE_IMPLICATIONS`、SAT
+variables/clauses、predicate candidates/physical/coalesced edges、dep/induced
+physical edge 数、frontier、cache、blocking clause 等。
 
 ## 14. 与 SER 的明确边界
 
@@ -302,4 +289,3 @@ counts 包含 initial/residual WW、SAT variables/clauses、predicate candidates
 - SI 的 B edge 不能直接折叠到 A/reachability；
 - SER GMWR obligation 和 WW feedback 建立在 serial-order 关系上，直接移植会拒绝 SI 允许的 write skew；
 - SI graph interning 需要 support 反向约束，因为 A reachability 本身是 predicate visibility 的语义输入。
-

@@ -2,9 +2,15 @@
 
 ## 1. 文档范围与结论
 
-本文描述 `SI/si-result-detector` 在 2026-09-11 当前工作树中的真实实现。依据是 CLI、loader、history、A/B typed dependency、四种 pruning、`SISolverInduced`、MonoSAT Java/JNI/C++ 接口以及当前测试，而不是从论文或 SER 实现推测不存在的步骤。
+本文描述 `SI/si-result-detector` 在 2026-09-13 当前工作树中的真实实现。依据是单一 audit CLI、loader、history、A/B typed dependency、WW reachability pruning、`SISolverInduced`、MonoSAT Java/JNI/C++ 接口以及当前测试，而不是从论文或 SER 实现推测不存在的步骤。
 
 结论先行：当前主链为“PRHIST 解析 → 内部一致性门禁 → ABSENT 初始版本补全 → SO/point-WR `KnownGraph` → ordinary WW/RW 二选一 → 可选的 SI-aware pruning → staged MonoSAT encoding → row-local EAGER/general predicate constraints → predicate witness 合并 → 两张物理图的 endpoint edge 复用 → `InducedSI` 无环求解 → general query refinement → ACCEPT/REJECT/TIMEOUT”。
+
+CLI 只有 `audit HISTORY`。公开参数是 `--solver-timeout-seconds` 和
+`--solver-stats`；`--ww-pruning NONE|REACHABILITY`、predicate witness
+coalescing 与 graph-edge interning 的消融开关隐藏。输入/backend 固定，谓词
+编码在 SI GMWR 接入前固定为 EAGER/general refinement，因此尚不公开
+`--predicate-encoding`。
 
 最终公式不是 SER 的 total serialization order，也不是简单的 `A∪B` 无环：
 
@@ -35,11 +41,8 @@ Main.main
            -> History.ensureInitialVersions
            -> SO / point-WR / predicate observations
         -> generateConstraintsSI
-        -> pruning
-           NONE
-           or REACHABILITY: InducedGraph.Oracle
-           or SNAPSHOT: Prun shared-snapshot
-           or PRUN: shared-snapshot + InducedGraph.Oracle
+        -> WW pruning from this audit's SolverSettings
+           NONE or REACHABILITY: InducedGraph.Oracle
         -> new SISolverInduced
            -> create dep/induced nodes
            -> known A/B edges
@@ -109,14 +112,15 @@ Induced(x,y, ga AND gb)
 | 输入 | history 目录或 `history.prhist.jsonl`；同目录需要 `initial_state.json`。 |
 | 输出 | `History<String,PredicateValue>`。 |
 | 核心结构 | Jackson `JsonNode`、`History/Session/Transaction/Event`、`QueryPlan`。 |
-| 入口 | `Main.Utils.getLoader()`、`PredicateHistoryLoader.loadHistory()`。 |
+| 入口 | `Audit.call()` 直接构造 `PredicateHistoryLoader`，随后调用 `loadHistory()`。 |
 | 确定性 | 完全确定；非法结构抛 `InvalidHistoryError`/`Error`。 |
 | graph/literal | 不产生。 |
 | 复杂度 | 与输入 JSON 节点数线性相关；query AST canonicalization 与 query 大小相关。 |
 
 输入契约：
 
-- 当前 `HistoryType` 只有 PRHIST；
+- audit 输入固定为 PRHIST；
+- transaction 必须携带可转换为 long 的整数 `session_seq`，同一 session 内不得重复；loader 在解析操作前按 `session -> session_seq` 排序，JSONL 行序与 `txn` 编号不参与 SO；
 - transaction 只接受 `status=commit`；
 - operation 只接受 `w/r/pr`；
 - `pr` 使用 `query + result`，旧 `predicate/results` 不在生产 loader 中接受；
@@ -225,7 +229,7 @@ S --WW(k)--> W
 R --RW(k)--> W
 ```
 
-默认 coalescing 使相同 writer transaction pair 跨 key 共用一个 direction choice。关闭时产生更细粒度 constraints，但最终 verdict 应保持一致。
+WW constraint coalescing 固定开启：相同 writer transaction pair 跨 key 共用一个 direction choice，不再保留旧的非合并生成路径。
 
 ### 4.6 REACHABILITY pruning
 
@@ -249,28 +253,7 @@ InducedGraph.Oracle {
 
 设真实 transaction 数为 T。每次 branch 不再付出 history/Guava object 重建成本，矩阵复制空间为 O(T²/word)，composition 与拓扑检查由实际 BitSet density 决定。它是精确替换，不把 B 错当成 A。
 
-### 4.7 SNAPSHOT / PRUN
-
-二者共享 `Prun.java` 的 fixed point：
-
-```text
-fixed observations
-  -> A predecessors
-  -> shared lower bounds per reader
-  -> source/competitor writer order
-  -> selected SIConstraint branch materialization
-```
-
-固定 observation 来源：point `readFrom` 与 external recorded predicate tuple sources；同 `(reader,key)` 多 source 时标为 ambiguous 并不作为 fixed seed。
-
-`IncrementalOrder` 只接受 A edge。对 observation `(R,k,S)` 和 competing writer C：
-
-- 若 C 已在 R 的 shared lower bound 内，则要求 `C <A S`；
-- 若 `S <A C`，则 C 必须位于 R 之后，对应的 ordinary anti-dependency仍写入 B，而不是加入 A closure。
-
-SNAPSHOT 只使用这些 snapshot-derived writer directions。PRUN 在每轮开始额外用同一个 SI `InducedGraph.Oracle` 对 residual branch 做双侧可行性消解。
-
-### 4.8 Solver setup、known edges 与 WW
+### 4.7 Solver setup、known edges 与 WW
 
 bottom transaction 不创建 MonoSAT node。每个 real transaction 在两张图各创建一个 node。
 
@@ -304,13 +287,15 @@ guard = WW(source,W,k)
 
 ### 4.10 Predicate EAGER
 
-row-local query 的主要公式：
+row-local encoder 返回 `ENCODED/UNSUPPORTED/INVALID`：已编码直接结束，只有不支持的形态进入 general/refinement，recorded snapshot 本身不匹配则加入矛盾约束，不再 fallback。
+
+EAGER、source witness、general refinement 和 blocking clause 共用 `LatestVisibleChecker`。辅助层只组合公式，两个基础 literal 由 SI 提供：`Visible` 使用 `depGraph.reaches(writer,reader)`，`WW` 使用该 key 的 `wwOrderLiteral`，不引入 SER serialization order：
 
 ```text
-bad writer b:
-  NOT Visible(b)
-  OR EXISTS good writer g:
-       Visible(g) AND WW(b,g,key)
+Latest(w,key,reader) = Visible_reader(w)
+                         AND ∧u!=w NOT(Visible_reader(u) AND WW_key(w,u))
+
+bad writer b: NOT Latest(b,key,reader)
 ```
 
 recorded source 固定 source 候选，并产生 fixed/guarded PR_WR 与 later-writer PR_RW。INTERNAL key 使用事件位置决定的 self write，不建立跨 transaction PR_WR。
@@ -441,7 +426,7 @@ flowchart LR
 
 | 机制 | 运行位置 | 输入 | 输出 |
 | --- | --- | --- | --- |
-| Checker pruning | `Pruning/Prun`，solver 前 | fixed A/B、WW constraints、fixed observations | forced branch 或 conflict。 |
+| Checker pruning | `Pruning`，solver 前 | fixed A/B、WW constraints | forced branch 或 conflict。 |
 | SAT Boolean propagation | MonoSAT CDCL | `f/not(f)`、AND/OR、support equivalence、blocking clause | literal assignment/conflict。 |
 | Graph theory propagation | MonoSAT graph solver | active dep/induced edge literals、reachability、acyclicity | reachability truth、cycle conflict reason。 |
 
@@ -480,8 +465,7 @@ REJECT 后：
 
 1. 若 known graph 单独 UNSAT，`InducedGraph.extractCycleEdges()`尝试把 induced cycle 还原为 direct A 或 A+B 两段 witness；
 2. 否则 `extractConflicts()`对 residual WW constraints 做贪心删除，每次构造不收集嵌套冲突的 solver；
-3. 输出 supporting known edges、WW choices、predicate-derived cycle labels；
-4. `--dot-output` 可切换 DOT 格式。
+3. 输出统一的文本 cycle witness，包含 supporting known edges、WW choices 与 predicate labels。
 
 TIMEOUT 清空 conflict collections并跳过上述过程，避免把“未完成求解”误报为已证明 UNSAT。
 
@@ -505,6 +489,7 @@ TIMEOUT 清空 conflict collections并跳过上述过程，避免把“未完成
 主要 counts：
 
 - `WW_INITIAL_CONSTRAINTS/WW_BASELINE_FORCED/WW_AFTER_BASELINE`；
+- `WW_INITIAL_IMPLICATIONS/WW_AFTER_BASELINE_IMPLICATIONS`；
 - residual WW choice variables/constraints 与 `solver.nVars()/nClauses()`；
 - predicate observations、scoped keys、frontiers/candidates、bad writes；
 - dependency witness candidates、typed physical edges、coalesced count；
@@ -523,7 +508,6 @@ TIMEOUT 清空 conflict collections并跳过上述过程，避免把“未完成
 | KnownGraph | O(T+E+PK/word)；write/source indexes 与 observations。 |
 | WW candidate | O(Σwk² + ΣWRk·wk)。 |
 | compact branch check | 每侧 clone O(T²/word)，A∘B 与 topo 取决于 density；无 history/Guava 重建。 |
-| shared-snapshot | A closure空间 O(T²/word)，增量 edge 最坏 O(T²/word)。 |
 | solver encoding | 与 logical candidates、A/B composable pairs、frontiers相关。 |
 | predicate coalescing | candidate 数期望线性 hash grouping。 |
 | graph interning | native edges 上界从 logical edge 数降到每图 unique endpoint pair 数。 |
@@ -538,7 +522,7 @@ TIMEOUT 清空 conflict collections并跳过上述过程，避免把“未完成
 3. timeout 从 solve 开始，不是端到端 wall-clock 限制；UNSAT conflict extraction当前使用无 deadline的诊断 solver。
 4. SAT 后不会输出完整 WW/source model，也不会把 model-selected edges写回 KnownGraph。
 5. predicate witness coalescing 保留 keys，但 native graph edge只保留 endpoints；type/key-sensitive diagnosis仍依赖 Java logical provenance和固定图。
-6. `InducedGraph` 中旧 MatrixGraph helpers继续用于 diagnostics与 predicate diagnostic derivation；生产 pruning branch check已改走 BitSet oracle。
+6. `InducedGraph` 中的 MatrixGraph helpers仍用于必要的 induced-cycle extraction；生产 pruning branch check走 BitSet oracle。
 7. GMWR/AR total-order propagation未进入 SI。若未来要加入，必须先给出针对 `A ∪ (A∘B)` 的 SI 证明，不能复用 SER 的 serial-order soundness。
 
 ## 16. 四张总览图
@@ -553,7 +537,7 @@ flowchart TD
     D --> E[Utils consistency]
     D --> F[KnownGraph A/B]
     D --> G[SIConstraint generation]
-    G --> H[Pruning or Prun]
+    G --> H[WW reachability pruning]
     F --> H
     H --> I[SISolverInduced]
     I --> J[depGraph A]
@@ -649,7 +633,6 @@ flowchart TB
 | WW candidate | `src/main/java/verifier/SIVerifier.java` | `generateConstraintsSI()` |
 | Reachability pruning | `src/main/java/verifier/Pruning.java` | `pruneConstraints()` |
 | SI branch oracle | `src/main/java/verifier/SIVerifier.java` | `InducedGraph.Oracle` |
-| Snapshot/PRUN | `src/main/java/verifier/Prun.java` | `prune/pruneSnapshotOnly()` |
 | Solver | `src/main/java/verifier/SISolverInduced.java` | constructor、`solveStatus()` |
 | Predicate | 同上 | `encodePredicateConstraints()`、`refinePredicateConstraints()` |
 | Compression | 同上 | `encodePredicateDependencies()`、`bindGraphEdge()`、`sealInternedGraphEdges()` |
@@ -658,4 +641,3 @@ flowchart TB
 ## 18. 最终回答
 
 当前 SI checker 已不再停留在“每个 pruning branch 复制整图、timeout 被 boolean 吞并、predicate edge逐 witness/native edge膨胀”的早期结构。它吸收了 SER 中与隔离级别无关的输入、求解和压缩改进，同时把关键部分改写为 SI-specific 版本：pruning精确检查 `A ∪ (A∘B)`，B不进入A reachability；物理 edge interning使用完整 support等价，避免虚假 A reachability；最终只对 induced graph断言无环。这个边界保证优化减少 Java构图与MonoSAT物理规模，但不把SI历史按SER total order误拒绝。
-

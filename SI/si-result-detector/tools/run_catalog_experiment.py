@@ -35,9 +35,14 @@ COUNT_RES = {
     "sessions_count": re.compile(r"Sessions count:\s*([0-9]+)"),
     "transactions_count": re.compile(r"Transactions count:\s*([0-9]+)"),
     "events_count": re.compile(r"Events count:\s*([0-9]+)"),
-    "mandatory_known_edges": re.compile(r"Mandatory known precedence edges:\s*([0-9]+)"),
     "unresolved_ww_choices": re.compile(r"Unresolved WW choices:\s*([0-9]+)"),
-    "conditional_ar_implications": re.compile(r"Conditional AR implications:\s*([0-9]+)"),
+    "conditional_dependency_implications": re.compile(
+        r"Conditional dependency implications:\s*([0-9]+)"),
+    "ww_initial_constraints": re.compile(r"WW_INITIAL_CONSTRAINTS:\s*([0-9]+)"),
+    "ww_after_baseline": re.compile(r"WW_AFTER_BASELINE:\s*([0-9]+)"),
+    "ww_initial_implications": re.compile(r"WW_INITIAL_IMPLICATIONS:\s*([0-9]+)"),
+    "ww_after_baseline_implications": re.compile(
+        r"WW_AFTER_BASELINE_IMPLICATIONS:\s*([0-9]+)"),
 }
 MAX_MEMORY_RE = re.compile(r"Max memory:\s*(.+)")
 
@@ -188,21 +193,13 @@ def run_case(case: Dict[str, Any], args: argparse.Namespace, output_root: pathli
         "-jar",
         str(args.jar),
         "audit",
-        "-t",
-        args.history_type,
-        "--solver",
-        args.solver,
         "--solver-timeout-seconds",
         str(args.solver_timeout_seconds),
+        "--ww-pruning",
+        args.ww_pruning,
     ]
     if args.solver_stats:
         cmd.append("--solver-stats")
-    if args.no_pruning:
-        cmd.append("--no-pruning")
-    if args.no_coalescing:
-        cmd.append("--no-coalescing")
-    if args.compare_derived_predicate_edges:
-        cmd.append("--compare-derived-predicate-edges")
     cmd.append(str(hist_dir))
 
     started = dt.datetime.now(dt.timezone.utc)
@@ -274,8 +271,10 @@ def write_results(output_root: pathlib.Path, results: List[Dict[str, Any]], conf
 
     paper_fields = [
         "suite", "case", "expected_verdict", "manifest_expected_verdict", "actual_verdict", "matched_expected",
-        "transactions_count", "events_count", "mandatory_known_edges",
-        "unresolved_ww_choices", "conditional_ar_implications",
+        "transactions_count", "events_count", "unresolved_ww_choices",
+        "conditional_dependency_implications", "ww_initial_constraints",
+        "ww_after_baseline", "ww_initial_implications",
+        "ww_after_baseline_implications",
         "time_entire_experiment_ms", "time_oneshot_cons_ms",
         "time_si_prune_ms", "time_oneshot_solve_ms",
         "elapsed_wall_ms", "max_memory",
@@ -324,17 +323,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Extra JVM option; repeat for multiple options")
     parser.add_argument("--monosat-native-dir", type=pathlib.Path, default=DEFAULT_MONOSAT_NATIVE_DIR,
                         help="Directory containing MonoSAT native library, e.g. libmonosat.so")
-    parser.add_argument("--solver", default="monosat", help="SI solver backend")
     parser.add_argument("--solver-timeout-seconds", type=int, default=1800,
                         help="Timeout passed to the solver backend")
     parser.add_argument("--timeout-seconds", type=int, default=2100,
                         help="Wall-clock timeout per case enforced by this runner")
-    parser.add_argument("--history-type", default="prhist", help="History type passed to audit")
     parser.add_argument("--solver-stats", action="store_true", help="Print and parse solver stats when supported")
-    parser.add_argument("--no-pruning", action="store_true", help="Pass --no-pruning")
-    parser.add_argument("--no-coalescing", action="store_true", help="Pass --no-coalescing")
-    parser.add_argument("--compare-derived-predicate-edges", action="store_true",
-                        help="Pass --compare-derived-predicate-edges")
+    parser.add_argument("--ww-pruning", choices=("NONE", "REACHABILITY"), default="REACHABILITY",
+                        help="Hidden detector WW-pruning ablation")
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N catalog cases")
     parser.add_argument("--fail-fast", action="store_true", help="Stop after first mismatch, runtime error, or timeout")
     return parser.parse_args(argv)
@@ -378,14 +373,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "heap": args.heap,
         "stack": args.stack,
         "jvm_opt": args.jvm_opt,
-        "solver": args.solver,
         "solver_timeout_seconds": args.solver_timeout_seconds,
         "runner_timeout_seconds": args.timeout_seconds,
-        "history_type": args.history_type,
         "solver_stats": args.solver_stats,
-        "no_pruning": args.no_pruning,
-        "no_coalescing": args.no_coalescing,
-        "compare_derived_predicate_edges": args.compare_derived_predicate_edges,
+        "ww_pruning": args.ww_pruning,
     }
     dump_json(output_root / "config.json", config)
     dump_json(output_root / "machine.json", machine_info(args.java, args.jar))

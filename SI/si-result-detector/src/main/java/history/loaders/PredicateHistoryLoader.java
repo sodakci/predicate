@@ -18,9 +18,13 @@ import java.io.File;
 import java.io.FileReader;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import lombok.EqualsAndHashCode;
 import lombok.SneakyThrows;
 
@@ -59,14 +63,29 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
         var history = new History<String, PredicateValue>();
         loadInitialState(history);
 
+        var transactions = new ArrayList<ParsedTransaction>();
+        var sessionSequences = new HashMap<Long, Set<Long>>();
         try (var in = new BufferedReader(new FileReader(historyFile))) {
             String line;
             while ((line = in.readLine()) != null) {
                 if (line.isBlank()) {
                     continue;
                 }
-                parseTransaction(history, objectMapper.readTree(line));
+                var parsed = parseTransactionHeader(objectMapper.readTree(line));
+                if (!sessionSequences
+                        .computeIfAbsent(parsed.sessionId, ignored -> new HashSet<>())
+                        .add(parsed.sessionSeq)) {
+                    throw new InvalidHistoryError();
+                }
+                transactions.add(parsed);
             }
+        }
+
+        transactions.sort(Comparator
+                .comparingLong((ParsedTransaction txn) -> txn.sessionId)
+                .thenComparingLong(txn -> txn.sessionSeq));
+        for (var transaction : transactions) {
+            parseTransaction(history, transaction);
         }
 
         return history;
@@ -97,14 +116,24 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
         initTxn.setStatus(Transaction.TransactionStatus.COMMIT);
     }
 
-    private void parseTransaction(History<String, PredicateValue> history, JsonNode txnNode) {
+    private ParsedTransaction parseTransactionHeader(JsonNode txnNode) {
+        var sessionId = requiredLong(txnNode, "session");
+        var txnId = requiredLong(txnNode, "txn");
+        return new ParsedTransaction(
+                txnNode, sessionId, txnId,
+                requiredSessionSeq(txnNode));
+    }
+
+    private void parseTransaction(
+            History<String, PredicateValue> history, ParsedTransaction parsed) {
+        var txnNode = parsed.node;
         var status = requiredText(txnNode, "status");
         if (!"commit".equalsIgnoreCase(status)) {
             throw new InvalidHistoryError();
         }
 
-        var sessionId = requiredLong(txnNode, "session");
-        var txnId = requiredLong(txnNode, "txn");
+        var sessionId = parsed.sessionId;
+        var txnId = parsed.txnId;
         var session = history.getSession(sessionId);
         if (session == null) {
             session = history.addSession(sessionId);
@@ -285,6 +314,14 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
         return child.asLong();
     }
 
+    private long requiredSessionSeq(JsonNode node) {
+        var child = node.get("session_seq");
+        if (child == null || !child.isIntegralNumber() || !child.canConvertToLong()) {
+            throw new InvalidHistoryError();
+        }
+        return child.longValue();
+    }
+
     private void rejectSourceMetadata(JsonNode node) {
         for (var field : SOURCE_METADATA_FIELDS) {
             if (node.has(field)) {
@@ -302,6 +339,21 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
                 RecordedQueryResult<String, PredicateValue> recorded) {
             this.inputs = inputs;
             this.recorded = recorded;
+        }
+    }
+
+    private static final class ParsedTransaction {
+        private final JsonNode node;
+        private final long sessionId;
+        private final long txnId;
+        private final long sessionSeq;
+
+        private ParsedTransaction(
+                JsonNode node, long sessionId, long txnId, long sessionSeq) {
+            this.node = node;
+            this.sessionId = sessionId;
+            this.txnId = txnId;
+            this.sessionSeq = sessionSeq;
         }
     }
 

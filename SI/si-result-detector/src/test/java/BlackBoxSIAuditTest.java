@@ -5,8 +5,6 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
-import verifier.Pruning;
-import verifier.SIVerifier;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
@@ -57,25 +55,22 @@ class BlackBoxSIAuditTest {
     }
 
     @Test
-    void pruningModesAndConstraintStatRunThroughTheCli() throws Exception {
+    void wwPruningAblationRunsThroughAuditAndReportsConstraintCounts() throws Exception {
         var historyDir = writeTextHistoryAsPrhist("pruning-modes", List.of(
                 "w(1,1,1,1)",
                 "r(1,1,2,2)"));
 
-        for (var mode : SIVerifier.PruningMode.values()) {
+        for (var mode : List.of("NONE", "REACHABILITY")) {
             var audit = runAuditCommand(
-                    "audit", "-t", "PRHIST", "--pruning-mode", mode.name(),
+                    "audit", "--ww-pruning", mode, "--solver-stats",
                     historyDir.toString());
             assertEquals(0, audit.exitCode,
                     () -> mode + " audit failed:\n" + audit.stderr);
+            assertTrue(audit.stderr.contains("WW_INITIAL_CONSTRAINTS:"));
+            assertTrue(audit.stderr.contains("WW_AFTER_BASELINE:"));
+            assertTrue(audit.stderr.contains("WW_INITIAL_IMPLICATIONS:"));
+            assertTrue(audit.stderr.contains("WW_AFTER_BASELINE_IMPLICATIONS:"));
         }
-
-        var stats = runAuditCommand(
-                "constraint-stat", "-t", "PRHIST",
-                "--pruning-mode", "SNAPSHOT", historyDir.toString());
-        assertEquals(0, stats.exitCode);
-        assertTrue(stats.stdout.contains(
-                "CONSTRAINT_STATS pruning_mode=SNAPSHOT"));
     }
 
     @Test
@@ -85,20 +80,20 @@ class BlackBoxSIAuditTest {
                 + "{\"key\":\"inventory_onhand_y\",\"value\":130000002,\"semantic\":130,\"source_write_id\":2},"
                 + "{\"key\":\"inventory_onhand_z\",\"value\":130000003,\"semantic\":130,\"source_write_id\":3}"
                 + "]", List.of(
-                "{\"session\":0,\"txn\":0,\"kind\":\"inventory.t0\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"kind\":\"inventory.t0\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_x\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_x\",\"value\":130000001,\"semantic\":130,\"source_write_id\":1,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_z\",\"value\":400000003,\"semantic\":40,\"write_id\":10}]}",
-                "{\"session\":1,\"txn\":1,\"kind\":\"inventory.t1\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":1,\"session_seq\":1,\"txn\":1,\"kind\":\"inventory.t1\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_y\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_y\",\"value\":130000002,\"semantic\":130,\"source_write_id\":2,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_x\",\"value\":400000001,\"semantic\":40,\"write_id\":11}]}",
-                "{\"session\":2,\"txn\":2,\"kind\":\"inventory.t2\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":2,\"session_seq\":1,\"txn\":2,\"kind\":\"inventory.t2\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_z\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_z\",\"value\":130000003,\"semantic\":130,\"source_write_id\":3,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_y\",\"value\":400000002,\"semantic\":40,\"write_id\":12}]}"));
 
-        var result = runAuditCommand("audit", "-t", "PRHIST", historyDir.toString());
+        var result = runAuditCommand("audit", historyDir.toString());
 
         assertEquals(-1, result.exitCode);
         assertTrue(result.stderr.contains("[[[[ REJECT ]]]]"),
@@ -123,12 +118,12 @@ class BlackBoxSIAuditTest {
     }
 
     @Test
-    void auditCli_supportsMonosatSolverBackend() throws Exception {
+    void auditCli_reportsFixedMonosatBackend() throws Exception {
         var historyDir = writeTextHistoryAsPrhist("monosat-history", List.of(
                 "w(1,1,1,1)",
                 "r(1,1,2,2)"));
 
-        var result = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat", "--solver-stats",
+        var result = runAuditCommand("audit", "--solver-stats",
                 historyDir.toString());
 
         assertEquals(0, result.exitCode);
@@ -142,7 +137,7 @@ class BlackBoxSIAuditTest {
                 "w(1,1,1,1)",
                 "r(1,1,2,2)"));
 
-        var result = runAuditCommand("audit", "-t", "PRHIST", "--solver-stats",
+        var result = runAuditCommand("audit", "--solver-stats",
                 historyDir.toString());
 
         assertEquals(0, result.exitCode);
@@ -160,7 +155,7 @@ class BlackBoxSIAuditTest {
                 "r(2,0,2,2)",
                 "w(2,1,2,2)"));
 
-        var monosat = runAuditCommand("audit", "-t", "PRHIST", "--solver", "monosat", historyDir.toString());
+        var monosat = runAuditCommand("audit", historyDir.toString());
 
         assertEquals(0, monosat.exitCode);
         assertTrue(monosat.stderr.contains("[[[[ ACCEPT ]]]]"));
@@ -180,40 +175,40 @@ class BlackBoxSIAuditTest {
                 "r(2,0,2,2)",
                 "w(2,1,2,2)"));
 
-        assertOptionMatrix(acceptHistory, "PRHIST", 0);
-        assertOptionMatrix(writeSkewHistory, "PRHIST", 0);
+        assertAblationMatrix(acceptHistory, 0);
+        assertAblationMatrix(writeSkewHistory, 0);
     }
 
     @Test
     void auditCli_prhistPredicateOptionMatrixPreservesAcceptRejectResults() throws Exception {
         var acceptHistory = writePrhist("matrix-prhist-accept", "[]", List.of(
-                "{\"session\":0,\"txn\":0,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_x\",\"value\":101,\"semantic\":101,\"write_id\":1}]}",
-                "{\"session\":1,\"txn\":1,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":1,\"session_seq\":1,\"txn\":1,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_x\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_x\",\"value\":101,\"semantic\":101,\"source_write_id\":1,\"source_txn\":0}]}]}"));
 
         var rejectHistory = writePrhist("matrix-prhist-reject", "[]", List.of(
-                "{\"session\":0,\"txn\":0,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"dep_y\",\"value\":1,\"semantic\":1,\"write_id\":20},"
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_x\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_x\",\"value\":101,\"semantic\":101,\"source_write_id\":21,\"source_txn\":1}]}]}",
-                "{\"session\":1,\"txn\":1,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":1,\"session_seq\":1,\"txn\":1,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"r\",\"key\":\"dep_y\",\"value\":1,\"semantic\":1,\"source_write_id\":20,\"source_txn\":0},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_x\",\"value\":101,\"semantic\":101,\"write_id\":21}]}"));
 
-        assertOptionMatrix(acceptHistory, "PRHIST", 0);
-        assertOptionMatrix(rejectHistory, "PRHIST", -1);
+        assertAblationMatrix(acceptHistory, 0);
+        assertAblationMatrix(rejectHistory, -1);
     }
 
     @Test
-    void auditCli_rejectsInvalidSolverArgument() throws Exception {
+    void auditCli_rejectsRemovedSolverOption() throws Exception {
         var historyDir = writeTextHistoryAsPrhist("invalid-solver-history", List.of("w(1,1,1,1)"));
 
-        var result = runAuditCommand("audit", "-t", "PRHIST", "--solver", "xxx", historyDir.toString());
+        var result = runAuditCommand("audit", "--solver", "monosat", historyDir.toString());
 
         assertEquals(2, result.exitCode);
-        assertTrue(result.stderr.contains("Invalid value") || result.stderr.contains("xxx"),
+        assertTrue(result.stderr.contains("Unknown option") || result.stderr.contains("--solver"),
                 () -> "stderr was:\n" + result.stderr);
     }
 
@@ -239,11 +234,11 @@ class BlackBoxSIAuditTest {
     @Test
     void auditCli_rejectsPredicateWrCycle() throws Exception {
         var result = runPrhistAudit("prwr-cycle", List.of(
-                "{\"session\":0,\"txn\":0,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"dep_y\",\"value\":1,\"semantic\":1,\"write_id\":20},"
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_x\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_x\",\"value\":101,\"semantic\":101,\"source_write_id\":21,\"source_txn\":1}]}]}",
-                "{\"session\":1,\"txn\":1,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":1,\"session_seq\":1,\"txn\":1,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"r\",\"key\":\"dep_y\",\"value\":1,\"semantic\":1,\"source_write_id\":20,\"source_txn\":0},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_x\",\"value\":101,\"semantic\":101,\"write_id\":21}]}"));
 
@@ -258,10 +253,10 @@ class BlackBoxSIAuditTest {
     @Test
     void auditCli_rejectsEmptyPredicateReadThenMatchingWriterCycle() throws Exception {
         var result = runPrhistAudit("empty-prrw-cycle", List.of(
-                "{\"session\":1,\"txn\":1,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":1,\"session_seq\":1,\"txn\":1,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"dep_y\",\"value\":1,\"semantic\":1,\"write_id\":30},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_x\",\"value\":101,\"semantic\":101,\"write_id\":31}]}",
-                "{\"session\":0,\"txn\":0,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"kind\":\"reader\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"r\",\"key\":\"dep_y\",\"value\":1,\"semantic\":1,\"source_write_id\":30,\"source_txn\":1},"
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_x\",\"comparator\":\"ge\",\"threshold\":100},\"results\":[]}]}"));
 
@@ -279,15 +274,15 @@ class BlackBoxSIAuditTest {
                 + "{\"key\":\"inventory_onhand_y\",\"value\":130000002,\"semantic\":130,\"source_write_id\":42},"
                 + "{\"key\":\"inventory_onhand_z\",\"value\":130000003,\"semantic\":130,\"source_write_id\":43}"
                 + "]", List.of(
-                "{\"session\":0,\"txn\":0,\"kind\":\"inventory.t0\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"kind\":\"inventory.t0\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_x\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_x\",\"value\":130000001,\"semantic\":130,\"source_write_id\":41,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_z\",\"value\":400000003,\"semantic\":40,\"write_id\":44}]}",
-                "{\"session\":1,\"txn\":1,\"kind\":\"inventory.t1\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":1,\"session_seq\":1,\"txn\":1,\"kind\":\"inventory.t1\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_y\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_y\",\"value\":130000002,\"semantic\":130,\"source_write_id\":42,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_x\",\"value\":400000001,\"semantic\":40,\"write_id\":45}]}",
-                "{\"session\":2,\"txn\":2,\"kind\":\"inventory.t2\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":2,\"session_seq\":1,\"txn\":2,\"kind\":\"inventory.t2\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_z\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_z\",\"value\":130000003,\"semantic\":130,\"source_write_id\":43,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_y\",\"value\":400000002,\"semantic\":40,\"write_id\":46}]}"));
@@ -317,13 +312,13 @@ class BlackBoxSIAuditTest {
                 + "{\"key\":\"inventory_onhand_A_0000\",\"value\":130000001,\"semantic\":130,\"source_write_id\":1},"
                 + "{\"key\":\"inventory_onhand_A_0001\",\"value\":120000002,\"semantic\":120,\"source_write_id\":2}"
                 + "]", List.of(
-                "{\"session\":0,\"txn\":0,\"kind\":\"observe.before\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"kind\":\"observe.before\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_A_\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_A_0000\",\"value\":130000001,\"semantic\":130,\"source_write_id\":1,\"source_txn\":-1},"
                         + "{\"key\":\"inventory_onhand_A_0001\",\"value\":120000002,\"semantic\":120,\"source_write_id\":2,\"source_txn\":-1}]}]}",
-                "{\"session\":0,\"txn\":1,\"kind\":\"flip.a0\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":2,\"txn\":1,\"kind\":\"flip.a0\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_A_0000\",\"value\":400000003,\"semantic\":40,\"write_id\":3}]}",
-                "{\"session\":0,\"txn\":2,\"kind\":\"observe.after\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":3,\"txn\":2,\"kind\":\"observe.after\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_A_\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_A_0001\",\"value\":120000002,\"semantic\":120,\"source_write_id\":2,\"source_txn\":-1}]}]}"));
 
@@ -341,19 +336,19 @@ class BlackBoxSIAuditTest {
                 + "{\"key\":\"inventory_onhand_C_0000\",\"value\":130000003,\"semantic\":130,\"source_write_id\":3},"
                 + "{\"key\":\"inventory_onhand_D_0000\",\"value\":130000004,\"semantic\":130,\"source_write_id\":4}"
                 + "]", List.of(
-                "{\"session\":0,\"txn\":0,\"kind\":\"cycle.t0\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":0,\"session_seq\":1,\"txn\":0,\"kind\":\"cycle.t0\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_A_\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_A_0000\",\"value\":130000001,\"semantic\":130,\"source_write_id\":1,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_D_0000\",\"value\":400000005,\"semantic\":40,\"write_id\":5}]}",
-                "{\"session\":1,\"txn\":1,\"kind\":\"cycle.t1\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":1,\"session_seq\":1,\"txn\":1,\"kind\":\"cycle.t1\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_B_\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_B_0000\",\"value\":130000002,\"semantic\":130,\"source_write_id\":2,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_A_0000\",\"value\":410000006,\"semantic\":41,\"write_id\":6}]}",
-                "{\"session\":2,\"txn\":2,\"kind\":\"cycle.t2\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":2,\"session_seq\":1,\"txn\":2,\"kind\":\"cycle.t2\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_C_\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_C_0000\",\"value\":130000003,\"semantic\":130,\"source_write_id\":3,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_B_0000\",\"value\":420000007,\"semantic\":42,\"write_id\":7}]}",
-                "{\"session\":3,\"txn\":3,\"kind\":\"cycle.t3\",\"status\":\"commit\",\"ops\":["
+                "{\"session\":3,\"session_seq\":1,\"txn\":3,\"kind\":\"cycle.t3\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_D_\",\"comparator\":\"ge\",\"threshold\":100},\"results\":["
                         + "{\"key\":\"inventory_onhand_D_0000\",\"value\":130000004,\"semantic\":130,\"source_write_id\":4,\"source_txn\":-1}]},"
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_C_0000\",\"value\":430000008,\"semantic\":43,\"write_id\":8}]}"));
@@ -367,7 +362,7 @@ class BlackBoxSIAuditTest {
         var historyFile = tempDir.resolve("history.txt");
         var historyDir = writeTextHistoryAsPrhist(historyFile.getFileName().toString(), historyLines);
 
-        return runAuditCommand("audit", "-t", "PRHIST", historyDir.toString());
+        return runAuditCommand("audit", historyDir.toString());
     }
 
     private CliResult runPrhistAudit(String name, List<String> lines) throws Exception {
@@ -376,7 +371,7 @@ class BlackBoxSIAuditTest {
 
     private CliResult runPrhistAudit(String name, String initialStateJson, List<String> lines) throws Exception {
         var historyDir = writePrhist(name, initialStateJson, lines);
-        return runAuditCommand("audit", "-t", "PRHIST", historyDir.toString());
+        return runAuditCommand("audit", historyDir.toString());
     }
 
     private Path writePrhist(String name, String initialStateJson, List<String> lines) throws Exception {
@@ -443,11 +438,14 @@ class BlackBoxSIAuditTest {
         }
 
         var txnLines = new ArrayList<String>();
+        var nextSessionSeq = new LinkedHashMap<Long, Long>();
         for (var entry : txns.entrySet()) {
             var txn = entry.getKey();
+            var session = txnSessions.get(txn);
+            var sessionSeq = nextSessionSeq.merge(session, 1L, Long::sum);
             txnLines.add(String.format(
-                    "{\"session\":%d,\"txn\":%d,\"kind\":\"inline.basic\",\"status\":\"commit\",\"ops\":[%s]}",
-                    txnSessions.get(txn), txn, String.join(",", entry.getValue())));
+                    "{\"session\":%d,\"session_seq\":%d,\"txn\":%d,\"kind\":\"inline.basic\",\"status\":\"commit\",\"ops\":[%s]}",
+                    session, sessionSeq, txn, String.join(",", entry.getValue())));
         }
 
         return writePrhist(name, "[" + String.join(",", initialRows) + "]", txnLines);
@@ -615,32 +613,25 @@ class BlackBoxSIAuditTest {
         return key + "\u0000" + value;
     }
 
-    private void assertOptionMatrix(Path historyPath, String type, int expectedExitCode) throws Exception {
-        var solvers = List.of("monosat");
+    private void assertAblationMatrix(Path historyPath, int expectedExitCode) throws Exception {
         var optionSets = List.of(
                 List.<String>of(),
-                List.of("--no-pruning"),
-                List.of("--no-coalescing"),
-                List.of("--no-pruning", "--no-coalescing"));
+                List.of("--ww-pruning", "NONE"),
+                List.of("--no-predicate-witness-coalescing"),
+                List.of("--no-graph-edge-interning"));
 
-        for (var solver : solvers) {
-            for (var options : optionSets) {
-                var args = new java.util.ArrayList<String>();
-                args.add("audit");
-                args.add("-t");
-                args.add(type);
-                args.add("--solver");
-                args.add(solver);
-                args.addAll(options);
-                args.add(historyPath.toString());
+        for (var options : optionSets) {
+            var args = new java.util.ArrayList<String>();
+            args.add("audit");
+            args.addAll(options);
+            args.add(historyPath.toString());
 
-                var result = runAuditCommand(args);
-                assertEquals(expectedExitCode, result.exitCode,
-                        () -> String.format("solver=%s options=%s stderr:%n%s%nstdout:%n%s",
-                                solver, options, result.stderr, result.stdout));
-                assertTrue(result.stderr.contains(expectedExitCode == 0 ? "[[[[ ACCEPT ]]]]" : "[[[[ REJECT ]]]]"),
-                        () -> String.format("solver=%s options=%s stderr:%n%s", solver, options, result.stderr));
-            }
+            var result = runAuditCommand(args);
+            assertEquals(expectedExitCode, result.exitCode,
+                    () -> String.format("options=%s stderr:%n%s%nstdout:%n%s",
+                            options, result.stderr, result.stdout));
+            assertTrue(result.stderr.contains(expectedExitCode == 0 ? "[[[[ ACCEPT ]]]]" : "[[[[ REJECT ]]]]"),
+                    () -> String.format("options=%s stderr:%n%s", options, result.stderr));
         }
     }
 
@@ -649,11 +640,6 @@ class BlackBoxSIAuditTest {
     }
 
     private CliResult runAuditCommand(String... args) throws Exception {
-        Pruning.setEnablePruning(true);
-        SIVerifier.setCoalesceConstraints(true);
-        SIVerifier.setDotOutput(false);
-        SIVerifier.setCompareDerivedPredicateEdges(false);
-
         var stdout = new ByteArrayOutputStream();
         var stderr = new ByteArrayOutputStream();
         var oldOut = System.out;

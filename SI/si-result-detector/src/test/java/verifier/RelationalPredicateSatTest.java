@@ -147,6 +147,21 @@ class RelationalPredicateSatTest {
     }
 
     @Test
+    void rejectsInvalidRowLocalResultWithOnlyFixedLocalSnapshot() throws Exception {
+        var history = writeHistory(
+                "row-local-invalid-fixed-snapshot",
+                "[{\"key\":\"kv:k0\",\"value\":7}]",
+                transaction(0, 10,
+                        "{\"type\":\"w\",\"key\":\"kv:k0\",\"value\":8},"
+                                + singleTableRead(
+                                        false,
+                                        "[{\"key\":\"kv:k0\",\"value\":8}]",
+                                        "[{\"value\":999}]")));
+
+        assertFalse(audit(history));
+    }
+
+    @Test
     void distinctSingleTableQueryKeepsWholeSnapshotSemantics() throws Exception {
         var initialState = "["
                 + "{\"key\":\"kv:k0\",\"value\":7},"
@@ -266,7 +281,8 @@ class RelationalPredicateSatTest {
     }
 
     private static String transaction(long session, long transaction, String operations) {
-        return "{\"session\":" + session + ",\"txn\":" + transaction
+        return "{\"session\":" + session + ",\"session_seq\":" + transaction
+                + ",\"txn\":" + transaction
                 + ",\"status\":\"commit\",\"ops\":[" + operations + "]}";
     }
 

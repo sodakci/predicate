@@ -1,7 +1,5 @@
 package verifier;
 
-import graph.Edge;
-import graph.EdgeType;
 import graph.KnownGraph;
 import history.Event;
 import history.History;
@@ -23,14 +21,12 @@ import static history.Event.EventType.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * SER 可转化性检测测试 — 覆盖所有关键场景
+ * SI 可接受性检测测试 — 覆盖主求解路径和内部一致性场景。
  *
  * 测试维度：
  * 1. 基础 WW/RW 冲突
- * 2. Predicate latest-visible frontier 识别
- * 3. PR_WR 推导（latest-visible frontier）
- * 4. PR_RW 推导（frontier + WW + Δ 条件）
- * 5. 内部一致性检查
+ * 2. Predicate visibility encoding
+ * 3. 内部一致性检查
  */
 public class SIDetectabilityTest {
 
@@ -70,20 +66,6 @@ public class SIDetectabilityTest {
         public String toString() {
             return semantic + "@" + physical;
         }
-    }
-
-    private static boolean hasKnownAEdgeOfType(KnownGraph<String, Integer> graph,
-            Transaction<String, Integer> from, Transaction<String, Integer> to, EdgeType type) {
-        return graph.getKnownGraphA().edgeValue(from, to)
-                .orElse(List.of()).stream()
-                .anyMatch(e -> e.getType() == type);
-    }
-
-    private static boolean hasKnownBEdgeOfType(KnownGraph<String, Integer> graph,
-            Transaction<String, Integer> from, Transaction<String, Integer> to, EdgeType type) {
-        return graph.getKnownGraphB().edgeValue(from, to)
-                .orElse(List.of()).stream()
-                .anyMatch(e -> e.getType() == type);
     }
 
     // ================================================================
@@ -171,176 +153,6 @@ public class SIDetectabilityTest {
         assertTrue(verifySer(h), "线性 Write-Dependency 链无环，SER 应通过");
     }
 
-    // ================================================================
-    // 维度三：latest-visible frontier 识别
-    // ================================================================
-
-    /**
-     * 场景5: predicate result source 作为最新可见 frontier
-     */
-    @Test
-    void ser_predicateFrontier_writerRecognized() {
-        var h = makeHistory(
-                Set.of(0L),
-                Map.of(0L, List.of(0L, 1L, 2L)),
-                Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
-                        1L, List.of(Triple.of(PREDICATE_READ, "x", 10)),
-                        2L, List.of(Triple.of(WRITE, "x", 3))),
-                Map.of(1L, Pair.of(
-                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
-                        List.of(new Event.PredResult<>("x", 10))))
-        );
-        var graph = new KnownGraph<>(h);
-        graph.putEdge(h.getTransaction(0L), h.getTransaction(1L), new Edge<>(EdgeType.WW, "x"));
-        graph.putEdge(h.getTransaction(1L), h.getTransaction(2L), new Edge<>(EdgeType.WW, "x"));
-
-        SIVerifier.refreshDerivedPredicateEdges(h, graph);
-
-        assertTrue(graph.getKnownGraphA()
-                        .hasEdgeConnecting(h.getTransaction(0L), h.getTransaction(1L)),
-                "T1 应为 latest-visible frontier, PR_WR(T1→T2) 应存在");
-    }
-
-    /**
-     * 场景6: 多个写之后选择 predicate read 的最新可见 frontier
-     */
-    @Test
-    void ser_multipleWrites_emitPrWrFromFrontier() {
-        var h = makeHistory(
-                Set.of(0L),
-                Map.of(0L, List.of(0L, 1L, 2L, 3L)),
-                Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
-                        1L, List.of(Triple.of(WRITE, "x", 3)),
-                        2L, List.of(Triple.of(WRITE, "x", 20)),
-                        3L, List.of(Triple.of(PREDICATE_READ, "x", 20))),
-                Map.of(3L, Pair.of(
-                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
-                        List.of(new Event.PredResult<>("x", 20))))
-        );
-        var graph = new KnownGraph<>(h);
-        graph.putEdge(h.getTransaction(0L), h.getTransaction(1L), new Edge<>(EdgeType.WW, "x"));
-        graph.putEdge(h.getTransaction(1L), h.getTransaction(2L), new Edge<>(EdgeType.WW, "x"));
-        graph.putEdge(h.getTransaction(2L), h.getTransaction(3L), new Edge<>(EdgeType.WW, "x"));
-
-        SIVerifier.refreshDerivedPredicateEdges(h, graph);
-
-        assertTrue(graph.getKnownGraphA()
-                        .hasEdgeConnecting(h.getTransaction(2L), h.getTransaction(3L)),
-                "latest-visible frontier = T3, PR_WR(T3→T4) 应存在");
-    }
-
-    // ================================================================
-    // 维度四：PR_WR 推导
-    // ================================================================
-
-    /**
-     * 场景7: PR_WR 基本推导
-     */
-    @Test
-    void ser_prWr_basicDerivation() {
-        var h = makeHistory(
-                Set.of(0L),
-                Map.of(0L, List.of(0L, 1L)),
-                Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
-                        1L, List.of(Triple.of(PREDICATE_READ, "x", 10))),
-                Map.of(1L, Pair.of(
-                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
-                        List.of(new Event.PredResult<>("x", 10))))
-        );
-        var graph = new KnownGraph<>(h);
-        graph.putEdge(h.getTransaction(0L), h.getTransaction(1L), new Edge<>(EdgeType.WW, "x"));
-
-        SIVerifier.refreshDerivedPredicateEdges(h, graph);
-
-        assertTrue(hasKnownAEdgeOfType(graph, h.getTransaction(0L), h.getTransaction(1L), EdgeType.PR_WR),
-                "PR_WR(T1→T2) 应存在");
-    }
-
-    /**
-     * 场景8: T2 自己写了 key — self frontier 不产生跨事务 PR_WR
-     */
-    @Test
-    void ser_prWr_selfWrite_excluded() {
-        var h = makeHistory(
-                Set.of(0L),
-                Map.of(0L, List.of(0L, 1L)),
-                Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
-                        1L, List.of(Triple.of(WRITE, "x", 20),
-                                Triple.of(PREDICATE_READ, "x", 20))),
-                Map.of(1L, Pair.of(
-                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
-                        List.of(new Event.PredResult<>("x", 20))))
-        );
-        var graph = new KnownGraph<>(h);
-        graph.putEdge(h.getTransaction(0L), h.getTransaction(1L), new Edge<>(EdgeType.WW, "x"));
-
-        SIVerifier.refreshDerivedPredicateEdges(h, graph);
-
-        assertFalse(hasKnownAEdgeOfType(graph, h.getTransaction(0L), h.getTransaction(1L), EdgeType.PR_WR),
-                "latest visible frontier 是 T2 自己的写，因此不应产生跨事务 PR_WR(T1→T2)");
-    }
-
-    // ================================================================
-    // 维度五：PR_RW 推导（frontier + WW + Δ 条件）
-    // ================================================================
-
-    /**
-     * 场景9: INTERNAL predicate read 暂不进入 PR_RW 推导
-     */
-    @Test
-    void ser_prRw_internalReadIsDeferred() {
-        var h = makeHistory(
-                Set.of(0L),
-                Map.of(0L, List.of(0L, 1L, 2L)),
-                Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
-                        1L, List.of(Triple.of(WRITE, "x", 20),
-                                Triple.of(PREDICATE_READ, "x", 20)),
-                        2L, List.of(Triple.of(WRITE, "x", 3))),
-                Map.of(1L, Pair.of(
-                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
-                        List.of(new Event.PredResult<>("x", 20))))
-        );
-        var graph = new KnownGraph<>(h);
-        graph.putEdge(h.getTransaction(0L), h.getTransaction(1L), new Edge<>(EdgeType.WW, "x"));
-        graph.putEdge(h.getTransaction(1L), h.getTransaction(2L), new Edge<>(EdgeType.WW, "x"));
-
-        SIVerifier.refreshDerivedPredicateEdges(h, graph);
-
-        assertFalse(hasKnownAEdgeOfType(graph, h.getTransaction(0L), h.getTransaction(1L), EdgeType.PR_WR),
-                "latest visible frontier 是 T2 自己的写，因此不应产生跨事务 PR_WR(T1→T2)");
-        assertFalse(hasKnownBEdgeOfType(graph, h.getTransaction(1L), h.getTransaction(2L), EdgeType.PR_RW),
-                "INTERNAL predicate read 暂不进入 external PR_RW 推导");
-    }
-
-    /**
-     * 场景11: PR_RW — 自环防护
-     */
-    @Test
-    void ser_prRw_selfLoop_noSelfLoop() {
-        var h = makeHistory(
-                Set.of(0L),
-                Map.of(0L, List.of(0L, 1L)),
-                Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
-                        1L, List.of(Triple.of(PREDICATE_READ, "x", 10),
-                                Triple.of(WRITE, "x", 20))),
-                Map.of(1L, Pair.of(
-                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
-                        List.of(new Event.PredResult<>("x", 10))))
-        );
-        var graph = new KnownGraph<>(h);
-        graph.putEdge(h.getTransaction(0L), h.getTransaction(1L), new Edge<>(EdgeType.WW, "x"));
-
-        SIVerifier.refreshDerivedPredicateEdges(h, graph);
-
-        assertTrue(graph.getKnownGraphA()
-                        .hasEdgeConnecting(h.getTransaction(0L), h.getTransaction(1L)),
-                "PR_WR(T1→T2) 应存在");
-        assertFalse(graph.getKnownGraphB()
-                        .hasEdgeConnecting(h.getTransaction(1L), h.getTransaction(1L)),
-                "PR_RW(T2→T2) 自环不应存在");
-    }
-
-    @Test
     void si_prRw_unchangedCanonicalPredicateResultDoesNotOverConstrainVisibility() {
         var history = new History<String, SemanticVersion>();
         var source = history.addTransaction(history.addSession(1L), 1L);
@@ -688,40 +500,6 @@ public class SIDetectabilityTest {
                 "首次谓词读前的最后一次本地写仍必须决定结果");
     }
 
-    // ================================================================
-    // 维度八：PR_* 推导与 SER 验证集成
-    // ================================================================
-
-    /**
-     * 集成测试: PR_WR + SER 验证流程
-     */
-    @Test
-    void ser_fullIntegration_prWrDerivation() {
-        // 场景: T0 写 x=10(满足), T1 写 y=1, T1 做 predicate read
-        // T0 和 T1 对 key x 没有 WW 冲突（只有 T0 写 x）
-        // predicate read 结果来自 T0 的写
-        var h = makeHistory(
-                Set.of(0L),
-                Map.of(0L, List.of(0L, 1L)),
-                Map.of(0L, List.of(Triple.of(WRITE, "x", 10)),
-                        1L, List.of(Triple.of(WRITE, "y", 1))),
-                Map.of(1L, Pair.of(
-                        (PredicateFixtures.RowPredicate<String, Integer>) (k, v) -> v > 5,
-                        List.of(new Event.PredResult<>("x", 10))))
-        );
-
-        var graph = new KnownGraph<>(h);
-
-        // 添加 WW 约束建立 orderedWrites
-        graph.putEdge(h.getTransaction(0L), h.getTransaction(1L), new Edge<>(EdgeType.WW, "x"));
-
-        SIVerifier.refreshDerivedPredicateEdges(h, graph);
-
-        // PR_WR 应存在: T0 是 latest-visible frontier, T1 是 reader
-        assertTrue(graph.getKnownGraphA()
-                        .hasEdgeConnecting(h.getTransaction(0L), h.getTransaction(1L)),
-                "PR_WR(T0→T1) 应存在");
-    }
 
     /**
      * 集成测试: 无 predicate 的简单 WW 历史

@@ -5,3 +5,6 @@
 PolySIHistories
 SER/ser-result-detector/tools/__pycache__/
 PolySIHistories/kvpredicate/kvpredicate_repeatable_read_write_skew1_20260706/hist-00000/raw_kvpredicate_trace.jsonl
+SER/predicates-1.pdf
+SER/SER_remove_legacy_predicate_solver_20260905.patch
+.gitignore
