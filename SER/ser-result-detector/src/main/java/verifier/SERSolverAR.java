@@ -171,11 +171,13 @@ class SERSolverAR<KeyType, ValueType> {
             new ArrayList<>();
     private final Map<Lit, Set<SEREdge<KeyType, ValueType>>> dependencyEdgesByGuard =
             new IdentityHashMap<>();
-    // Predicate witnesses are first collected per key, then pruned into one
-    // physical dependency edge per (from,to,type). The merged edge retains
-    // every witness key and is guarded by the disjunction of their guards.
-    private final List<GuardedDependencyEdge<KeyType, ValueType>>
-            predicateDependencyCandidates = new ArrayList<>();
+    // Predicate witnesses are merged as soon as their complete activation
+    // guard is known. No per-witness candidate objects survive until the
+    // physical dependency pass.
+    private final Map<PredicateTransactionEdgeKey<KeyType, ValueType>,
+            CoalescedPredicateDependency<KeyType, ValueType>>
+            predicateDependencyAccumulators = new LinkedHashMap<>();
+    private long predicateDependencyCandidateCount;
     // Set only while encoding one external predicate-read key. It lets the
     // later physical-edge pass attribute a witness to a recorded or absent
     // source without changing the typed dependency semantics.
@@ -190,7 +192,7 @@ class SERSolverAR<KeyType, ValueType> {
     private long mixedPhysicalPredicateMaterializeNanos;
     private long knownOrInternalPhysicalPredicateMaterializeNanos;
     private final Map<Pair<Transaction<KeyType, ValueType>,
-            Transaction<KeyType, ValueType>>, List<GuardedDependencyEdge<KeyType, ValueType>>>
+            Transaction<KeyType, ValueType>>, List<SEREdge<KeyType, ValueType>>>
             logicalDependenciesByEndpoint =
             new HashMap<>();
     private final Set<PredicateWitnessIdentity<KeyType, ValueType>>
@@ -465,7 +467,19 @@ class SERSolverAR<KeyType, ValueType> {
             SERConstraint<KeyType, ValueType> wwConstraint) {
         var literal = new Lit(solver);
         var assumption = new AssumptionReason<>(
-                nextAssumptionId++, kind, reason, literal, wwConstraint);
+                nextAssumptionId++, kind, reason, null, literal, wwConstraint);
+        solver.addName(literal, assumption.assumptionId());
+        assumptionLiterals.add(literal);
+        assumptionReasons.put(literal, assumption);
+        return assumption;
+    }
+
+    private AssumptionReason<KeyType, ValueType> newFactAssumption(
+            GmwrPropagationState.DependencyFact<KeyType, ValueType> fact) {
+        var literal = new Lit(solver);
+        var assumption = new AssumptionReason<>(
+                nextAssumptionId++, AssumptionKind.GMWR_RULE,
+                null, fact, literal, null);
         solver.addName(literal, assumption.assumptionId());
         assumptionLiterals.add(literal);
         assumptionReasons.put(literal, assumption);
@@ -517,7 +531,6 @@ class SERSolverAR<KeyType, ValueType> {
     Collection<SEREdge<KeyType, ValueType>> getLogicalDependencies() {
         return logicalDependenciesByEndpoint.values().stream()
                 .flatMap(Collection::stream)
-                .map(guarded -> guarded.edge)
                 .collect(Collectors.toUnmodifiableList());
     }
 
@@ -563,13 +576,7 @@ class SERSolverAR<KeyType, ValueType> {
                         || fact.from.equals(fact.to)) {
                     continue;
                 }
-                var assumption = newAssumption(
-                        AssumptionKind.GMWR_RULE,
-                        String.format("%s forces %s < %s%s%s",
-                                fact.rule, fact.from, fact.to,
-                                fact.type == null ? "" : " type=" + fact.type,
-                                fact.key == null ? "" : " key=" + fact.key),
-                        null);
+                var assumption = newFactAssumption(fact);
                 assertUnderAssumption(
                         assumption, directSerializationEdge(fact.from, fact.to));
                 if (fact.isTypedDependency()) {
@@ -724,6 +731,7 @@ class SERSolverAR<KeyType, ValueType> {
             knownWwSuccessorsByKey.putAll(buildKnownWwSuccessorsByKey(graph));
         }
         publishPropagationMetrics();
+        propagation.releasePropagationIndexes();
     }
 
     private void propagateGmwrToWwFixpoint() {
@@ -835,12 +843,6 @@ class SERSolverAR<KeyType, ValueType> {
                 }
                 var analysis = analyzeAbsentKey(
                         observation, entry, predicateRead, relationResolver);
-                if (!analysis.goodWriterTxns.isEmpty()) {
-                    propagation.addOrIntersectFrontier(
-                            reader, observation.getEventIndex(),
-                            observation.getCoverageEpoch(), key, analysis.goodWriterTxns,
-                            false);
-                }
                 for (var obligation : analysis.obligations) {
                     gmwrItemObligations++;
                     gmwrAbsentItemObligations++;
@@ -864,18 +866,15 @@ class SERSolverAR<KeyType, ValueType> {
         final Transaction<KeyType, ValueType> reader;
         final Transaction<KeyType, ValueType> badWriter;
         final List<Set<Transaction<KeyType, ValueType>>> repairs;
-        final boolean outsideAllowed;
         final KeyType key;
 
         BadWriterObligation(Transaction<KeyType, ValueType> reader,
                             Transaction<KeyType, ValueType> badWriter,
                             List<Set<Transaction<KeyType, ValueType>>> repairs,
-                            boolean outsideAllowed,
                             KeyType key) {
             this.reader = reader;
             this.badWriter = badWriter;
             this.repairs = repairs;
-            this.outsideAllowed = outsideAllowed;
             this.key = key;
         }
     }
@@ -926,7 +925,7 @@ class SERSolverAR<KeyType, ValueType> {
             }
             badWrites.add(write);
             obligations.add(new BadWriterObligation<>(
-                    reader, write.getTxn(), repairSets, true, entry.key));
+                    reader, write.getTxn(), repairSets, entry.key));
         }
         return new AbsentKeyAnalysis<>(
                 goodWriterTxns, emptyContributions, badWrites, obligations);
@@ -1003,8 +1002,25 @@ class SERSolverAR<KeyType, ValueType> {
                 }
                 return;
             }
-            predicateDependencyCandidates.add(new GuardedDependencyEdge<>(edge, guard,
-                    currentPredicateDependencyOrigin));
+            predicateDependencyCandidateCount++;
+            if (!encodingPredicateConstraints) {
+                predicateEncodingMetrics.dependencyFixedEdgeCandidates++;
+            }
+            if (!predicateWitnessCoalescing) {
+                queueUncoalescedDependencyEdge(
+                        edge, guard, currentPredicateDependencyOrigin);
+                return;
+            }
+            var key = new PredicateTransactionEdgeKey<>(
+                    edge.getFrom(), edge.getTo(), edge.getType());
+            var physical = predicateDependencyAccumulators.get(key);
+            if (physical == null) {
+                predicateDependencyAccumulators.put(key,
+                        new CoalescedPredicateDependency<>(
+                                edge, guard, currentPredicateDependencyOrigin));
+            } else {
+                physical.merge(edge, guard, currentPredicateDependencyOrigin);
+            }
             return;
         }
         if (!dependencyEdgesByGuard
@@ -1096,7 +1112,7 @@ class SERSolverAR<KeyType, ValueType> {
         var endpoint = Pair.of(guarded.edge.getFrom(), guarded.edge.getTo());
         logicalDependenciesByEndpoint
                 .computeIfAbsent(endpoint, ignored -> new ArrayList<>())
-                .add(guarded);
+                .add(guarded.edge);
         boolean predicatePhysical = guarded.edge.getType() == EdgeType.PR_WR
                 || guarded.edge.getType() == EdgeType.PR_RW;
         long started = predicatePhysical ? System.nanoTime() : 0L;
@@ -1376,13 +1392,12 @@ class SERSolverAR<KeyType, ValueType> {
             if (predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR) {
                 publishGmwrSourcePruning();
                 resolveAndEncodeGmwrBundles();
+                propagation.releaseEncodedState();
             }
-            if (predicateWitnessCoalescing) {
-                prunePredicateDependencies();
-            } else {
-                enqueuePredicateDependenciesWithoutPruning();
-            }
+            flushPredicateDependencies();
         } finally {
+            predicateDependencyAccumulators.clear();
+            predicateWitnessIdentities.clear();
             encodingPredicateConstraints = false;
             collectingPredicateMetrics = false;
             predicateEncodingMetrics.publish(
@@ -1395,37 +1410,22 @@ class SERSolverAR<KeyType, ValueType> {
      * PR_WR or PR_RW relation. The graph needs one physical edge whose guard
      * is true exactly when at least one key witness is active.
      */
-    private void prunePredicateDependencies() {
-        if (predicateDependencyCandidates.isEmpty()) {
+    private void flushPredicateDependencies() {
+        if (!predicateWitnessCoalescing
+                || predicateDependencyAccumulators.isEmpty()) {
             return;
         }
 
         var profiler = Profiler.getInstance();
         profiler.startTick("SER_PRED_DEPENDENCY_PRUNE");
         try {
-            int total = predicateDependencyCandidates.size();
-            var physicalEdges = new LinkedHashMap<PredicateTransactionEdgeKey<KeyType, ValueType>,
-                    CoalescedPredicateDependency<KeyType, ValueType>>();
-            for (var candidate : predicateDependencyCandidates) {
-                var edge = candidate.edge;
-                var key = new PredicateTransactionEdgeKey<>(
-                        edge.getFrom(), edge.getTo(), edge.getType());
-                var physical = physicalEdges.get(key);
-                if (physical == null) {
-                    physicalEdges.put(key, new CoalescedPredicateDependency<>(
-                            edge, candidate.guard, candidate.origin));
-                } else {
-                    physical.merge(edge, candidate.guard, candidate.origin);
-                }
-            }
-
             long physicalPrWrEdges = 0L;
             long physicalPrRwEdges = 0L;
             long sourcedPhysicalEdges = 0L;
             long sourcelessPhysicalEdges = 0L;
             long mixedPhysicalEdges = 0L;
             long knownOrInternalPhysicalEdges = 0L;
-            for (var physical : physicalEdges.values()) {
+            for (var physical : predicateDependencyAccumulators.values()) {
                 if (physical.edge.getType() == EdgeType.PR_WR) {
                     physicalPrWrEdges++;
                 } else if (physical.edge.getType() == EdgeType.PR_RW) {
@@ -1447,8 +1447,10 @@ class SERSolverAR<KeyType, ValueType> {
                 }
             }
 
-            predicateEncodingMetrics.dependencyEdgeCandidates += total;
-            predicateEncodingMetrics.dependencyPhysicalEdges += physicalEdges.size();
+            predicateEncodingMetrics.dependencyEdgeCandidates +=
+                    predicateDependencyCandidateCount;
+            predicateEncodingMetrics.dependencyPhysicalEdges +=
+                    predicateDependencyAccumulators.size();
             if (collectingPredicateMetrics) {
                 predicateEncodingMetrics.dependencyPhysicalPrWrEdges += physicalPrWrEdges;
                 predicateEncodingMetrics.dependencyPhysicalPrRwEdges += physicalPrRwEdges;
@@ -1458,14 +1460,16 @@ class SERSolverAR<KeyType, ValueType> {
                 predicateEncodingMetrics.dependencyPhysicalKnownOrInternalEdges +=
                         knownOrInternalPhysicalEdges;
                 predicateEncodingMetrics.dependencyEdgesCoalesced +=
-                        total - physicalEdges.size();
-                predicateEncodingMetrics.dependencyEdgesQueued += physicalEdges.size();
+                        predicateDependencyCandidateCount
+                                - predicateDependencyAccumulators.size();
+                predicateEncodingMetrics.dependencyEdgesQueued +=
+                        predicateDependencyAccumulators.size();
             }
-            for (var physical : physicalEdges.values()) {
+            for (var physical : predicateDependencyAccumulators.values()) {
                 queueGuardedDependency(physical.edge, physical.guard, physical.origin);
             }
         } finally {
-            predicateDependencyCandidates.clear();
+            predicateDependencyAccumulators.clear();
             profiler.endTick("SER_PRED_DEPENDENCY_PRUNE");
         }
     }
@@ -1484,18 +1488,6 @@ class SERSolverAR<KeyType, ValueType> {
                     gmwrPrWrPrRwCyclePruned);
             profiler.addCount("SER_PRED_PR_WR_REACHABILITY_FORCED_COUNT",
                     gmwrPrWrSourceAlternativesForced);
-        }
-    }
-
-    /** Queues predicate dependencies without applying the optional PR prune. */
-    private void enqueuePredicateDependenciesWithoutPruning() {
-        try {
-            for (var candidate : predicateDependencyCandidates) {
-                queueUncoalescedDependencyEdge(
-                        candidate.edge, candidate.guard, candidate.origin);
-            }
-        } finally {
-            predicateDependencyCandidates.clear();
         }
     }
 
@@ -1793,9 +1785,6 @@ class SERSolverAR<KeyType, ValueType> {
     private Lit sharedOrderLiteral(
             Transaction<KeyType, ValueType> from,
             Transaction<KeyType, ValueType> to) {
-        if (propagation != null) {
-            propagation.internLogicalRelation(from, to);
-        }
         return orderLiteral(from, to);
     }
 
@@ -2780,6 +2769,7 @@ class SERSolverAR<KeyType, ValueType> {
         private final long id;
         private final AssumptionKind kind;
         private final String reason;
+        private final GmwrPropagationState.DependencyFact<KeyType, ValueType> fact;
         private final Lit literal;
         private final SERConstraint<KeyType, ValueType> wwConstraint;
 
@@ -2787,11 +2777,13 @@ class SERSolverAR<KeyType, ValueType> {
                 long id,
                 AssumptionKind kind,
                 String reason,
+                GmwrPropagationState.DependencyFact<KeyType, ValueType> fact,
                 Lit literal,
                 SERConstraint<KeyType, ValueType> wwConstraint) {
             this.id = id;
             this.kind = kind;
             this.reason = reason;
+            this.fact = fact;
             this.literal = literal;
             this.wwConstraint = wwConstraint;
         }
@@ -2805,7 +2797,13 @@ class SERSolverAR<KeyType, ValueType> {
         }
 
         String getReason() {
-            return reason;
+            if (reason != null) {
+                return reason;
+            }
+            return String.format("%s forces %s < %s%s%s",
+                    fact.rule, fact.from, fact.to,
+                    fact.type == null ? "" : " type=" + fact.type,
+                    fact.key == null ? "" : " key=" + fact.key);
         }
 
         String assumptionId() {
@@ -2944,24 +2942,18 @@ class SERSolverAR<KeyType, ValueType> {
         private final SEREdge<KeyType, ValueType> edge;
         private Lit guard;
         private PredicateDependencyOrigin origin;
-        private final List<PredicateWitness<KeyType, ValueType>> witnesses =
-                new ArrayList<>();
 
         private CoalescedPredicateDependency(SEREdge<KeyType, ValueType> edge,
                 Lit guard, PredicateDependencyOrigin origin) {
             this.edge = edge;
             this.guard = guard;
             this.origin = origin;
-            witnesses.add(new PredicateWitness<>(edge.getType(), edge.getKey(), origin));
         }
 
         private void merge(SEREdge<KeyType, ValueType> witness,
                 Lit witnessGuard,
                 PredicateDependencyOrigin witnessOrigin) {
-            for (var key : witness.getKeys()) {
-                edge.addKey(key);
-                witnesses.add(new PredicateWitness<>(witness.getType(), key, witnessOrigin));
-            }
+            witness.addKeysTo(edge);
             guard = or(guard, witnessGuard);
             origin = PredicateDependencyOrigin.merge(origin, witnessOrigin);
         }
@@ -2998,24 +2990,6 @@ class SERSolverAR<KeyType, ValueType> {
         @Override
         public int hashCode() {
             return Objects.hash(from, to, type, key, System.identityHashCode(guard));
-        }
-    }
-
-    private static final class PredicateWitness<KeyType, ValueType> {
-        private final EdgeType type;
-        private final KeyType key;
-        private final PredicateDependencyOrigin origin;
-
-        private PredicateWitness(EdgeType type, KeyType key,
-                                 PredicateDependencyOrigin origin) {
-            this.type = type;
-            this.key = key;
-            this.origin = origin;
-        }
-
-        @Override
-        public String toString() {
-            return type + ":" + key + ":" + origin;
         }
     }
 
@@ -3417,6 +3391,7 @@ class SERSolverAR<KeyType, ValueType> {
         private long dependencyEdgesSkipped;
         private long dependencyEdgesQueued;
         private long dependencyEdgeCandidates;
+        private long dependencyFixedEdgeCandidates;
         private long dependencyPhysicalEdges;
         private long dependencyPhysicalPrWrEdges;
         private long dependencyPhysicalPrRwEdges;
@@ -3444,6 +3419,8 @@ class SERSolverAR<KeyType, ValueType> {
             profiler.addCount("SER_PRED_DEPENDENCY_SKIPPED_COUNT", dependencyEdgesSkipped);
             profiler.addCount("SER_PRED_DEPENDENCY_CANDIDATES_COUNT",
                     dependencyEdgeCandidates);
+            profiler.addCount("SER_PRED_DEPENDENCY_FIXED_CANDIDATES_COUNT",
+                    dependencyFixedEdgeCandidates);
             profiler.addCount("SER_PRED_DEPENDENCY_PHYSICAL_EDGES_COUNT",
                     dependencyPhysicalEdges);
             if (!includeCounts) {

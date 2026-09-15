@@ -109,7 +109,7 @@ class GmwrPropagationTest {
         var graph = new KnownGraph<String, Integer>(history);
         var state = gmwrState(history, graph);
         state.seedKnownDependencies();
-        state.addOrIntersectFrontier(b, 0, 0, "k", List.of(a), true);
+        state.addKnownFact(a, b, EdgeType.PR_WR, "k");
         assertFalse(state.propagate());
         assertTrue(state.precedenceOracle().before(a, b));
 
@@ -149,26 +149,6 @@ class GmwrPropagationTest {
         assertEquals(1, obligations.get(0).items.size());
         assertEquals(Set.of(a1, a2), obligations.get(0).items.get(0).repairs);
         assertTrue(state.stats.mergedConstraints > 0);
-        assertEquals(state.internLogicalRelation(bad, a1),
-                state.internLogicalRelation(bad, a1));
-    }
-
-    @Test
-    void frontierDomainsDoNotMergeAcrossObservationEpochs() {
-        var history = new History<String, Integer>();
-        var reader = history.addTransaction(history.addSession(1L), 1L);
-        var w1 = history.addTransaction(history.addSession(2L), 2L);
-        var w2 = history.addTransaction(history.addSession(3L), 3L);
-        commitAll(history);
-
-        var state = gmwrState(history, new KnownGraph<>(history));
-        state.addOrIntersectFrontier(reader, 0, 0, "k", List.of(w1, w2));
-        state.addOrIntersectFrontier(reader, 1, 1, "k", List.of(w1));
-        var domains = new ArrayList<>(state.frontierDomains());
-
-        assertEquals(2, domains.size());
-        assertEquals(2, domains.get(0).allowed.size());
-        assertEquals(1, domains.get(1).allowed.size());
     }
 
     @Test
@@ -210,39 +190,6 @@ class GmwrPropagationTest {
         assertTrue(state.precedenceOracle().before(reader, bad));
         assertEquals(GmwrPropagationState.FactKind.DERIVED_ORDER,
                 state.definiteFacts().iterator().next().kind);
-    }
-
-    @Test
-    void absentFrontierDoesNotForceUniqueSource() {
-        var history = new History<String, Integer>();
-        var reader = history.addTransaction(history.addSession(1L), 1L);
-        var writer = history.addTransaction(history.addSession(2L), 2L);
-        commitAll(history);
-
-        var state = gmwrState(history, new KnownGraph<>(history));
-        state.addOrIntersectFrontier(reader, 0, 0, "k", List.of(writer), false);
-
-        assertFalse(state.propagate());
-        assertFalse(state.precedenceOracle().before(writer, reader));
-        assertEquals(0L, state.definiteFactCount());
-    }
-
-    @Test
-    void mustExistFrontierForcesUniqueSourceAsTypedPrWr() {
-        var history = new History<String, Integer>();
-        var reader = history.addTransaction(history.addSession(1L), 1L);
-        var writer = history.addTransaction(history.addSession(2L), 2L);
-        commitAll(history);
-
-        var state = gmwrState(history, new KnownGraph<>(history));
-        state.addOrIntersectFrontier(reader, 0, 0, "k", List.of(writer), true);
-
-        assertFalse(state.propagate());
-        assertTrue(state.precedenceOracle().before(writer, reader));
-        var fact = state.definiteFacts().iterator().next();
-        assertTrue(fact.isTypedDependency());
-        assertEquals(EdgeType.PR_WR, fact.type);
-        assertEquals("FRONTIER_UNIQUE_SOURCE", fact.rule);
     }
 
     private static void commitAll(History<?, ?> history) {

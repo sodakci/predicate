@@ -152,8 +152,8 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | `serializationEdgeCache` / `comparablePairs` | `(from,to)` serialization theory-edge literal 与已建立 XOR 的无序 pair。 |
 | `wwOrder` | `(writerFrom,writerTo,key) -> Boolean guard`；多个产生路径以 OR 合并。 |
 | `dependencyEdgesA/B` / `GuardedDependencyEdge` | 等待最终物化的 typed logical edge + guard。 |
-| `predicateDependencyCandidates` | 合并前逐 key PR_WR/PR_RW witness。 |
-| `logicalDependenciesByEndpoint` | `(from,to)` 对应的所有 `GuardedDependencyEdge(SEREdge(type,keys),guard)`；不依赖 MonoSAT 边保留语义，用于 explanation/debugging/paper description。 |
+| `predicateDependencyAccumulators` | 完整 activation guard 生成后立即按 `(from,to,type)` 合并的 PR_WR/PR_RW；不保留逐 witness candidate对象。 |
+| `logicalDependenciesByEndpoint` | `(from,to)` 对应的 `SEREdge(type,keys)`；编码后不再保留仅供物化使用的 guard/origin 包装，用于 explanation/debugging/paper description。 |
 | `KeyFrontier` / `FrontierCandidate` | 某 predicate reader/key 的 latest-visible source 候选及 `visible=writer<reader` literal。 |
 | `PredicateCheck` | general query 的 lazy snapshot refinement 记录。 |
 
@@ -163,8 +163,8 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | --- | --- |
 | `encodeRemainingWwChoices()` | 普通 WW/RW 的唯一 SAT 来源：每个 residual `SERConstraint` 创建一个带`A<n>`的`WW_CHOICE` assumption和一个 fresh `Lit forward`；两侧branch guard分别为`A AND forward`与`A AND not(forward)`，branch 中 WW/RW 由同一 guard 激活。 |
 | `registerWwOrder()` / `wwOrderLiteral()` | 建 key-local WW guard；bottom 顺序返回常量；找不到明确 WW guard 时回退到 auxiliary `orderLiteral()`。 |
-| `addDependencyEdge()` | ordinary edge 入 A/B queue；predicate edge 先做 source legality/dedup，再进 candidate list。 |
-| `prunePredicateDependencies()` | 按 `(from,to,type)` 合并 predicate witnesses，key 集合合并，guard 取 OR；这就是 predicate witness coalescing。 |
+| `addDependencyEdge()` | ordinary edge 入 A/B queue；predicate edge 先完成 assumption/source/latest-visible 等 guard 与 legality/dedup，再立即合入 `(from,to,type)` accumulator。 |
+| `flushPredicateDependencies()` | 将已在线合并的 predicate accumulator 排入 A/B；key 集合已合并，guard 为各 witness guard 的 OR。 |
 | `encodeDependencyEdge()` | 先记录 logical metadata，再 assert `guard -> serialization(from,to)`。fixed edge 的 guard 是 `True`。 |
 | `ensureComparable()` / `directSerializationEdge()` | 对实际被请求比较的 pair assert 两方向 serialization edge XOR；不是预先创建全体 pair。 |
 | `encodeSerializationAcyclicity()` | 断言唯一 `serializationGraph` 的 directed acyclicity literal 为 true。 |

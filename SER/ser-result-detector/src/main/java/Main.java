@@ -232,22 +232,50 @@ class Audit implements Callable<Integer> {
     }
 
     private void printGmwrSummary() {
+        long wwInitial = profiler.getCount("WW_INITIAL_CHOICES");
+        long wwAfterReachability = profiler.getCount("WW_AFTER_REACHABILITY");
+        long wwAfterGmwr = profiler.getCount("WW_AFTER_GMWR");
+        long gmwrInitial = profiler.getCount("GMWR_INITIAL_CONSTRAINTS");
+        long gmwrResidual = profiler.getCount("GMWR_RESIDUAL_CONSTRAINTS");
+        long gmwrMs = profiler.getTime("GMWR_BUILD_MS")
+                + profiler.getTime("GMWR_REDUCTION_MS")
+                + profiler.getTime("GMWR_WW_BRIDGE_MS");
         System.err.println("GMWR");
-        printSummaryTransition("Constraints:",
-                profiler.getCount("GMWR_INITIAL_CONSTRAINTS"),
-                profiler.getCount("GMWR_RESIDUAL_CONSTRAINTS"));
+        printSummaryTransition("Constraints:", gmwrInitial, gmwrResidual);
         printSummaryTransition("Bundles:",
                 profiler.getCount("SER_GMWR_BUNDLES_COUNT"),
                 profiler.getCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT"));
+        System.err.printf(Locale.ROOT,
+                "PRUNING_COMPARISON_STATS ww_original=%d ww_residual=%d ww_reduced=%d "
+                        + "ww_time_ms=%d gmwr_original=%d gmwr_residual=%d "
+                        + "gmwr_reduced=%d gmwr_time_ms=%d "
+                        + "gmwr_obligations_original=%d gmwr_obligations_residual=%d%n",
+                wwInitial, wwAfterReachability,
+                Math.max(0L, wwInitial - wwAfterReachability),
+                profiler.getTime("WW_REACHABILITY_PRUNE_MS"),
+                wwAfterReachability, wwAfterGmwr,
+                Math.max(0L, wwAfterReachability - wwAfterGmwr), gmwrMs,
+                gmwrInitial, gmwrResidual);
         System.err.println();
     }
 
     private void printPredicateSummary() {
+        long attempts = profiler.getCount("SER_PRED_DEPENDENCY_ATTEMPTS_COUNT");
+        long candidates = profiler.getCount("SER_PRED_DEPENDENCY_CANDIDATES_COUNT");
+        long fixedCandidates = profiler.getCount(
+                "SER_PRED_DEPENDENCY_FIXED_CANDIDATES_COUNT");
+        long generatedCandidates = Math.max(0L, candidates - fixedCandidates);
+        long physicalEdges = profiler.getCount("SER_PRED_DEPENDENCY_PHYSICAL_EDGES_COUNT");
         System.err.println("Predicate");
         System.err.printf(Locale.ROOT,
-                "Candidates: %s | Physical edges: %s | Skipped: %s%n%n",
-                grouped(profiler.getCount("SER_PRED_DEPENDENCY_CANDIDATES_COUNT")),
-                grouped(profiler.getCount("SER_PRED_DEPENDENCY_PHYSICAL_EDGES_COUNT")),
+                "Generated PR_WR/PR_RW: %s attempts -> %s remaining%n",
+                grouped(attempts), grouped(generatedCandidates));
+        System.err.printf(Locale.ROOT, "Fixed PR_WR/PR_RW:     %s%n",
+                grouped(fixedCandidates));
+        System.err.printf(Locale.ROOT,
+                "All logical PR edges:  %s -> %s physical edges%n",
+                grouped(candidates), grouped(physicalEdges));
+        System.err.printf(Locale.ROOT, "Skipped: %s%n%n",
                 grouped(profiler.getCount("SER_PRED_DEPENDENCY_SKIPPED_COUNT")));
     }
 

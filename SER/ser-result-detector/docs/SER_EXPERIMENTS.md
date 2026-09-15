@@ -21,6 +21,18 @@
 python3 tools/run_ser_ablation.py HISTORY_ROOT --suite pruning
 ```
 
+只比较 WW 与 GMWR 的剪枝能力、且不进入 MonoSAT 求解时，使用：
+
+```bash
+python3 tools/run_ww_gmwr_pruning_comparison.py
+```
+
+该脚本默认读取 `predicateHistories/kvpredicate/test-ser%`。每条历史只运行一次
+`REACHABILITY + GMWR + WW_GMWR`：WW 削减量为
+`WW_INITIAL_CHOICES - WW_AFTER_REACHABILITY`，GMWR 的增量削减为
+`WW_AFTER_REACHABILITY - WW_AFTER_GMWR`。取得两阶段计数和耗时后立即结束 JVM，不运行 SAT solver。输出逐历史 `raw.csv`、按谓词操作比例取中位数的
+`summary.csv`，以及 `pruning_time.svg`、`pruned_constraints.svg`。
+
 三个 suite：
 
 | suite | 配置 | 用途 |

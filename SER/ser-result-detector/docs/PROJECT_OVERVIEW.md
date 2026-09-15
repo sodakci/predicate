@@ -537,13 +537,13 @@ type
 keys
 ```
 
-普通边初始通常只有一个 key。谓词 coalescing 后，同一个 `SEREdge` 可以保存多个 witness key。
+普通边初始通常只有一个 key；`SEREdge` 对 0/1 key 使用空值或直接字段，出现第二个不同 key 时才升级为集合。谓词 coalescing 后，同一个 `SEREdge` 可以保存多个 witness key。
 
-非谓词依赖按同一个 guard 下的完整 `SEREdge` 去重。谓词依赖先用 `(from,to,type,key,guard identity)` 去掉完全重复的 witness，再进入 predicate candidate 队列。
+非谓词依赖按同一个 guard 下的完整 `SEREdge` 去重。谓词依赖先用 `(from,to,type,key,guard identity)` 去掉完全重复的 witness，再在完整 guard 已生成的当前位置直接合入 transaction-level accumulator，不保存逐 witness candidate 对象。
 
 ### 8.2 谓词 witness coalescing：按 `(from,to,type)`
 
-`prunePredicateDependencies` 的分组键明确包含 `type`：
+在线 accumulator 的分组键明确包含 `type`：
 
 ```text
 PredicateTransactionEdgeKey = (from, to, type)
@@ -902,8 +902,9 @@ g3 -> E(B,A)
 
 ```text
 addDependencyEdge
-  -> predicate candidates / exact dedup
-  -> prunePredicateDependencies（可选，按 from/to/type 合并）
+  -> complete guard / exact dedup
+  -> predicateDependencyAccumulators（可选，立即按 from/to/type 合并）
+  -> flushPredicateDependencies
   -> queueGuardedDependency
   -> encodeDependencyEdges
   -> encodeDependencyEdge

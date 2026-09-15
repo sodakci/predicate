@@ -12,7 +12,8 @@ class SEREdge<KeyType, ValueType> {
     private final Transaction<KeyType, ValueType> from;
     private final Transaction<KeyType, ValueType> to;
     private final EdgeType type;
-    private final LinkedHashSet<KeyType> keys = new LinkedHashSet<>();
+    private KeyType singleKey;
+    private LinkedHashSet<KeyType> multipleKeys;
 
     SEREdge(Transaction<KeyType, ValueType> from,
             Transaction<KeyType, ValueType> to,
@@ -21,9 +22,7 @@ class SEREdge<KeyType, ValueType> {
         this.from = from;
         this.to = to;
         this.type = type;
-        if (key != null) {
-            this.keys.add(key);
-        }
+        this.singleKey = key;
     }
 
     Transaction<KeyType, ValueType> getFrom() {
@@ -39,15 +38,45 @@ class SEREdge<KeyType, ValueType> {
     }
 
     KeyType getKey() {
-        return keys.isEmpty() ? null : keys.iterator().next();
+        return multipleKeys == null ? singleKey : multipleKeys.iterator().next();
     }
 
     Set<KeyType> getKeys() {
-        return Collections.unmodifiableSet(keys);
+        if (multipleKeys != null) {
+            return Collections.unmodifiableSet(multipleKeys);
+        }
+        return singleKey == null ? Collections.emptySet() : Collections.singleton(singleKey);
     }
 
     boolean addKey(KeyType key) {
-        return key != null && keys.add(key);
+        if (key == null) {
+            return false;
+        }
+        if (multipleKeys != null) {
+            return multipleKeys.add(key);
+        }
+        if (singleKey == null) {
+            singleKey = key;
+            return true;
+        }
+        if (Objects.equals(singleKey, key)) {
+            return false;
+        }
+        multipleKeys = new LinkedHashSet<>();
+        multipleKeys.add(singleKey);
+        multipleKeys.add(key);
+        singleKey = null;
+        return true;
+    }
+
+    void addKeysTo(SEREdge<KeyType, ValueType> target) {
+        if (multipleKeys == null) {
+            target.addKey(singleKey);
+            return;
+        }
+        for (var key : multipleKeys) {
+            target.addKey(key);
+        }
     }
 
     @Override
@@ -62,16 +91,33 @@ class SEREdge<KeyType, ValueType> {
         return type == other.type
                 && Objects.equals(from, other.from)
                 && Objects.equals(to, other.to)
-                && keys.equals(other.keys);
+                && keysEqual(other);
+    }
+
+    private boolean keysEqual(SEREdge<?, ?> other) {
+        if (multipleKeys == null && other.multipleKeys == null) {
+            return Objects.equals(singleKey, other.singleKey);
+        }
+        if (multipleKeys == null) {
+            return other.multipleKeys.size() == 1
+                    && other.multipleKeys.contains(singleKey);
+        }
+        if (other.multipleKeys == null) {
+            return multipleKeys.size() == 1 && multipleKeys.contains(other.singleKey);
+        }
+        return multipleKeys.equals(other.multipleKeys);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(from, to, type, keys);
+        int keysHash = multipleKeys == null
+                ? Objects.hashCode(singleKey)
+                : multipleKeys.hashCode();
+        return Objects.hash(from, to, type, keysHash);
     }
 
     @Override
     public String toString() {
-        return String.format("(%s -> %s, %s, %s)", from, to, type, keys);
+        return String.format("(%s -> %s, %s, %s)", from, to, type, getKeys());
     }
 }

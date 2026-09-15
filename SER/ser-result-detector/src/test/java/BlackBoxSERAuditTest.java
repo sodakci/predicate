@@ -42,7 +42,11 @@ class BlackBoxSERAuditTest {
                 "History\nTransactions: 2 | Events: 2 | Predicates: 0"),
                 () -> "stderr was:\n" + result.stderr);
         assertTrue(result.stderr.contains("WW\n1 -> 1"));
-        assertTrue(result.stderr.contains("Predicate\nCandidates:"));
+        assertTrue(result.stderr.contains("Predicate\nGenerated PR_WR/PR_RW:"));
+        assertTrue(result.stderr.contains(" attempts -> "));
+        assertTrue(result.stderr.contains(" remaining\nFixed PR_WR/PR_RW:"));
+        assertTrue(result.stderr.contains("\nAll logical PR edges:"));
+        assertTrue(result.stderr.contains(" physical edges\nSkipped:"));
         assertTrue(result.stderr.contains("SAT\nVariables:"));
         assertTrue(result.stderr.contains("Timing\nWW:"));
         assertTrue(result.stderr.contains("Peak memory:"));

@@ -254,6 +254,8 @@ class SERSolverARSatEncodingTest {
                 SERVerifier.PredicateSolvingMode.GMWR);
 
         long candidates = profiler.getCount("SER_PRED_DEPENDENCY_CANDIDATES_COUNT");
+        long fixedCandidates = profiler.getCount(
+                "SER_PRED_DEPENDENCY_FIXED_CANDIDATES_COUNT");
         long physical = profiler.getCount("SER_PRED_DEPENDENCY_PHYSICAL_EDGES_COUNT");
         long physicalPrWr = profiler.getCount(
                 "SER_PRED_DEPENDENCY_PHYSICAL_PR_WR_EDGES_COUNT");
@@ -270,6 +272,9 @@ class SERSolverARSatEncodingTest {
         long coalesced = profiler.getCount("SER_PRED_DEPENDENCY_COALESCED_COUNT");
         assertTrue(candidates > physical,
                 "same writer/reader predicate witnesses from x and y must share one physical edge");
+        assertTrue(fixedCandidates > 0,
+                "recorded predicate sources must be reported separately as fixed PR edges");
+        assertTrue(fixedCandidates <= candidates);
         assertEquals(candidates - physical, coalesced);
         assertEquals(physical, physicalPrWr + physicalPrRw,
                 "the physical predicate edge total must equal its PR_WR/PR_RW partition");

@@ -99,15 +99,15 @@ cd SER/ser-result-detector
 
 当前公开入口是 `PRHIST`。输入可以是：
 
-- 一个 `history.prhist.jsonl` 文件。
-- 一个包含 `history.prhist.jsonl` 和 `initial_state.json` 的 `hist-00000` 目录。
+- 一个 `history.prhist.jsonl.zst` 或旧版 `history.prhist.jsonl` 文件。
+- 一个包含上述 history 文件和 `initial_state.json` 的 `hist-00000` 目录；两种 history 同时存在时优先读取压缩文件。
 
 目录形态：
 
 ```text
 hist-00000/
   initial_state.json
-  history.prhist.jsonl
+  history.prhist.jsonl.zst
   manifest.json
 ```
 
@@ -122,7 +122,7 @@ hist-00000/
 ]
 ```
 
-`history.prhist.jsonl` 每行一个已提交事务：
+history 解压后是 JSONL，每行一个已提交事务：
 
 ```json
 {"session":0,"session_seq":1,"txn":1001,"status":"commit","ops":[{"type":"r","key":"kv:0","value":0},{"type":"w","key":"kv:0","value":10}]}
@@ -187,7 +187,7 @@ java -Djava.library.path=build/monosat -Xmx8g \
   audit /absolute/path/to/hist-00000
 ```
 
-普通 `audit` 按 History、WW、可选 GMWR、Predicate、SAT、Timing 的完成顺序流式打印精简摘要；数量带千位分隔符，时间统一为秒并保留三位小数。History 中的 Events 仅统计客户端事务事件，不包含内部初始版本写。稳定 verdict 始终是最后一行：
+普通 `audit` 按 History、WW、可选 GMWR、Predicate、SAT、Timing 的完成顺序流式打印精简摘要；数量带千位分隔符，时间统一为秒并保留三位小数。Predicate 摘要分别展示编码阶段生成的 `PR_WR/PR_RW` 尝试及剩余 logical candidate、编码前已确定的 fixed PR candidate，并展示两者合计后按 `(from,to,type)` 合并得到的 physical edge 数。History 中的 Events 仅统计客户端事务事件，不包含内部初始版本写。稳定 verdict 始终是最后一行：
 
 ```text
 SER audit result: ACCEPT
@@ -332,6 +332,36 @@ python3 tools/run_ser_ablation.py \
 ```
 
 两个入口都保存 stdout/stderr 和 raw CSV，并汇总 verdict、耗时、MonoSAT、内存及 GMWR 指标。catalog runner 只保留 catalog 选样和期望 verdict 校验，复用主 runner 的进程执行与日志解析函数。
+
+### 运行 WW/GMWR 剪枝对比
+
+先构建可运行分发，再运行专用脚本。不传历史路径时，默认处理 `predicateHistories/kvpredicate/test-ser%` 下的全部谓词比例：
+
+```bash
+cd SER/ser-result-detector
+./gradlew installDist
+python3 tools/run_ww_gmwr_pruning_comparison.py
+```
+
+如果只运行实际谓词比例低于指定阈值的历史，使用 `--predicate-ratio-below`：
+
+```bash
+python3 tools/run_ww_gmwr_pruning_comparison.py \
+  --predicate-ratio-below 0.10
+```
+
+阈值使用 0–1 的小数表示；`0.10` 表示只运行 `manifest.json` 中实际谓词操作比例严格低于 10% 的历史，等于 10% 的历史不会运行。
+
+如果只运行一个谓词比例，通过 `PREDICATE_RATIO` 选择对应的已有历史目录：
+
+```bash
+cd SER/ser-result-detector
+PREDICATE_RATIO=0.10
+python3 tools/run_ww_gmwr_pruning_comparison.py \
+  "../../predicateHistories/kvpredicate/test-ser%/20_100_10_5000_${PREDICATE_RATIO}_uniform"
+```
+
+`PREDICATE_RATIO` 使用 0–1 的小数表示，例如 `0.10` 表示 10%；指定的目录必须已存在。脚本读取每份 history 的 `manifest.json` 计算实际谓词操作比例，并生成 `raw.csv`、`summary.csv`、`pruning_time.svg` 和 `pruned_constraints.svg`。`pruned_constraints.svg` 分别比较 WW 相对初始 WW 约束、GMWR 相对 WW 剩余约束的削减百分比；`pruning_time.svg` 分别比较 WW reachability 与 GMWR feedback 阶段的中位耗时（秒）。
 
 ## 运行 catalog 实验
 
@@ -498,8 +528,8 @@ SER_RESULT_DETECTOR_HEAP=32g tools/audit-prhist.sh /absolute/path/to/root
 
 优先检查：
 
-- `hist-00000` 下是否同时有 `history.prhist.jsonl` 和 `initial_state.json`。
-- `history.prhist.jsonl` 中是否只有 `status: "commit"` 的事务。
+- `hist-00000` 下是否同时有 `history.prhist.jsonl.zst`（或旧版 `.jsonl`）和 `initial_state.json`。
+- history 解压后的 JSONL 中是否只有 `status: "commit"` 的事务。
 - `r` 和 `pr.result.inputs` 引用的 `(key,value)` 是否能在初始版本或写操作中找到。
 - 写入的 `(key,value)` 是否唯一。
 - 谓词读是否使用当前 loader 支持的 `query/result` 格式。

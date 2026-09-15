@@ -213,15 +213,15 @@ non-predicate fixed A+B edges
 | 审计项 | 当前实现 |
 | --- | --- |
 | 1. 输入 | baseline-pruned A+B、residual WW constraints、predicate observations和 writes。 |
-| 2. 输出 | `PrecedenceOracle` 中的确定顺序、GMWR obligations/frontier domains、definite typed/order facts；可进一步减少 residual WW或产生冲突。 |
-| 3. 核心结构 | 从 `SERVerifier`注入的同一 `PrecedenceOracle`、`GmwrObligation(reader,badWriter)`、`GmwrItem(repairs)`、`FrontierDomain`、`DependencyFact`、work queue。 |
+| 2. 输出 | `PrecedenceOracle` 中的确定顺序、GMWR obligations、definite typed/order facts；可进一步减少 residual WW或产生冲突。 |
+| 3. 核心结构 | 从 `SERVerifier`注入的同一 `PrecedenceOracle`、`GmwrObligation(reader,badWriter)`、`GmwrItem(repairs)`、`DependencyFact`、work queue。 |
 | 4. 代码 | `SERSolverAR.propagateBeforeEncoding/collectGmwrLogicalConstraints/propagateGmwrToWwFixpoint`；`GmwrPropagationState`；`GmwrWwBridge`。 |
-| 5. 信息变化 | 移除会成环的 repair/source；识别已满足 obligation；强制 `reader<bad`、singleton repair chain、唯一 PR_WR；`WW_GMWR` 还可强制 WW/RW branch并写回 KnownGraph。 |
+| 5. 信息变化 | 移除会成环的 repair；识别已满足 obligation；强制 `reader<bad`、singleton repair chain；已记录 PR_WR source 直接作为 definite fact，latest-visible 仍由编码阶段校验；`WW_GMWR` 还可强制 WW/RW branch并写回 KnownGraph。 |
 | 6. 推导类型 | checker 确定性 propagation；没有 SAT decision。 |
 | 7. graph edge | feedback branch写 Guava WW/RW；typed definite fact保留 logical metadata并稍后进入 serialization graph；derived order也只进入 serialization graph。 |
 | 8. literal/constraint | 此阶段本身不创建 SAT literal。未决定 obligation稍后才转为 clauses。 |
 | 9. 下一阶段消费 | `buildKnownOrder/encodeKnownEdges`消费 definite facts；`resolveAndEncodeGmwrBundles()`消费 residual obligations。 |
-| 10. 复杂度 | reachability O(T²/word) 空间；每个新 definite fact增量 closure最坏 O(T²/word)；repair/frontier work量与 item/candidate 数相关；WW feedback按轮扫描受影响或全部 residual constraints。 |
+| 10. 复杂度 | reachability O(T²/word) 空间；每个新 definite fact增量 closure最坏 O(T²/word)；repair work量与 item/candidate 数相关；WW feedback按轮扫描受影响或全部 residual constraints。传播结束即释放反向索引和队列，definite facts/residual obligations 编码并发布统计后释放对应容器。 |
 
 GMWR item 的逻辑形态为：
 
@@ -244,7 +244,7 @@ OR
 | --- | --- |
 | 1. 输入 | fixed A+B、GMWR definite facts、residual WW constraints、predicate observations、write indexes。 |
 | 2. 输出 | SAT Boolean formula；logical dependency metadata；`serializationGraph` 的 conditional/fixed theory edges；一个 `acyclic` assertion；general query refinement records。 |
-| 3. 核心结构 | `serializationEdgeCache/comparablePairs/wwOrder`、`GuardedDependencyEdge`、`logicalDependenciesByEndpoint`、predicate candidates、`KeyFrontier`、`PredicateCheck`、一张 `monosat.Graph`。 |
+| 3. 核心结构 | `serializationEdgeCache/comparablePairs/wwOrder`、`GuardedDependencyEdge`、`logicalDependenciesByEndpoint`、predicate dependency accumulators、`KeyFrontier`、`PredicateCheck`、一张 `monosat.Graph`。 |
 | 4. 代码 | `SERSolverAR` constructor 中 `encodeKnownEdges/encodeRemainingWwChoices/encodePredicateConstraints/encodeDependencyEdges/encodeSerializationAcyclicity`。 |
 | 5. 信息变化 | checker candidates转成 guards、clauses、implications和 physical theory edges；predicate witnesses可合并；known/forced facts assert true。 |
 | 6. 推导类型 | fixed/constant simplification确定；residual WW、frontier、GMWR repair由 SAT decision。 |
@@ -285,10 +285,12 @@ backward -> c.edges2 中每条 dependency/order edge
 | 压缩 | 实现 | 删除/复用什么 | 是否改变语义条件 |
 | --- | --- | --- | --- |
 | WW constraint coalescing | `generateConstraintsCoalesce()` | 同 transaction pair跨 key共用一个 branch choice | 目标是保留全局 transaction order语义。 |
-| Predicate witness coalescing | `prunePredicateDependencies()` | 相同 `(from,to,type)` 的逐 key PR witness合为一个 `SEREdge(keys)`，guard取 OR | physical typed edge只需在任一 witness成立时启用。 |
+| Predicate witness coalescing | `addDependencyEdge()` / `flushPredicateDependencies()` | 完整 guard 生成后立即把相同 `(from,to,type)` 的逐 key PR witness合入一个 accumulator，key合并且guard取 OR；不保留逐 witness candidate对象 | physical typed edge只需在任一 witness成立时启用。 |
 | Graph-edge interning / physical merge | `encodeDependencyEdge()` / `directSerializationEdge()` | 相同 `(from,to)` 的 relation type/key可共享一个 `serializationGraph` edge literal | 只压 endpoint physical edge；logical metadata仍被记录。 |
 
 后两项适用于 EAGER 和 GMWR，不是 GMWR 专属优化。
+
+`SEREdge` 对 0/1 个 key 使用空值或直接字段，仅在第二个不同 key 合入时升级为 `LinkedHashSet`。GMWR definite-fact assumption 保存结构化 `DependencyFact`，只在冲突输出调用 `getReason()` 时格式化解释字符串；assumption literal 与诊断粒度不变。
 
 ### 4.8 MonoSAT Solve、Predicate Refinement 与 Verdict
 
@@ -752,10 +754,7 @@ semantic guard assignment
 - GMWR obligation：resolved/satisfied的不编码，但其结论来自已编码fixed facts；其余由 `resolveAndEncodeGmwrBundles()`逐 item加clause。
 - general predicate：不一次性进入初始CNF，但每个 `PredicateCheck`在每次SAT model后执行，mismatch必加no-good再solve。
 
-未发现一个已确认会在当前正常路径中静默丢失、从而完全不约束solver的 ordinary或GMWR item。不过存在两类需要警惕的“非直接消费”结构：
-
-1. `GmwrPropagationState.frontierDomains()`没有一个直接的SAT编码遍历；forced unique source进入 `definiteFacts`，residual frontier则依赖后续 `createKeyFrontier()`重新构造等价语义。代码没有对两套candidate domain做一致性断言。
-2. `LogicalRelation.forced`和 `FactKind.CONDITIONAL_ORDER`当前没有求解消费路径；residual GMWR实际直接调用 `orderLiteral()`。这些对象当前更像bookkeeping/残留接口，不能当成已编码constraint。
+未发现一个已确认会在当前正常路径中静默丢失、从而完全不约束solver的 ordinary或GMWR item。原 GMWR optional frontier 没有 SAT 编码消费者，且 row-local 编码会由 `createKeyFrontier()`重新建立 latest-visible 语义，因此不再持久化；已记录 source 直接进入 `definiteFacts`。原无读取方的 `LogicalRelation` bookkeeping 同步删除。
 
 ## 11. SAT/MonoSAT 到最终 verdict
 
@@ -816,8 +815,7 @@ SAT assignment不会生成一个新的 Java transaction sequence。solver 只通
 ### 13.3 Pruning / propagation 交接
 
 7. **deterministic order交接已统一。** `Pruning`、GMWR和solver通过constructor injection持有同一个audit-scoped oracle；中间derived order无需复制即可继续可见。typed WW/RW仍写回KnownGraph，以保留type/key metadata。
-8. **GMWR residual frontier domain没有直接编码消费者。** fixed/unique结果通过definite facts传递，residual语义由`createKeyFrontier()`重新生成。需要在大规模或边界query上验证preprop domain削减与重建candidate完全一致。
-9. **存在未参与实际流程的GMWR bookkeeping。** `LogicalRelation.forced`未被读取，`FactKind.CONDITIONAL_ORDER`没有构造点，`BadWriterObligation.outsideAllowed`当前总为true且未被消费。它们不构成当前已确认漏约束，但容易让维护者误以为存在额外编码路径。
+8. **GMWR 预传播只保留被消费的 obligation。** optional frontier 不产生 definite fact、冲突或 residual SAT clause，已取消持久化；row-local `KeyFrontier`仍在编码时完整建立并检查 latest-visible，GENERAL refinement 的 frontier 仍保留到求解结束。
 10. **baseline branch物化器不写回PR_RW。** `Pruning.addToKnownGraph()`跳过PR_RW。当前ordinary constraint generation不会把PR_RW放入baseline constraints，所以主路径未触发；若未来复用该pruner处理predicate option，这会成为必须重新审计的接口缺口。
 
 ### 13.4 EAGER/GMWR 等价与求解边界

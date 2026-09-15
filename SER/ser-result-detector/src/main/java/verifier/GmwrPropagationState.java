@@ -32,18 +32,15 @@ final class GmwrPropagationState<KeyType, ValueType> {
     enum ReductionReason {
         CYCLE,
         REACHABLE,
-        DOMINATED,
         SATISFIED,
         SINGLETON,
         OUTSIDE_IMPOSSIBLE,
-        FORCE_OUTSIDE,
-        ABSENCE
+        FORCE_OUTSIDE
     }
 
     enum FactKind {
         TYPED_DEPENDENCY,
-        DERIVED_ORDER,
-        CONDITIONAL_ORDER
+        DERIVED_ORDER
     }
 
     private final KnownGraph<KeyType, ValueType> graph;
@@ -52,21 +49,12 @@ final class GmwrPropagationState<KeyType, ValueType> {
     private final List<DependencyFact<KeyType, ValueType>> definiteFacts = new ArrayList<>();
 
     private final Map<Pair<Transaction<KeyType, ValueType>, Transaction<KeyType, ValueType>>,
-            LogicalRelation<KeyType, ValueType>> sharedLogicalRelations = new LinkedHashMap<>();
-    private final Map<Pair<Transaction<KeyType, ValueType>, Transaction<KeyType, ValueType>>,
             GmwrObligation<KeyType, ValueType>> gmwrByPair = new LinkedHashMap<>();
     private final Map<Transaction<KeyType, ValueType>,
             Set<GmwrObligation<KeyType, ValueType>>> gmwrByTxn = new HashMap<>();
-    private final Map<FrontierKey<KeyType, ValueType>, FrontierDomain<KeyType, ValueType>>
-            frontiers = new LinkedHashMap<>();
-    private final Map<Transaction<KeyType, ValueType>,
-            Set<FrontierDomain<KeyType, ValueType>>> frontiersByReader = new HashMap<>();
-    private final Map<Transaction<KeyType, ValueType>,
-            Set<FrontierDomain<KeyType, ValueType>>> frontiersByWriter = new HashMap<>();
-
-    private final ArrayDeque<WorkItem<KeyType, ValueType>> workQueue = new ArrayDeque<>();
+    private final ArrayDeque<GmwrObligation<KeyType, ValueType>> workQueue =
+            new ArrayDeque<>();
     private final Set<GmwrObligation<KeyType, ValueType>> queuedGmwr = new HashSet<>();
-    private final Set<FrontierDomain<KeyType, ValueType>> queuedFrontiers = new HashSet<>();
     private final Set<Transaction<KeyType, ValueType>> lastReachabilityTouched =
             new HashSet<>();
     private boolean suppressDirtyNotifications;
@@ -118,21 +106,13 @@ final class GmwrPropagationState<KeyType, ValueType> {
             for (var gmwr : gmwrByPair.values()) {
                 enqueueGmwr(gmwr);
             }
-            for (var frontier : frontiers.values()) {
-                enqueueFrontier(frontier);
-            }
             while (!workQueue.isEmpty() && !conflict) {
                 stats.reductionSteps++;
-                var item = workQueue.removeFirst();
-                if (item.kind == WorkItem.Kind.GMWR) {
-                    queuedGmwr.remove(item.gmwr);
-                    reduceGmwr(item.gmwr);
-                } else {
-                    queuedFrontiers.remove(item.frontier);
-                    reduceFrontier(item.frontier);
-                }
+                var gmwr = workQueue.removeFirst();
+                queuedGmwr.remove(gmwr);
+                reduceGmwr(gmwr);
             }
-            stats.residualConstraints = residualGmwrCount() + residualFrontierCount();
+            stats.residualConstraints = residualGmwrCount();
             return conflict;
         } finally {
             profiler.endTick("GMWR_REDUCTION_MS");
@@ -163,19 +143,8 @@ final class GmwrPropagationState<KeyType, ValueType> {
         return gmwrByPair.values();
     }
 
-    Collection<FrontierDomain<KeyType, ValueType>> frontierDomains() {
-        return frontiers.values();
-    }
-
     PrecedenceOracle<Transaction<KeyType, ValueType>> precedenceOracle() {
         return precedence;
-    }
-
-    LogicalRelation<KeyType, ValueType> internLogicalRelation(
-            Transaction<KeyType, ValueType> from,
-            Transaction<KeyType, ValueType> to) {
-        return sharedLogicalRelations.computeIfAbsent(
-                Pair.of(from, to), ignored -> new LogicalRelation<>(from, to));
     }
 
     void addGmwrItem(Transaction<KeyType, ValueType> reader,
@@ -194,10 +163,7 @@ final class GmwrPropagationState<KeyType, ValueType> {
                 continue;
             }
             repairSet.add(repair);
-            internLogicalRelation(badWriter, repair);
-            internLogicalRelation(repair, reader);
         }
-        internLogicalRelation(reader, badWriter);
 
         var pair = Pair.of(reader, badWriter);
         var obligation = gmwrByPair.computeIfAbsent(
@@ -212,46 +178,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
             indexGmwr(repair, obligation);
         }
         enqueueGmwr(obligation);
-    }
-
-    void addOrIntersectFrontier(Transaction<KeyType, ValueType> reader,
-                                int eventIndex,
-                                int coverageEpoch,
-                                KeyType key,
-                                Collection<Transaction<KeyType, ValueType>> allowed) {
-        addOrIntersectFrontier(reader, eventIndex, coverageEpoch, key, allowed, false);
-    }
-
-    void addOrIntersectFrontier(Transaction<KeyType, ValueType> reader,
-                                int eventIndex,
-                                int coverageEpoch,
-                                KeyType key,
-                                Collection<Transaction<KeyType, ValueType>> allowed,
-                                boolean mustExist) {
-        stats.initialConstraints++;
-        var frontierKey = new FrontierKey<>(reader, eventIndex, coverageEpoch, key);
-        var allowedSet = new LinkedHashSet<Transaction<KeyType, ValueType>>();
-        for (var writer : allowed) {
-            if (writer != null && !writer.equals(reader)) {
-                allowedSet.add(writer);
-            }
-        }
-        var existing = frontiers.get(frontierKey);
-        if (existing == null) {
-            var domain = new FrontierDomain<>(frontierKey, allowedSet, mustExist);
-            frontiers.put(frontierKey, domain);
-            frontiersByReader.computeIfAbsent(reader, ignored -> new HashSet<>()).add(domain);
-            for (var writer : allowedSet) {
-                frontiersByWriter.computeIfAbsent(writer, ignored -> new HashSet<>()).add(domain);
-            }
-            enqueueFrontier(domain);
-            return;
-        }
-        existing.allowed.retainAll(allowedSet);
-        existing.mustExist |= mustExist;
-        existing.absencePossible = !existing.mustExist;
-        existing.lastReason = ReductionReason.DOMINATED;
-        enqueueFrontier(existing);
     }
 
     /** Adds a known fact discovered outside GMWR, without publishing feedback. */
@@ -371,7 +297,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
     }
 
     private void forceOutside(GmwrObligation<KeyType, ValueType> gmwr) {
-        internLogicalRelation(gmwr.reader, gmwr.badWriter).forced = true;
         addDerivedOrder(gmwr.reader, gmwr.badWriter, gmwr.keys.isEmpty()
                 ? null : gmwr.keys.iterator().next(), "GMWR_FORCE_OUTSIDE");
         gmwr.lastReason = ReductionReason.FORCE_OUTSIDE;
@@ -380,42 +305,9 @@ final class GmwrPropagationState<KeyType, ValueType> {
     private void forceRepair(GmwrObligation<KeyType, ValueType> gmwr,
                              Transaction<KeyType, ValueType> repair) {
         stats.forcedRepairs++;
-        internLogicalRelation(gmwr.badWriter, repair).forced = true;
-        internLogicalRelation(repair, gmwr.reader).forced = true;
         var key = gmwr.keys.isEmpty() ? null : gmwr.keys.iterator().next();
         addDerivedOrder(gmwr.badWriter, repair, key, "GMWR_SINGLETON_REPAIR");
         addDerivedOrder(repair, gmwr.reader, key, "GMWR_SINGLETON_REPAIR");
-    }
-
-    private void reduceFrontier(FrontierDomain<KeyType, ValueType> frontier) {
-        if (frontier.resolved || conflict) {
-            return;
-        }
-        var iterator = frontier.allowed.iterator();
-        while (iterator.hasNext()) {
-            if (precedence.before(frontier.key.reader, iterator.next())) {
-                iterator.remove();
-                frontier.lastReason = ReductionReason.REACHABLE;
-            }
-        }
-        if (frontier.allowed.isEmpty()) {
-            if (frontier.mustExist) {
-                frontier.lastReason = ReductionReason.CYCLE;
-                stats.conflicts++;
-                conflict = true;
-                return;
-            }
-            frontier.resolved = true;
-            frontier.lastReason = ReductionReason.ABSENCE;
-            return;
-        }
-        if (frontier.mustExist && frontier.allowed.size() == 1) {
-            var source = frontier.allowed.iterator().next();
-            frontier.resolved = true;
-            frontier.lastReason = ReductionReason.SINGLETON;
-            addTypedFact(source, frontier.key.reader, EdgeType.PR_WR,
-                    frontier.key.key, "FRONTIER_UNIQUE_SOURCE");
-        }
     }
 
     private boolean repairAlreadySatisfied(GmwrObligation<KeyType, ValueType> gmwr) {
@@ -488,12 +380,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
                                      Transaction<KeyType, ValueType> to) {
         dirtyGmwrTouching(from);
         dirtyGmwrTouching(to);
-        for (var frontier : frontiersByReader.getOrDefault(from, Collections.emptySet())) {
-            enqueueFrontier(frontier);
-        }
-        for (var frontier : frontiersByWriter.getOrDefault(to, Collections.emptySet())) {
-            enqueueFrontier(frontier);
-        }
     }
 
     private void dirtyGmwrTouching(Transaction<KeyType, ValueType> txn) {
@@ -509,14 +395,21 @@ final class GmwrPropagationState<KeyType, ValueType> {
 
     private void enqueueGmwr(GmwrObligation<KeyType, ValueType> gmwr) {
         if (!gmwr.resolved && queuedGmwr.add(gmwr)) {
-            workQueue.addLast(WorkItem.gmwr(gmwr));
+            workQueue.addLast(gmwr);
         }
     }
 
-    private void enqueueFrontier(FrontierDomain<KeyType, ValueType> frontier) {
-        if (!frontier.resolved && queuedFrontiers.add(frontier)) {
-            workQueue.addLast(WorkItem.frontier(frontier));
-        }
+    void releasePropagationIndexes() {
+        gmwrByTxn.clear();
+        workQueue.clear();
+        queuedGmwr.clear();
+        lastReachabilityTouched.clear();
+    }
+
+    void releaseEncodedState() {
+        knownFacts.clear();
+        definiteFacts.clear();
+        gmwrByPair.clear();
     }
 
     private boolean addPrecedence(Transaction<KeyType, ValueType> from,
@@ -579,9 +472,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
                 if (!writer.equals(reader)) {
                     addTypedFact(writer, reader, EdgeType.PR_WR, source.getKey(),
                             "RECORDED_PREDICATE_SOURCE");
-                    addOrIntersectFrontier(reader, observation.getEventIndex(),
-                            observation.getCoverageEpoch(), source.getKey(),
-                            List.of(writer), true);
                 }
             }
         }
@@ -590,10 +480,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
     private long residualGmwrCount() {
         return gmwrByPair.values().stream()
                 .filter(gmwr -> !gmwr.resolved && !gmwr.satisfied).count();
-    }
-
-    private long residualFrontierCount() {
-        return frontiers.values().stream().filter(frontier -> !frontier.resolved).count();
     }
 
     static boolean isBottomTxn(Transaction<?, ?> txn) {
@@ -706,73 +592,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
         }
     }
 
-    static final class FrontierKey<KeyType, ValueType> {
-        final Transaction<KeyType, ValueType> reader;
-        final int eventIndex;
-        final int coverageEpoch;
-        final KeyType key;
-
-        FrontierKey(Transaction<KeyType, ValueType> reader,
-                    int eventIndex,
-                    int coverageEpoch,
-                    KeyType key) {
-            this.reader = reader;
-            this.eventIndex = eventIndex;
-            this.coverageEpoch = coverageEpoch;
-            this.key = key;
-        }
-
-        @Override
-        public boolean equals(Object object) {
-            if (!(object instanceof FrontierKey)) {
-                return false;
-            }
-            var other = (FrontierKey<?, ?>) object;
-            return eventIndex == other.eventIndex && coverageEpoch == other.coverageEpoch
-                    && Objects.equals(reader, other.reader) && Objects.equals(key, other.key);
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(reader, eventIndex, coverageEpoch, key);
-        }
-    }
-
-    static final class FrontierDomain<KeyType, ValueType> {
-        final FrontierKey<KeyType, ValueType> key;
-        final LinkedHashSet<Transaction<KeyType, ValueType>> allowed;
-        boolean mustExist;
-        boolean absencePossible;
-        boolean resolved;
-        ReductionReason lastReason;
-
-        FrontierDomain(FrontierKey<KeyType, ValueType> key,
-                       Collection<Transaction<KeyType, ValueType>> allowed) {
-            this(key, allowed, false);
-        }
-
-        FrontierDomain(FrontierKey<KeyType, ValueType> key,
-                       Collection<Transaction<KeyType, ValueType>> allowed,
-                       boolean mustExist) {
-            this.key = key;
-            this.allowed = new LinkedHashSet<>(allowed);
-            this.mustExist = mustExist;
-            this.absencePossible = !mustExist;
-        }
-    }
-
-    static final class LogicalRelation<KeyType, ValueType> {
-        final Transaction<KeyType, ValueType> from;
-        final Transaction<KeyType, ValueType> to;
-        boolean forced;
-
-        LogicalRelation(Transaction<KeyType, ValueType> from,
-                        Transaction<KeyType, ValueType> to) {
-            this.from = from;
-            this.to = to;
-        }
-    }
-
     private static final class FactKey<KeyType, ValueType> {
         private final EdgeType type;
         private final Transaction<KeyType, ValueType> from;
@@ -807,29 +626,4 @@ final class GmwrPropagationState<KeyType, ValueType> {
         }
     }
 
-    private static final class WorkItem<KeyType, ValueType> {
-        enum Kind { GMWR, FRONTIER }
-
-        final Kind kind;
-        final GmwrObligation<KeyType, ValueType> gmwr;
-        final FrontierDomain<KeyType, ValueType> frontier;
-
-        private WorkItem(Kind kind,
-                         GmwrObligation<KeyType, ValueType> gmwr,
-                         FrontierDomain<KeyType, ValueType> frontier) {
-            this.kind = kind;
-            this.gmwr = gmwr;
-            this.frontier = frontier;
-        }
-
-        static <KeyType, ValueType> WorkItem<KeyType, ValueType> gmwr(
-                GmwrObligation<KeyType, ValueType> gmwr) {
-            return new WorkItem<>(Kind.GMWR, gmwr, null);
-        }
-
-        static <KeyType, ValueType> WorkItem<KeyType, ValueType> frontier(
-                FrontierDomain<KeyType, ValueType> frontier) {
-            return new WorkItem<>(Kind.FRONTIER, null, frontier);
-        }
-    }
 }
