@@ -13,6 +13,15 @@ public interface QueryScope<KeyType> {
     Set<String> relations();
 
     /**
+     * Physical table mapping shared by scope coverage and query evaluation.
+     * Custom scopes with a different key convention must override this method.
+     * An unqualified legacy key belongs to kv, never to a query-dependent table.
+     */
+    default RelationResolver<KeyType> relationResolver() {
+        return RelationResolver.canonicalKeys();
+    }
+
+    /**
      * Stable immutable value key for reusing scope-derived data. Implementations
      * must return empty when equivalent coverage cannot be expressed safely.
      */
@@ -45,6 +54,11 @@ public interface QueryScope<KeyType> {
         @Override
         public boolean covers(KeyType key) {
             return key != null && relations.contains(resolver.relationOf(key));
+        }
+
+        @Override
+        public RelationResolver<KeyType> relationResolver() {
+            return resolver;
         }
 
         @Override

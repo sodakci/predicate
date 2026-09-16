@@ -14,19 +14,25 @@ public interface RelationResolver<KeyType> {
     }
 
     static RelationResolver<String> canonicalStringKeys() {
+        return canonicalKeys();
+    }
+
+    /** The same physical-key convention for programmatic and loaded histories. */
+    static <KeyType> RelationResolver<KeyType> canonicalKeys() {
         var cacheKey = (Object) java.util.List.of(
                 RelationResolver.class.getName(), "canonicalStringKeys");
         return new RelationResolver<>() {
             @Override
-            public String relationOf(String key) {
+            public String relationOf(KeyType key) {
                 Objects.requireNonNull(key, "key");
-                var separator = key.indexOf(':');
+                var canonical = String.valueOf(key);
+                var separator = canonical.indexOf(':');
                 if (separator <= 0) {
                     // Compact legacy predicate histories used unqualified keys and
                     // represented their only table as relation "kv".
                     return "kv";
                 }
-                return key.substring(0, separator);
+                return canonical.substring(0, separator);
             }
 
             @Override

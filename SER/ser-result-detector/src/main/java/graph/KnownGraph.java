@@ -271,9 +271,9 @@ public class KnownGraph<KeyType, ValueType> {
         var immutablePredicateKeyIds = Map.copyOf(predicateKeyIds);
 
         // Collect predicate-read observations and classify each covered key.
-        // A key is internal only when this transaction already wrote it before
-        // this read, or when an earlier read of the same predicate identity
-        // covered it. Other keys remain external and are resolved by the solver.
+        // Earlier self writes are internal for every query. Repeated-read
+        // coverage is only a row-local optimization: a JOIN's non-contributing
+        // visible rows cannot be reconstructed from its previous result.inputs.
         history.getTransactions().forEach(txn -> {
             var txnEvents = txn.getEvents();
             var writtenKeyIds = new BitSet(predicateKeysById.size());
@@ -297,8 +297,10 @@ public class KnownGraph<KeyType, ValueType> {
                 var internalKeyIds = new BitSet(predicateKeysById.size());
                 var predicate = ev.getPredicate();
                 var predicateIdentity = predicate == null ? null : predicate.identity();
-                var previousSamePredicateKeyIds =
-                        predicateObservedKeyIdsByIdentity.get(predicateIdentity);
+                var canReuseCoverage = predicate != null && predicate.isRowLocal();
+                var previousSamePredicateKeyIds = canReuseCoverage
+                        ? predicateObservedKeyIdsByIdentity.get(predicateIdentity)
+                        : null;
                 for (int keyId = 0; keyId < predicateKeysById.size(); keyId++) {
                     var key = predicateKeysById.get(keyId);
                     if (predicate != null && !predicate.scope().covers(key)) {
@@ -318,10 +320,12 @@ public class KnownGraph<KeyType, ValueType> {
                         && coveredKeyIds.cardinality() == predicateKeysById.size()) {
                     coverageEpoch++;
                 }
-                predicateObservedKeyIdsByIdentity
-                        .computeIfAbsent(predicateIdentity,
-                                ignored -> new BitSet(predicateKeysById.size()))
-                        .or(coveredKeyIds);
+                if (canReuseCoverage) {
+                    predicateObservedKeyIdsByIdentity
+                            .computeIfAbsent(predicateIdentity,
+                                    ignored -> new BitSet(predicateKeysById.size()))
+                            .or(coveredKeyIds);
+                }
             }
         });
     }

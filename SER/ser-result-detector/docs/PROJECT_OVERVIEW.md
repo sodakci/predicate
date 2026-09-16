@@ -8,6 +8,8 @@
 
 日常构建和运行命令见 `SER/README.md`；WW/RW pruning 使用默认的 reachability 检查。
 
+单表与多表谓词读的共同可见性、结果比较及单表加速边界见 [PREDICATE_SEMANTICS.md](PREDICATE_SEMANTICS.md)。
+
 ## 1. 先给出结论
 
 当前实现有三层对象，必须分开理解：

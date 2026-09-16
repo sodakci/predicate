@@ -32,6 +32,11 @@ public final class PredicateFixtures {
             extends PredicateEvaluator<KeyType, ValueType> {
         boolean test(KeyType key, ValueType value);
 
+        @Override
+        default boolean isRowLocal() {
+            return true;
+        }
+
         default boolean covers(KeyType key) {
             return true;
         }

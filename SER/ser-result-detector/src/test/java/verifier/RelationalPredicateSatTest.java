@@ -124,7 +124,7 @@ class RelationalPredicateSatTest {
     }
 
     @Test
-    void gmwrUsesMultiKeyWitnessForMonotoneJoin() throws Exception {
+    void gmwrUsesExplicitEncodingForMonotoneJoin() throws Exception {
         var initialState = "[" + PURCHASE + "," + INVENTORY_EMPTY + ","
                 + "{\"key\":\"control:c0\",\"value\":{\"version\":0}}]";
         var writer = transaction(1, 11,
@@ -142,8 +142,9 @@ class RelationalPredicateSatTest {
 
         assertFalse(audit(history, SERVerifier.PredicateSolvingMode.GMWR));
         assertEquals(1L, profiler.getCount("SER_GMWR_GENERAL_OBSERVATIONS_COUNT"));
-        assertEquals(1L, profiler.getCount("SER_GMWR_GENERAL_WITNESSES_COUNT"));
-        assertEquals(2L, profiler.getCount("SER_GMWR_GENERAL_WITNESS_KEYS_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_GMWR_GENERAL_WITNESSES_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_GMWR_GENERAL_WITNESS_KEYS_COUNT"));
+        assertTrue(profiler.getCount("SER_PRED_BLOCKING_CLAUSES_COUNT") > 0);
     }
 
     @Test

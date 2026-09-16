@@ -2,6 +2,7 @@ package history.query;
 
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -115,6 +116,7 @@ public final class QueryPlan<KeyType, ValueType>
      * Joins, DISTINCT, and custom AST nodes deliberately fall back to the
      * general whole-snapshot evaluator.
      */
+    @Override
     public boolean isRowLocal() {
         return !distinct
                 && QueryAst.isRowLocal(root)
@@ -133,6 +135,51 @@ public final class QueryPlan<KeyType, ValueType>
      */
     public CompactResultProjection compactResultProjection() {
         return compactResultProjection;
+    }
+
+    /**
+     * Enumerates the physical input-version sets of every result-producing
+     * binding over a version pool. This is used by the explicit multi-relation
+     * predicate encoder: each returned map is one JOIN/filter witness, not a
+     * complete visible snapshot.
+     *
+     * <p>The version pool may contain several historical versions of the same
+     * physical key. A single binding is retained only when it is physically
+     * consistent (one value per key). DISTINCT is intentionally unsupported by
+     * this witness API because the detector's current key/value model excludes
+     * DISTINCT semantics.</p>
+     */
+    public List<Map<KeyType, ValueType>> candidateInputBindings(
+            Collection<RowVersion<KeyType, ValueType>> versionPool) {
+        Objects.requireNonNull(versionPool, "versionPool");
+        if (distinct) {
+            throw new QueryException(
+                    "candidate bindings do not support DISTINCT");
+        }
+
+        var context = new QueryExecutionContext<KeyType, ValueType>(
+                new CandidateRowsState<>(versionPool), valueAdapter);
+        var result = new ArrayList<Map<KeyType, ValueType>>();
+        for (var binding : root.execute(context)) {
+            var sources = new LinkedHashMap<KeyType, ValueType>();
+            try {
+                // Evaluate the projection as the real query would. The value is
+                // not stored here; result multiplicity/value equality is already
+                // validated against the recorded source set before encoding.
+                for (var column : columns) {
+                    column.expression().evaluate(binding, context);
+                }
+                for (var source : binding.sources()) {
+                    mergeInput(sources, source.key(), source.value());
+                }
+            } catch (QueryException conflict) {
+                // A self-join binding that selects two different versions of one
+                // physical key cannot occur in any real visible snapshot.
+                continue;
+            }
+            result.add(Collections.unmodifiableMap(sources));
+        }
+        return Collections.unmodifiableList(result);
     }
 
     private CompactResultProjection buildCompactResultProjection(String rowAlias) {
@@ -194,6 +241,60 @@ public final class QueryPlan<KeyType, ValueType>
     @Override
     public String toString() {
         return identity;
+    }
+
+    private static final class CandidateRowsState<KeyType, ValueType>
+            implements VisibleState<KeyType, ValueType> {
+        private final List<RowVersion<KeyType, ValueType>> rows;
+        private final Map<String, List<RowVersion<KeyType, ValueType>>> byRelation;
+
+        private CandidateRowsState(
+                Collection<RowVersion<KeyType, ValueType>> versionPool) {
+            this.rows = Collections.unmodifiableList(new ArrayList<>(versionPool));
+            var grouped = new LinkedHashMap<String, List<RowVersion<KeyType, ValueType>>>();
+            for (var row : rows) {
+                grouped.computeIfAbsent(row.relation(), ignored -> new ArrayList<>())
+                        .add(row);
+            }
+            var immutable = new LinkedHashMap<String, List<RowVersion<KeyType, ValueType>>>();
+            grouped.forEach((relation, relationRows) -> immutable.put(
+                    relation, Collections.unmodifiableList(relationRows)));
+            this.byRelation = Collections.unmodifiableMap(immutable);
+        }
+
+        @Override
+        public ValueType get(KeyType key) {
+            ValueType value = null;
+            boolean found = false;
+            for (var row : rows) {
+                if (!Objects.equals(row.key(), key)) {
+                    continue;
+                }
+                if (found && !Objects.equals(value, row.value())) {
+                    throw new QueryException(
+                            "candidate state has multiple versions for key " + key);
+                }
+                value = row.value();
+                found = true;
+            }
+            return value;
+        }
+
+        @Override
+        public Collection<RowVersion<KeyType, ValueType>> rows() {
+            return rows;
+        }
+
+        @Override
+        public Collection<RowVersion<KeyType, ValueType>> rows(String relation) {
+            return byRelation.getOrDefault(relation, Collections.emptyList());
+        }
+
+        @Override
+        public VisibleState<KeyType, ValueType> replacing(KeyType key, ValueType value) {
+            throw new UnsupportedOperationException(
+                    "candidate version pools are enumeration-only");
+        }
     }
 
     private static final class ProjectedRow<KeyType, ValueType> {

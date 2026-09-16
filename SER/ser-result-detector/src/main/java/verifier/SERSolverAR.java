@@ -1,5 +1,11 @@
 package verifier;
 
+import static history.query.PredicateReadSemantics.evaluatePredicateSnapshot;
+import static history.query.PredicateReadSemantics.expectedPredicateInputs;
+import static history.query.PredicateReadSemantics.predicateEvaluationMatches;
+import static history.query.PredicateReadSemantics.predicateSnapshotMatches;
+import static history.query.PredicateReadSemantics.relationResolverFor;
+
 import graph.Edge;
 import graph.EdgeType;
 import graph.KnownGraph;
@@ -13,6 +19,7 @@ import history.query.QueryPlan;
 import history.query.QueryScope;
 import history.query.RelationResolver;
 import history.query.RowContribution;
+import history.query.RowVersion;
 import monosat.Graph;
 import monosat.Lit;
 import monosat.Logic;
@@ -41,12 +48,6 @@ class SERSolverAR<KeyType, ValueType> {
     private static final int COMPACT_MATCH_FALSE = 1;
     private static final int COMPACT_MATCH_TRUE = 2;
     private static final int MAX_GENERAL_ROW_CONTRIBUTIONS = 32_768;
-
-    private enum PredicateEncodeStatus {
-        ENCODED,
-        UNSUPPORTED,
-        INVALID
-    }
 
     private final History<KeyType, ValueType> history;
     private final KnownGraph<KeyType, ValueType> graph;
@@ -126,15 +127,16 @@ class SERSolverAR<KeyType, ValueType> {
             new PredicateEncodingMetrics();
     private boolean encodingPredicateConstraints;
     private boolean collectingPredicateMetrics;
-    // Predicate constraints are refined lazily from concrete SAT models.  This
-    // avoids eagerly enumerating the Cartesian product of every key frontier.
+    // Only unsupported/custom whole-snapshot evaluators use model refinement.
+    // Supported row-local and monotone multi-relation QueryPlans are complete
+    // before the first solve.
     private final List<PredicateCheck<KeyType, ValueType>> predicateChecks = new ArrayList<>();
     // One source constraint is encoded for every external predicate-read key:
     // either a recorded source is fixed or a latest-visible frontier is chosen.
     private long predicateSourceConstraintCount;
-    // GMWR row-local item obligations are quotiented by (reader,bad-writer);
-    // monotone multi-row queries use exact model refinement with a compact
-    // multi-key witness.
+    // GMWR row-local item obligations are quotiented by (reader,bad-writer).
+    // Multi-relation QueryPlans use the common eager explicit JOIN encoding;
+    // GMWR remains a row-local acceleration only.
     private BitSet[] gmwrSeenBadWritersByReader;
     private long gmwrBundleCount;
     private long gmwrItemObligations;
@@ -821,8 +823,8 @@ class SERSolverAR<KeyType, ValueType> {
             }
             var scopedEntries = scopedWrites(predicate.scope());
             var relationResolver = relationResolverFor(predicateRead);
-            if (!rowLocalSnapshotValid(
-                    predicateRead, relationResolver, resultSourcesByKey)) {
+            if (!recordedPredicateInputsValid(
+                    predicateRead, resultSourcesByKey)) {
                 propagationConflict = true;
                 continue;
             }
@@ -1251,142 +1253,49 @@ class SERSolverAR<KeyType, ValueType> {
                     predicateEncodingMetrics.scopedKeys += scopedEntries.size();
                 }
 
-                if (predicate instanceof QueryPlan
-                        && ((QueryPlan<?, ?>) predicate).isRowLocal()) {
-                    if (collectingPredicateMetrics) {
-                        predicateEncodingMetrics.rowLocalAttempts++;
-                    }
-                    final PredicateEncodeStatus status;
-                    switch (predicateSolvingMode) {
-                    case GMWR:
-                        status = encodeRowLocalPredicateGmwr(
-                                observation, scopedEntries, resultSourcesByKey);
-                        break;
-                    case EAGER:
-                    default:
-                        status = encodeRowLocalPredicateEager(
-                                observation, scopedEntries, resultSourcesByKey);
-                        break;
-                    }
-                    if (status == PredicateEncodeStatus.INVALID) {
-                        assertCurrentPredicate(Lit.False);
-                        if (collectingPredicateMetrics) {
-                            predicateEncodingMetrics.rowLocalEncoded++;
-                        }
-                        continue;
-                    }
-                    if (status == PredicateEncodeStatus.ENCODED) {
-                        if (collectingPredicateMetrics) {
-                            predicateEncodingMetrics.rowLocalEncoded++;
-                        }
-                        continue;
-                    }
-                    if (collectingPredicateMetrics) {
-                        predicateEncodingMetrics.rowLocalFallbacks++;
-                    }
-                }
-                if (collectingPredicateMetrics) {
-                    predicateEncodingMetrics.generalObservations++;
-                }
-
-                boolean gmwrMonotone = predicateSolvingMode
-                        == SERVerifier.PredicateSolvingMode.GMWR
-                        && predicate instanceof QueryPlan
-                        && ((QueryPlan<?, ?>) predicate).isMonotone();
-                if (gmwrMonotone) {
-                    gmwrGeneralObservations++;
-                    var expectedInputs = expectedPredicateInputs(predicateRead);
-                    if (!predicateSnapshotMatches(predicateRead, expectedInputs,
-                            relationResolverFor(predicateRead))) {
-                        assertCurrentPredicate(Lit.False);
-                    }
-                    for (var entry : scopedEntries) {
-                        var recordedSource = resultSourcesByKey.get(entry.key);
-                        if (recordedSource != null
-                                && observation.getPredicateReadType(entry.key)
-                                    == KnownGraph.PredicateReadType.EXTERNAL) {
-                            var externalStarted = startExternalKeyEncoding(true);
-                            try {
-                                encodeGeneralGmwrRecordedSource(
-                                        observation, entry, recordedSource);
-                            } finally {
-                                finishExternalKeyEncoding(true, externalStarted);
-                            }
-                        }
-                    }
-                }
-
                 started = System.nanoTime();
-                var frontierEntries = scopedEntries.stream()
-                        .filter(entry -> observation.getPredicateReadType(entry.key)
-                                == KnownGraph.PredicateReadType.EXTERNAL)
-                        .filter(entry -> !gmwrMonotone
-                                || !resultSourcesByKey.containsKey(entry.key))
-                        .collect(Collectors.toList());
-                predicateEncodingMetrics.generalKeyScanNanos +=
+                var recordedInputsValid = recordedPredicateInputsValid(
+                        predicateRead, resultSourcesByKey);
+                predicateEncodingMetrics.snapshotValidationNanos +=
                         System.nanoTime() - started;
-                if (collectingPredicateMetrics) {
-                    predicateEncodingMetrics.generalExternalKeys += frontierEntries.size();
-                }
-                if (frontierEntries.isEmpty()) {
-                    var snapshot = new LinkedHashMap<KeyType, ValueType>();
-                    for (var entry : scopedEntries) {
-                        var latestSelf = entry.latestSelfBefore(
-                                observation.getTxn(), observation.getEventIndex());
-                        if (latestSelf == null) {
-                            latestSelf = resultSourcesByKey.get(entry.key);
-                        }
-                        if (latestSelf != null) {
-                            snapshot.put(entry.key, latestSelf.getEvent().getValue());
-                        }
-                    }
-                    if (!predicateSnapshotMatches(predicateRead, snapshot,
-                            relationResolverFor(predicateRead))) {
-                        assertCurrentPredicate(Lit.False);
-                    }
+                if (!recordedInputsValid) {
+                    assertCurrentPredicate(Lit.False);
                     continue;
                 }
 
-                var frontiers = new ArrayList<KeyFrontier<KeyType, ValueType>>(
-                        frontierEntries.size());
-                for (var entry : frontierEntries) {
-                    var recordedSource = resultSourcesByKey.get(entry.key);
-                    var externalStarted = startExternalKeyEncoding(
-                            recordedSource != null);
-                    try {
-                        frontiers.add(createKeyFrontier(
-                                observation, entry, recordedSource));
-                    } finally {
-                        finishExternalKeyEncoding(
-                                recordedSource != null, externalStarted);
-                    }
-                }
-
-                for (var resultKey : resultSourcesByKey.keySet()) {
-                    if (!predicate.scope().covers(resultKey)) {
-                        assertCurrentPredicate(Lit.False);
-                    }
-                }
-
-                var snapshot = new LinkedHashMap<KeyType, ValueType>();
-                var frontierKeys = frontierEntries.stream().map(entry -> entry.key)
-                        .collect(Collectors.toSet());
-                for (var entry : scopedEntries) {
-                    if (frontierKeys.contains(entry.key)) {
+                if (predicate instanceof QueryPlan) {
+                    @SuppressWarnings("unchecked")
+                    var plan = (QueryPlan<KeyType, ValueType>) predicate;
+                    if (plan.isRowLocal()) {
+                        if (collectingPredicateMetrics) {
+                            predicateEncodingMetrics.rowLocalAttempts++;
+                        }
+                        switch (predicateSolvingMode) {
+                        case GMWR:
+                            encodeRowLocalPredicateGmwr(
+                                    observation, scopedEntries, resultSourcesByKey);
+                            break;
+                        case EAGER:
+                        default:
+                            encodeRowLocalPredicateEager(
+                                    observation, scopedEntries, resultSourcesByKey);
+                            break;
+                        }
+                        if (collectingPredicateMetrics) {
+                            predicateEncodingMetrics.rowLocalEncoded++;
+                        }
                         continue;
                     }
-                    var latestSelf = entry.latestSelfBefore(
-                            observation.getTxn(), observation.getEventIndex());
-                    if (latestSelf == null) {
-                        latestSelf = resultSourcesByKey.get(entry.key);
-                    }
-                    if (latestSelf != null) {
-                        snapshot.put(entry.key, latestSelf.getEvent().getValue());
+                    if (!plan.distinct() && plan.isMonotone()) {
+                        encodeExplicitMultiRelationPredicate(
+                                observation, scopedEntries, resultSourcesByKey, plan);
+                        continue;
                     }
                 }
-                predicateChecks.add(new PredicateCheck<>(predicateRead, frontiers,
-                        snapshot, relationResolverFor(predicateRead), gmwrMonotone,
-                        resultSourcesByKey.keySet(), currentPredicateAssumption));
+                // Unsupported/custom whole-snapshot evaluators retain the old
+                // model-refinement fallback. DISTINCT is outside the current
+                // unique key/value detector contract.
+                encodeSnapshotPredicate(observation, scopedEntries, resultSourcesByKey);
             }
             currentPredicateAssumption = null;
             if (predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR) {
@@ -1403,6 +1312,454 @@ class SERSolverAR<KeyType, ValueType> {
             predicateEncodingMetrics.publish(
                     Profiler.getInstance(), collectPredicateMetrics);
         }
+    }
+
+    /**
+     * Complete eager encoding for supported non-row-local QueryPlan predicates.
+     *
+     * <p>Unlike the legacy snapshot-refinement path, this method never waits for
+     * a SAT model to discover a bad JOIN result. It enumerates only
+     * result-producing query bindings over the finite version pool, then:
+     * (1) fixes every recorded source as latest-visible, (2) forbids every
+     * additional contributing binding, and (3) emits context-guarded PR_WR /
+     * PR_RW dependencies into the same typed dependency pipeline used by the
+     * row-local encoders.</p>
+     */
+    private void encodeExplicitMultiRelationPredicate(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
+            Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey,
+            QueryPlan<KeyType, ValueType> plan) {
+        var predicateRead = observation.getPredicateReadEvent();
+        var reader = observation.getTxn();
+        var resolver = plan.scope().relationResolver();
+        var recordedInputs = expectedPredicateInputs(predicateRead);
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.generalObservations++;
+            predicateEncodingMetrics.generalExternalKeys += scopedEntries.size();
+        }
+        if (predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR) {
+            gmwrGeneralObservations++;
+        }
+
+        var frontiersByKey = new LinkedHashMap<KeyType,
+                KeyFrontier<KeyType, ValueType>>();
+        var externalWritesByKey = new LinkedHashMap<KeyType,
+                List<KnownGraph.WriteRef<KeyType, ValueType>>>();
+        var versionsByKey = new LinkedHashMap<KeyType,
+                List<QueryVersionWitness<KeyType, ValueType>>>();
+        var versionPool = new ArrayList<RowVersion<KeyType, ValueType>>();
+
+        for (var entry : scopedEntries) {
+            var recordedSource = resultSourcesByKey.get(entry.key);
+            var latestSelf = entry.latestSelfBefore(reader, observation.getEventIndex());
+            var externalWrites = entry.latestExternalWrites(reader);
+            externalWritesByKey.put(entry.key, externalWrites);
+
+            if (latestSelf != null) {
+                if (recordedSource != null && recordedSource != latestSelf) {
+                    assertCurrentPredicate(Lit.False);
+                    return;
+                }
+                var frontier = new KeyFrontier<KeyType, ValueType>(
+                        entry.key, reader,
+                        List.of(new FrontierCandidate<>(latestSelf, Lit.True, Lit.True)),
+                        latestSelf);
+                frontiersByKey.put(entry.key, frontier);
+                addQueryVersionWitness(
+                        versionsByKey, versionPool, resolver, latestSelf, Lit.True);
+                continue;
+            }
+
+            var externalStarted = startExternalKeyEncoding(recordedSource != null);
+            try {
+                var frontier = createExplicitQueryFrontier(
+                        observation, entry, recordedSource);
+                frontiersByKey.put(entry.key, frontier);
+
+                // The current source candidates carry their latest-visible guard.
+                // Additional writes remain in the version pool as hypothetical
+                // replacement targets for contextual PR_RW construction.
+                var selectionByWrite = new IdentityHashMap<
+                        KnownGraph.WriteRef<KeyType, ValueType>, Lit>();
+                for (var candidate : frontier.candidates) {
+                    selectionByWrite.put(candidate.write, candidate.latest);
+                }
+                for (var write : externalWrites) {
+                    addQueryVersionWitness(
+                            versionsByKey, versionPool, resolver, write,
+                            selectionByWrite.get(write));
+                }
+
+                encodeExplicitPrWr(frontier, recordedSource);
+            } finally {
+                finishExternalKeyEncoding(recordedSource != null, externalStarted);
+            }
+        }
+
+        final List<Map<KeyType, ValueType>> bindings;
+        try {
+            bindings = plan.candidateInputBindings(versionPool);
+        } catch (QueryException exception) {
+            assertCurrentPredicate(Lit.False);
+            return;
+        }
+
+        var contributionContexts = new IdentityHashMap<
+                KnownGraph.WriteRef<KeyType, ValueType>, Lit>();
+        for (var binding : bindings) {
+            var resolved = resolveQueryBinding(binding, versionsByKey);
+            if (resolved == null) {
+                // The detector contract requires globally unique (key,value)
+                // sources. Ambiguity is therefore an invalid history/model.
+                assertCurrentPredicate(Lit.False);
+                return;
+            }
+
+            encodeAdditionalBindingExclusion(binding, recordedInputs, resolved);
+            accumulateContributionContexts(resolved, contributionContexts);
+        }
+
+        // Result-change dependencies are key-local in their target write, but
+        // their activation context can mention latest-visible versions from the
+        // other relations participating in the JOIN.
+        for (var entry : scopedEntries) {
+            var frontier = frontiersByKey.get(entry.key);
+            if (frontier == null) {
+                continue;
+            }
+            if (frontier.fixedWrite != null
+                    && frontier.fixedWrite.getTxn().equals(frontier.reader)) {
+                // Only a query-before self-write frontier is internal.  An
+                // external recorded source is also stored as fixedWrite, but it
+                // is the PR_WR anchor from which later same-key writes must be
+                // checked for contextual PR_RW dependencies.
+                continue;
+            }
+            var externalStarted = startExternalKeyEncoding(
+                    resultSourcesByKey.containsKey(entry.key));
+            try {
+                encodeExplicitPrRw(
+                        frontier,
+                        externalWritesByKey.getOrDefault(
+                                entry.key, Collections.emptyList()),
+                        contributionContexts);
+            } finally {
+                finishExternalKeyEncoding(
+                        resultSourcesByKey.containsKey(entry.key), externalStarted);
+            }
+        }
+    }
+
+    /** Builds a latest-visible frontier without row-local GMWR pruning or
+     * row-local predicate-dependency side effects. */
+    private KeyFrontier<KeyType, ValueType> createExplicitQueryFrontier(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            KeyWriteIndex<KeyType, ValueType> writeIndex,
+            KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
+        predicateSourceConstraintCount++;
+        var key = writeIndex.key;
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.frontiers++;
+        }
+
+        if (initializedPredicateWriteOrders.add(key)) {
+            var comparableWrites = writeIndex.latestWritesByWriter;
+            for (int i = 0; i < comparableWrites.size(); i++) {
+                for (int j = i + 1; j < comparableWrites.size(); j++) {
+                    beforeWrite(comparableWrites.get(i), comparableWrites.get(j));
+                }
+            }
+        }
+
+        var externalWrites = writeIndex.latestExternalWrites(observation.getTxn());
+        var candidates = latestVisibleChecker.check(
+                        observation.getTxn(), key, externalWrites,
+                        new LatestVisibleChecker.SerializationOrder<KeyType, ValueType>() {
+                            @Override
+                            public Lit beforeReader(
+                                    KeyType candidateKey,
+                                    KnownGraph.WriteRef<KeyType, ValueType> writer,
+                                    Transaction<KeyType, ValueType> reader) {
+                                return orderLiteral(writer.getTxn(), reader);
+                            }
+
+                            @Override
+                            public Lit beforeWriter(
+                                    KeyType candidateKey,
+                                    KnownGraph.WriteRef<KeyType, ValueType> left,
+                                    KnownGraph.WriteRef<KeyType, ValueType> right) {
+                                return beforeWrite(left, right);
+                            }
+                        }).stream()
+                .map(validity -> new FrontierCandidate<>(
+                        validity.writer, validity.visible, validity.valid))
+                .filter(candidate -> candidate.visible != Lit.False)
+                .collect(Collectors.toList());
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.frontierCandidates += candidates.size();
+        }
+
+        var frontier = new KeyFrontier<KeyType, ValueType>(
+                key, observation.getTxn(), candidates, recordedSource);
+        if (recordedSource != null) {
+            var source = candidateFor(frontier, recordedSource);
+            if (source == null) {
+                assertCurrentPredicate(Lit.False);
+            } else {
+                assertCurrentPredicate(source.latest);
+            }
+        }
+        return frontier;
+    }
+
+    private void encodeExplicitPrWr(
+            KeyFrontier<KeyType, ValueType> frontier,
+            KnownGraph.WriteRef<KeyType, ValueType> recordedSource) {
+        for (var source : frontier.candidates) {
+            if (source.write.getTxn().equals(frontier.reader)) {
+                continue;
+            }
+            var edge = new SEREdge<KeyType, ValueType>(
+                    source.write.getTxn(), frontier.reader,
+                    EdgeType.PR_WR, frontier.key);
+            if (recordedSource == source.write) {
+                addKnownPredicateEdge(edge);
+            }
+            addDependencyEdge(edge, source.latest);
+        }
+    }
+
+    private void encodeExplicitPrRw(
+            KeyFrontier<KeyType, ValueType> frontier,
+            List<KnownGraph.WriteRef<KeyType, ValueType>> writes,
+            IdentityHashMap<KnownGraph.WriteRef<KeyType, ValueType>, Lit>
+                    contributionContexts) {
+        for (var source : frontier.candidates) {
+            var sourceContext = contributionContexts.getOrDefault(
+                    source.write, Lit.False);
+            for (var later : writes) {
+                if (later == source.write) {
+                    continue;
+                }
+                var laterContext = contributionContexts.getOrDefault(
+                        later, Lit.False);
+                var changeContext = or(sourceContext, laterContext);
+                if (changeContext == Lit.False) {
+                    continue;
+                }
+                addDependencyEdge(
+                        new SEREdge<>(frontier.reader, later.getTxn(),
+                                EdgeType.PR_RW, frontier.key),
+                        and(source.latest,
+                                beforeWrite(source.write, later),
+                                changeContext));
+            }
+        }
+    }
+
+    private void encodeAdditionalBindingExclusion(
+            Map<KeyType, ValueType> binding,
+            Map<KeyType, ValueType> recordedInputs,
+            List<QueryVersionWitness<KeyType, ValueType>> resolved) {
+        boolean recordedOnly = true;
+        for (var source : binding.entrySet()) {
+            if (!recordedInputs.containsKey(source.getKey())
+                    || !Objects.equals(
+                            recordedInputs.get(source.getKey()), source.getValue())) {
+                recordedOnly = false;
+                break;
+            }
+        }
+        if (recordedOnly) {
+            return;
+        }
+
+        var clause = new ArrayList<Lit>(resolved.size());
+        for (var source : resolved) {
+            if (source.selection == null) {
+                // This version is retained only as a hypothetical later PR_RW
+                // target; it cannot contribute to the current visible result.
+                return;
+            }
+            if (source.selection == Lit.False) {
+                return;
+            }
+            if (source.selection != Lit.True) {
+                clause.add(Logic.not(source.selection));
+            }
+        }
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.blockingClauses++;
+            predicateEncodingMetrics.blockingClauseLiterals +=
+                    Math.max(1, clause.size());
+        }
+        assertClauseUnderAssumption(currentPredicateAssumption, clause);
+    }
+
+    private void accumulateContributionContexts(
+            List<QueryVersionWitness<KeyType, ValueType>> resolved,
+            IdentityHashMap<KnownGraph.WriteRef<KeyType, ValueType>, Lit> contexts) {
+        for (var target : resolved) {
+            var terms = new ArrayList<Lit>(Math.max(0, resolved.size() - 1));
+            boolean valid = true;
+            for (var other : resolved) {
+                if (other == target) {
+                    continue;
+                }
+                if (other.selection == null || other.selection == Lit.False) {
+                    valid = false;
+                    break;
+                }
+                terms.add(other.selection);
+            }
+            if (!valid) {
+                continue;
+            }
+            var context = and(terms);
+            contexts.merge(target.write, context, SERSolverAR::or);
+        }
+    }
+
+    private List<QueryVersionWitness<KeyType, ValueType>> resolveQueryBinding(
+            Map<KeyType, ValueType> binding,
+            Map<KeyType, List<QueryVersionWitness<KeyType, ValueType>>> versionsByKey) {
+        var resolved = new ArrayList<QueryVersionWitness<KeyType, ValueType>>(
+                binding.size());
+        for (var source : binding.entrySet()) {
+            QueryVersionWitness<KeyType, ValueType> match = null;
+            for (var candidate : versionsByKey.getOrDefault(
+                    source.getKey(), Collections.emptyList())) {
+                if (!Objects.equals(
+                        candidate.write.getEvent().getValue(), source.getValue())) {
+                    continue;
+                }
+                if (match != null && match.write != candidate.write) {
+                    return null;
+                }
+                match = candidate;
+            }
+            if (match == null) {
+                return null;
+            }
+            resolved.add(match);
+        }
+        return resolved;
+    }
+
+    private void addQueryVersionWitness(
+            Map<KeyType, List<QueryVersionWitness<KeyType, ValueType>>> versionsByKey,
+            List<RowVersion<KeyType, ValueType>> versionPool,
+            RelationResolver<KeyType> resolver,
+            KnownGraph.WriteRef<KeyType, ValueType> write,
+            Lit selection) {
+        var event = write.getEvent();
+        if (event.getValue() == null) {
+            return;
+        }
+        versionsByKey.computeIfAbsent(event.getKey(), ignored -> new ArrayList<>())
+                .add(new QueryVersionWitness<>(write, selection));
+        versionPool.add(new RowVersion<>(
+                event.getKey(), resolver.relationOf(event.getKey()), event.getValue()));
+    }
+
+    /** Exact whole-snapshot strategy under the same predicate-read contract. */
+    private void encodeSnapshotPredicate(
+            KnownGraph.PredicateObservation<KeyType, ValueType> observation,
+            List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
+            Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
+        var predicateRead = observation.getPredicateReadEvent();
+        var predicate = predicateRead.getPredicate();
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.generalObservations++;
+        }
+
+        boolean gmwrMonotone = predicateSolvingMode
+                == SERVerifier.PredicateSolvingMode.GMWR
+                && predicate instanceof QueryPlan
+                && ((QueryPlan<?, ?>) predicate).isMonotone();
+        if (gmwrMonotone) {
+            gmwrGeneralObservations++;
+            for (var entry : scopedEntries) {
+                var recordedSource = resultSourcesByKey.get(entry.key);
+                if (recordedSource != null
+                        && entry.latestSelfBefore(observation.getTxn(),
+                                observation.getEventIndex()) == null) {
+                    var externalStarted = startExternalKeyEncoding(true);
+                    try {
+                        encodeGeneralGmwrRecordedSource(
+                                observation, entry, recordedSource);
+                    } finally {
+                        finishExternalKeyEncoding(true, externalStarted);
+                    }
+                }
+            }
+        }
+
+        var started = System.nanoTime();
+        var frontierEntries = scopedEntries.stream()
+                .filter(entry -> entry.latestSelfBefore(observation.getTxn(),
+                            observation.getEventIndex()) == null)
+                .filter(entry -> !gmwrMonotone
+                        || !resultSourcesByKey.containsKey(entry.key))
+                .collect(Collectors.toList());
+        predicateEncodingMetrics.generalKeyScanNanos +=
+                System.nanoTime() - started;
+        if (collectingPredicateMetrics) {
+            predicateEncodingMetrics.generalExternalKeys += frontierEntries.size();
+        }
+        if (frontierEntries.isEmpty()) {
+            var snapshot = new LinkedHashMap<KeyType, ValueType>();
+            for (var entry : scopedEntries) {
+                var latestSelf = entry.latestSelfBefore(
+                        observation.getTxn(), observation.getEventIndex());
+                if (latestSelf == null) {
+                    latestSelf = resultSourcesByKey.get(entry.key);
+                }
+                if (latestSelf != null) {
+                    snapshot.put(entry.key, latestSelf.getEvent().getValue());
+                }
+            }
+            if (!predicateSnapshotMatches(predicateRead, snapshot)) {
+                assertCurrentPredicate(Lit.False);
+            }
+            return;
+        }
+
+        var frontiers = new ArrayList<KeyFrontier<KeyType, ValueType>>(
+                frontierEntries.size());
+        for (var entry : frontierEntries) {
+            var recordedSource = resultSourcesByKey.get(entry.key);
+            var externalStarted = startExternalKeyEncoding(
+                    recordedSource != null);
+            try {
+                frontiers.add(createKeyFrontier(
+                        observation, entry, recordedSource));
+            } finally {
+                finishExternalKeyEncoding(
+                        recordedSource != null, externalStarted);
+            }
+        }
+
+        var snapshot = new LinkedHashMap<KeyType, ValueType>();
+        var frontierKeys = frontierEntries.stream().map(entry -> entry.key)
+                .collect(Collectors.toSet());
+        for (var entry : scopedEntries) {
+            if (frontierKeys.contains(entry.key)) {
+                continue;
+            }
+            var latestSelf = entry.latestSelfBefore(
+                    observation.getTxn(), observation.getEventIndex());
+            if (latestSelf == null) {
+                latestSelf = resultSourcesByKey.get(entry.key);
+            }
+            if (latestSelf != null) {
+                snapshot.put(entry.key, latestSelf.getEvent().getValue());
+            }
+        }
+        predicateChecks.add(new PredicateCheck<>(predicateRead, frontiers,
+                snapshot, gmwrMonotone,
+                resultSourcesByKey.keySet(), currentPredicateAssumption));
     }
 
     /**
@@ -1581,7 +1938,7 @@ class SERSolverAR<KeyType, ValueType> {
      * source-aware typed frontier encoder; the bundle only compresses the
      * result-validity clauses.</p>
      */
-    private PredicateEncodeStatus encodeRowLocalPredicateGmwr(
+    private void encodeRowLocalPredicateGmwr(
             KnownGraph.PredicateObservation<KeyType, ValueType> observation,
             List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
             Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
@@ -1589,15 +1946,6 @@ class SERSolverAR<KeyType, ValueType> {
         try {
             var predicateRead = observation.getPredicateReadEvent();
             var relationResolver = relationResolverFor(predicateRead);
-            var snapshotStarted = System.nanoTime();
-            var snapshotValid = rowLocalSnapshotValid(
-                    predicateRead, relationResolver, resultSourcesByKey);
-            predicateEncodingMetrics.snapshotValidationNanos +=
-                    System.nanoTime() - snapshotStarted;
-            if (!snapshotValid) {
-                return PredicateEncodeStatus.INVALID;
-            }
-
             var reader = observation.getTxn();
             for (var entry : scopedEntries) {
                 var key = entry.key;
@@ -1673,13 +2021,6 @@ class SERSolverAR<KeyType, ValueType> {
                 }
             }
 
-            for (var resultKey : resultSourcesByKey.keySet()) {
-                if (!predicateRead.getPredicate().scope().covers(resultKey)
-                        || !writesByKey.containsKey(resultKey)) {
-                    assertCurrentPredicate(Lit.False);
-                }
-            }
-            return PredicateEncodeStatus.ENCODED;
         } finally {
             gmwrBuildNanos += System.nanoTime() - started;
         }
@@ -1844,22 +2185,13 @@ class SERSolverAR<KeyType, ValueType> {
     }
 
     /** Eagerly materializes every row-local reader-key constraint before solve(). */
-    private PredicateEncodeStatus encodeRowLocalPredicateEager(
+    private void encodeRowLocalPredicateEager(
             KnownGraph.PredicateObservation<KeyType, ValueType> observation,
             List<KeyWriteIndex<KeyType, ValueType>> scopedEntries,
             Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
         var predicateRead = observation.getPredicateReadEvent();
         var relationResolver = relationResolverFor(predicateRead);
         var started = System.nanoTime();
-        var snapshotValid = rowLocalSnapshotValid(
-                predicateRead, relationResolver, resultSourcesByKey);
-        predicateEncodingMetrics.snapshotValidationNanos +=
-                System.nanoTime() - started;
-        if (!snapshotValid) {
-            return PredicateEncodeStatus.INVALID;
-        }
-
-        started = System.nanoTime();
         for (var entry : scopedEntries) {
             var key = entry.key;
             var writes = entry.writes;
@@ -1950,49 +2282,39 @@ class SERSolverAR<KeyType, ValueType> {
             }
         }
 
-        for (var resultKey : resultSourcesByKey.keySet()) {
-            if (!predicateRead.getPredicate().scope().covers(resultKey)
-                    || !writesByKey.containsKey(resultKey)) {
-                assertCurrentPredicate(Lit.False);
-            }
-        }
         predicateEncodingMetrics.rowLocalKeyScanNanos +=
                 System.nanoTime() - started;
-        return PredicateEncodeStatus.ENCODED;
     }
 
-    private boolean rowLocalSnapshotValid(
+    /** Common recorded-source contract; no full-snapshot materialization is retained. */
+    private boolean recordedPredicateInputsValid(
             Event<KeyType, ValueType> predicateRead,
-            RelationResolver<KeyType> relationResolver,
             Map<KeyType, KnownGraph.WriteRef<KeyType, ValueType>> resultSourcesByKey) {
-        var expectedInputs = expectedPredicateInputs(predicateRead);
-        if (!expectedInputs.keySet().equals(resultSourcesByKey.keySet())
-                || !predicateSnapshotMatches(predicateRead, expectedInputs, relationResolver)) {
+        final Map<KeyType, ValueType> expectedInputs;
+        try {
+            expectedInputs = expectedPredicateInputs(predicateRead);
+        } catch (QueryException exception) {
             return false;
         }
+        if (!expectedInputs.keySet().equals(resultSourcesByKey.keySet())) {
+            return false;
+        }
+        var predicate = predicateRead.getPredicate();
         for (var source : resultSourcesByKey.entrySet()) {
-            if (!Objects.equals(expectedInputs.get(source.getKey()),
-                    source.getValue().getEvent().getValue())) {
+            if (!predicate.scope().covers(source.getKey())
+                    || !writesByKey.containsKey(source.getKey())
+                    || !Objects.equals(expectedInputs.get(source.getKey()),
+                            source.getValue().getEvent().getValue())) {
                 return false;
             }
         }
-        return true;
-    }
-
-    private Map<KeyType, ValueType> expectedPredicateInputs(
-            Event<KeyType, ValueType> predicateRead) {
-        var recorded = predicateRead.getRecordedPredicateResult();
-        if (recorded != null) {
-            return recorded.inputs();
-        }
-
-        var expected = new LinkedHashMap<KeyType, ValueType>();
-        for (var result : predicateRead.getPredResults()) {
-            if (expected.putIfAbsent(result.getKey(), result.getValue()) != null) {
-                return Collections.emptyMap();
-            }
-        }
-        return expected;
+        // For row-local and monotone plans, the complete contributing inputs
+        // must reproduce the recorded bag and provenance. Do not impose this
+        // reduction on arbitrary non-monotone/custom snapshot evaluators.
+        return !(predicate.isRowLocal()
+                    || predicate instanceof QueryPlan
+                            && ((QueryPlan<?, ?>) predicate).isMonotone())
+                || predicateSnapshotMatches(predicateRead, expectedInputs);
     }
 
     private boolean hasEmptyPredicateContribution(
@@ -2371,10 +2693,6 @@ class SERSolverAR<KeyType, ValueType> {
      * direct no-good clause for every mismatching visible snapshot.
      */
     private boolean refinePredicateConstraints() {
-        return refineGeneralPredicateConstraints();
-    }
-
-    private boolean refineGeneralPredicateConstraints() {
         var refined = false;
         for (var check : predicateChecks) {
             var snapshot = new LinkedHashMap<>(check.fixedSnapshot);
@@ -2393,7 +2711,7 @@ class SERSolverAR<KeyType, ValueType> {
             }
 
             var evaluation = evaluatePredicateSnapshot(
-                    check.predicateRead, snapshot, check.relationResolver);
+                    check.predicateRead, snapshot);
             if (predicateEvaluationMatches(check.predicateRead, evaluation)) {
                 continue;
             }
@@ -2678,61 +2996,6 @@ class SERSolverAR<KeyType, ValueType> {
         return literal.value();
     }
 
-    private boolean predicateSnapshotMatches(
-            Event<KeyType, ValueType> predicateRead,
-            Map<KeyType, ValueType> snapshot,
-            RelationResolver<KeyType> relationResolver) {
-        return predicateEvaluationMatches(predicateRead,
-                evaluatePredicateSnapshot(predicateRead, snapshot, relationResolver));
-    }
-
-    private QueryEvaluation<KeyType, ValueType> evaluatePredicateSnapshot(
-            Event<KeyType, ValueType> predicateRead,
-            Map<KeyType, ValueType> snapshot,
-            RelationResolver<KeyType> relationResolver) {
-        try {
-            return predicateRead.getPredicate().evaluate(
-                    new MapVisibleState<>(snapshot, relationResolver));
-        } catch (QueryException exception) {
-            return null;
-        }
-    }
-
-    private boolean predicateEvaluationMatches(
-            Event<KeyType, ValueType> predicateRead,
-            QueryEvaluation<KeyType, ValueType> evaluation) {
-        if (evaluation == null) {
-            return false;
-        }
-        var recorded = predicateRead.getRecordedPredicateResult();
-        if (recorded != null) {
-            return evaluation.canonicalEquals(recorded);
-        }
-        var expectedInputs = new LinkedHashMap<KeyType, ValueType>();
-        for (var result : predicateRead.getPredResults()) {
-            if (expectedInputs.putIfAbsent(result.getKey(), result.getValue()) != null) {
-                return false;
-            }
-        }
-        return evaluation.inputs().equals(expectedInputs);
-    }
-
-    private RelationResolver<KeyType> relationResolverFor(
-            Event<KeyType, ValueType> predicateRead) {
-        var relations = predicateRead.getPredicate().scope().relations();
-        return key -> {
-            var canonical = String.valueOf(key);
-            var separator = canonical.indexOf(':');
-            if (separator > 0) {
-                return canonical.substring(0, separator);
-            }
-            if (relations.size() == 1) {
-                return relations.iterator().next();
-            }
-            return "__legacy__";
-        };
-    }
-
     private static final class CompactRowMatchCache {
         private final BitSet computed = new BitSet();
         private final BitSet matched = new BitSet();
@@ -2843,11 +3106,23 @@ class SERSolverAR<KeyType, ValueType> {
         }
     }
 
+    private static final class QueryVersionWitness<KeyType, ValueType> {
+        private final KnownGraph.WriteRef<KeyType, ValueType> write;
+        /** Null means target-only: valid for PR_RW replacement analysis but not
+         * selectable in the current predicate snapshot. */
+        private final Lit selection;
+
+        private QueryVersionWitness(
+                KnownGraph.WriteRef<KeyType, ValueType> write, Lit selection) {
+            this.write = write;
+            this.selection = selection;
+        }
+    }
+
     private static final class PredicateCheck<KeyType, ValueType> {
         private final Event<KeyType, ValueType> predicateRead;
         private final List<KeyFrontier<KeyType, ValueType>> frontiers;
         private final Map<KeyType, ValueType> fixedSnapshot;
-        private final RelationResolver<KeyType> relationResolver;
         private final boolean gmwrMonotone;
         private final Set<KeyType> recordedInputKeys;
         private final AssumptionReason<KeyType, ValueType> assumption;
@@ -2855,7 +3130,6 @@ class SERSolverAR<KeyType, ValueType> {
         private PredicateCheck(Event<KeyType, ValueType> predicateRead,
                 List<KeyFrontier<KeyType, ValueType>> frontiers,
                 Map<KeyType, ValueType> fixedSnapshot,
-                RelationResolver<KeyType> relationResolver,
                 boolean gmwrMonotone,
                 Collection<KeyType> recordedInputKeys,
                 AssumptionReason<KeyType, ValueType> assumption) {
@@ -2863,7 +3137,6 @@ class SERSolverAR<KeyType, ValueType> {
             this.frontiers = List.copyOf(frontiers);
             this.fixedSnapshot = Collections.unmodifiableMap(
                     new LinkedHashMap<>(fixedSnapshot));
-            this.relationResolver = relationResolver;
             this.gmwrMonotone = gmwrMonotone;
             this.recordedInputKeys = Collections.unmodifiableSet(
                     new HashSet<>(recordedInputKeys));
