@@ -21,8 +21,7 @@ class SERTimeoutPropagationTest {
         var graph = new KnownGraph<>(history);
         var settings = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.EAGER,
-                SERVerifier.PruningMode.NONE,
-                SERVerifier.SerPropagationMode.WW_ONLY);
+                SERVerifier.PruningMode.NONE);
         settings.solverTimeoutSeconds = 1;
         settings.satSolveBackend = (solver, remaining, assumptions) -> Optional.empty();
 
@@ -39,8 +38,7 @@ class SERTimeoutPropagationTest {
         var history = committedTxn();
         var settings = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.EAGER,
-                SERVerifier.PruningMode.NONE,
-                SERVerifier.SerPropagationMode.WW_ONLY);
+                SERVerifier.PruningMode.NONE);
         settings.solverTimeoutSeconds = 1;
         settings.satSolveBackend = (solver, remaining, assumptions) -> Optional.empty();
 
@@ -75,8 +73,7 @@ class SERTimeoutPropagationTest {
 
         var settingsHook = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.EAGER,
-                SERVerifier.PruningMode.NONE,
-                SERVerifier.SerPropagationMode.WW_ONLY);
+                SERVerifier.PruningMode.NONE);
         settingsHook.satSolveBackend = (solver, remaining, assumptions) -> Optional.empty();
         settingsHook.solverTimeoutSeconds = 1;
 

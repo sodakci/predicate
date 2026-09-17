@@ -19,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GmwrPropagationTest {
     @Test
-    void wwOnlyDoesNotBuildOrRunGmwrPropagation() {
+    void eagerDoesNotBuildOrRunGmwrPropagation() {
         var profiler = Profiler.getInstance();
         profiler.clear();
         var history = new History<String, Integer>();
@@ -28,11 +28,11 @@ class GmwrPropagationTest {
         var graph = new KnownGraph<String, Integer>(history);
 
         var solver = new SERSolverAR<>(history, graph, List.of(), true, false,
-                SERVerifier.PredicateSolvingMode.GMWR,
-                SERVerifier.SerPropagationMode.WW_ONLY);
+                SERVerifier.PredicateSolvingMode.EAGER);
 
         assertEquals(SolveStatus.SAT, solver.solve());
-        assertEquals(0L, profiler.getCount("GMWR_WW_BRIDGE_SCANS"));
+        assertEquals(0L, profiler.getCount("GMWR_INITIAL_CONSTRAINTS"));
+        assertEquals(0L, profiler.getTime("GMWR_REDUCTION_MS"));
     }
 
     @Test
@@ -45,14 +45,12 @@ class GmwrPropagationTest {
         var graph = new KnownGraph<String, Integer>(history);
         var settings = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.GMWR,
-                SERVerifier.PruningMode.REACHABILITY,
-                SERVerifier.SerPropagationMode.WW_GMWR);
+                SERVerifier.PruningMode.REACHABILITY);
         settings.gmwrPrepropagation = false;
 
         var solver = new SERSolverAR<>(history, graph, List.of(), true, false, settings);
 
         assertEquals(SolveStatus.SAT, solver.solve());
-        assertEquals(0L, profiler.getCount("GMWR_WW_BRIDGE_SCANS"));
         assertEquals(0L, profiler.getTime("GMWR_REDUCTION_MS"));
     }
 
@@ -98,39 +96,7 @@ class GmwrPropagationTest {
     }
 
     @Test
-    void bridgeScansResidualWwOnceAndCommitsOnlyForcedBranch() {
-        var history = new History<String, Integer>();
-        var a = history.addTransaction(history.addSession(1L), 1L);
-        var b = history.addTransaction(history.addSession(2L), 2L);
-        history.addEvent(a, WRITE, "k", 1);
-        history.addEvent(b, WRITE, "k", 2);
-        commitAll(history);
-
-        var graph = new KnownGraph<String, Integer>(history);
-        var state = gmwrState(history, graph);
-        state.seedKnownDependencies();
-        state.addKnownFact(a, b, EdgeType.PR_WR, "k");
-        assertFalse(state.propagate());
-        assertTrue(state.precedenceOracle().before(a, b));
-
-        var constraint = new SERConstraint<>(
-                List.of(new SEREdge<>(b, a, EdgeType.WW, "k")),
-                List.of(new SEREdge<>(a, b, EdgeType.WW, "k")),
-                a, b, 0);
-        var residual = new ArrayList<>(List.of(constraint));
-        var result = new GmwrWwBridge<>(state.precedenceOracle())
-                .scan(graph, residual);
-
-        assertFalse(result.conflict);
-        assertEquals(1, result.scannedConstraints);
-        assertEquals(1, result.forcedConstraints);
-        assertTrue(residual.isEmpty());
-        assertTrue(graph.getKnownGraphA().edgeValue(a, b)
-                .orElse(List.of()).contains(new Edge<>(EdgeType.WW, "k")));
-    }
-
-    @Test
-    void sameReaderBadWriterObligationsKeepMinimalAntichain() {
+    void sameReaderBadWriterKeepsEverySemanticItemExplicit() {
         var history = new History<String, Integer>();
         var reader = history.addTransaction(history.addSession(1L), 1L);
         var bad = history.addTransaction(history.addSession(2L), 2L);
@@ -146,9 +112,10 @@ class GmwrPropagationTest {
         var obligations = new ArrayList<>(state.gmwrObligations());
 
         assertEquals(1, obligations.size());
-        assertEquals(1, obligations.get(0).items.size());
+        assertEquals(2, obligations.get(0).items.size());
         assertEquals(Set.of(a1, a2), obligations.get(0).items.get(0).repairs);
-        assertTrue(state.stats.mergedConstraints > 0);
+        assertEquals(Set.of(a1, a2, a3), obligations.get(0).items.get(1).repairs);
+        assertEquals(Set.of("x", "y"), obligations.get(0).keys);
     }
 
     @Test

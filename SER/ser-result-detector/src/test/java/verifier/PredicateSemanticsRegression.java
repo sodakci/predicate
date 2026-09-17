@@ -285,27 +285,22 @@ public final class PredicateSemanticsRegression {
         cases++;
         check(serialOracle(factory.get()) == expected, "fixture/oracle disagreement: " + name);
         for (var mode : SERVerifier.PredicateSolvingMode.values()) {
-            var propagationModes = mode == SERVerifier.PredicateSolvingMode.EAGER
-                    ? List.of(SERVerifier.SerPropagationMode.WW_ONLY)
-                    : List.of(SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY,
-                            SERVerifier.SerPropagationMode.WW_GMWR);
-            var pruningModes = targeted ? List.of(SERVerifier.PruningMode.NONE, SERVerifier.PruningMode.REACHABILITY)
+            var pruningModes = targeted
+                    ? List.of(SERVerifier.PruningMode.NONE, SERVerifier.PruningMode.REACHABILITY)
                     : List.of(SERVerifier.PruningMode.REACHABILITY);
-            for (var propagation : propagationModes) {
-                for (var pruning : pruningModes) {
-                    for (int variant = 0; variant < (targeted ? 2 : 1); variant++) {
-                        var h = factory.get();
-                        if (variant == 1) { disableRowAcceleration(h); }
-                        Profiler.getInstance().clear();
-                        HistoryLoader<String, V> loader = () -> h;
-                        var actual = new SERVerifier<>(loader, false, mode, pruning, propagation).audit();
-                        results.add(name + "\t" + (variant == 0 ? "AUTO" : "SNAPSHOT_ONLY")
-                                + "\t" + mode + "\t" + pruning + "\t" + propagation
-                                + "\t" + (expected ? "ACCEPT" : "REJECT") + "\t" + actual);
-                        if (actual != (expected ? SERVerifier.AuditResult.ACCEPT : SERVerifier.AuditResult.REJECT)) {
-                            failures++;
-                            System.err.println("MISMATCH " + results.get(results.size() - 1));
-                        }
+            for (var pruning : pruningModes) {
+                for (int variant = 0; variant < (targeted ? 2 : 1); variant++) {
+                    var h = factory.get();
+                    if (variant == 1) { disableRowAcceleration(h); }
+                    Profiler.getInstance().clear();
+                    HistoryLoader<String, V> loader = () -> h;
+                    var actual = new SERVerifier<>(loader, false, mode, pruning).audit();
+                    results.add(name + "\t" + (variant == 0 ? "AUTO" : "SNAPSHOT_ONLY")
+                            + "\t" + mode + "\t" + pruning
+                            + "\t" + (expected ? "ACCEPT" : "REJECT") + "\t" + actual);
+                    if (actual != (expected ? SERVerifier.AuditResult.ACCEPT : SERVerifier.AuditResult.REJECT)) {
+                        failures++;
+                        System.err.println("MISMATCH " + results.get(results.size() - 1));
                     }
                 }
             }

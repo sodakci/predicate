@@ -87,8 +87,7 @@ class SERCycleStructureAuditTest {
     private static List<SERVerifier.SolverSettings> configurations() {
         var eagerRaw = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.EAGER,
-                SERVerifier.PruningMode.NONE,
-                SERVerifier.SerPropagationMode.WW_ONLY);
+                SERVerifier.PruningMode.NONE);
         eagerRaw.predicateWitnessCoalescing = false;
         eagerRaw.graphEdgeInterning = false;
         eagerRaw.gmwrPrepropagation = false;
@@ -96,8 +95,7 @@ class SERCycleStructureAuditTest {
 
         var eagerCompressed = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.EAGER,
-                SERVerifier.PruningMode.NONE,
-                SERVerifier.SerPropagationMode.WW_ONLY);
+                SERVerifier.PruningMode.NONE);
         eagerCompressed.predicateWitnessCoalescing = true;
         eagerCompressed.graphEdgeInterning = true;
         eagerCompressed.gmwrPrepropagation = false;
@@ -105,8 +103,7 @@ class SERCycleStructureAuditTest {
 
         var gmwrRaw = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.GMWR,
-                SERVerifier.PruningMode.NONE,
-                SERVerifier.SerPropagationMode.WW_ONLY);
+                SERVerifier.PruningMode.NONE);
         gmwrRaw.predicateWitnessCoalescing = false;
         gmwrRaw.graphEdgeInterning = false;
         gmwrRaw.gmwrPrepropagation = false;
@@ -114,8 +111,7 @@ class SERCycleStructureAuditTest {
 
         var gmwrOptimized = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.GMWR,
-                SERVerifier.PruningMode.NONE,
-                SERVerifier.SerPropagationMode.WW_GMWR);
+                SERVerifier.PruningMode.NONE);
         gmwrOptimized.predicateWitnessCoalescing = true;
         gmwrOptimized.graphEdgeInterning = true;
         gmwrOptimized.gmwrPrepropagation = true;

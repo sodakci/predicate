@@ -156,7 +156,7 @@ class RelationalPredicateSatTest {
                 "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
                 "[{\"purchase_id\":\"p0\",\"sku\":\"s0\",\"stock\":2}]"));
         var history = writeHistory(
-                "gmwr-recorded-input-bundle",
+                "gmwr-recorded-input",
                 "[" + PURCHASE + "," + INVENTORY_AVAILABLE + "]",
                 writer,
                 reader);
@@ -165,8 +165,7 @@ class RelationalPredicateSatTest {
 
         assertTrue(audit(history, SERVerifier.PredicateSolvingMode.GMWR));
         assertEquals(0L, profiler.getCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT"));
-        assertEquals(0L, profiler.getCount("SER_GMWR_BUNDLES_COUNT"));
-        assertEquals(0L, profiler.getCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_GMWR_RESIDUAL_CLAUSES_COUNT"));
         assertTrue(profiler.getCount("SER_PRED_FRONTIERS_COUNT") > 0);
     }
 

@@ -25,8 +25,8 @@ import java.util.Set;
  * GMWR reduction worklist backed by the shared precedence oracle.
  *
  * <p>Ordinary WW constraints are deliberately absent. They remain owned by
- * {@link Pruning}; this state only consumes the graph produced by that
- * baseline and publishes definite GMWR facts for {@link GmwrWwBridge}.</p>
+ * {@link Pruning}; this state consumes the baseline graph and publishes only
+ * definite GMWR-derived precedence facts for the residual encoding.</p>
  */
 final class GmwrPropagationState<KeyType, ValueType> {
     enum ReductionReason {
@@ -55,8 +55,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
     private final ArrayDeque<GmwrObligation<KeyType, ValueType>> workQueue =
             new ArrayDeque<>();
     private final Set<GmwrObligation<KeyType, ValueType>> queuedGmwr = new HashSet<>();
-    private final Set<Transaction<KeyType, ValueType>> lastReachabilityTouched =
-            new HashSet<>();
     private boolean suppressDirtyNotifications;
     private boolean conflict;
 
@@ -91,19 +89,11 @@ final class GmwrPropagationState<KeyType, ValueType> {
         }
     }
 
-    /** Synchronizes newly committed baseline WW/RW facts into the overlay. */
-    long syncKnownDependencies() {
-        long before = knownFacts.size();
-        syncGraph(graph.getKnownGraphA());
-        syncGraph(graph.getKnownGraphB());
-        return knownFacts.size() - before;
-    }
-
     boolean propagate() {
         var profiler = Profiler.getInstance();
         profiler.startTick("GMWR_REDUCTION_MS");
         try {
-            for (var gmwr : gmwrByPair.values()) {
+            for (var gmwr : gmwrObligations()) {
                 enqueueGmwr(gmwr);
             }
             while (!workQueue.isEmpty() && !conflict) {
@@ -117,14 +107,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
         } finally {
             profiler.endTick("GMWR_REDUCTION_MS");
         }
-    }
-
-    Collection<Transaction<KeyType, ValueType>> lastReachabilityTouched() {
-        return Collections.unmodifiableSet(lastReachabilityTouched);
-    }
-
-    void clearLastReachabilityTouched() {
-        lastReachabilityTouched.clear();
     }
 
     boolean isConflict() {
@@ -168,10 +150,12 @@ final class GmwrPropagationState<KeyType, ValueType> {
         var pair = Pair.of(reader, badWriter);
         var obligation = gmwrByPair.computeIfAbsent(
                 pair, ignored -> new GmwrObligation<>(reader, badWriter));
+        // Preserve every semantic obligation explicitly. Items sharing the
+        // same pair reuse only the outside branch and propagation state.
+        obligation.items.add(new GmwrItem<>(repairSet));
         if (key != null) {
             obligation.keys.add(key);
         }
-        mergeRepairSet(obligation, repairSet);
         indexGmwr(reader, obligation);
         indexGmwr(badWriter, obligation);
         for (var repair : repairSet) {
@@ -180,7 +164,7 @@ final class GmwrPropagationState<KeyType, ValueType> {
         enqueueGmwr(obligation);
     }
 
-    /** Adds a known fact discovered outside GMWR, without publishing feedback. */
+    /** Adds a known dependency fact discovered outside the GMWR worklist. */
     boolean addKnownFact(Transaction<KeyType, ValueType> from,
                          Transaction<KeyType, ValueType> to,
                          EdgeType type,
@@ -257,8 +241,8 @@ final class GmwrPropagationState<KeyType, ValueType> {
             }
         }
 
-        // Key obligations in one bundle are AND. An unrepairable key cannot be
-        // dropped because another key still has repairs.
+        // Item obligations in one pair group are conjunctive. An unrepairable
+        // item cannot be dropped because another item still has repairs.
         if (emptyRepairItem && !gmwr.outsidePossible) {
             gmwr.resolved = true;
             gmwr.lastReason = ReductionReason.CYCLE;
@@ -266,8 +250,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
             conflict = true;
             return;
         }
-
-        compactRepairAntichain(gmwr);
 
         if (emptyRepairItem && gmwr.outsidePossible) {
             forceOutside(gmwr);
@@ -327,55 +309,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
         return !gmwr.items.isEmpty();
     }
 
-    private void mergeRepairSet(GmwrObligation<KeyType, ValueType> obligation,
-                                Set<Transaction<KeyType, ValueType>> incoming) {
-        for (var item : obligation.items) {
-            if (incoming.containsAll(item.repairs)) {
-                item.multiplicity++;
-                stats.mergedConstraints++;
-                return;
-            }
-        }
-        var iterator = obligation.items.iterator();
-        long multiplicity = 1L;
-        while (iterator.hasNext()) {
-            var item = iterator.next();
-            if (item.repairs.containsAll(incoming)) {
-                multiplicity += item.multiplicity;
-                iterator.remove();
-                stats.mergedConstraints++;
-            }
-        }
-        obligation.items.add(new GmwrItem<>(incoming, multiplicity));
-    }
-
-    private void compactRepairAntichain(GmwrObligation<KeyType, ValueType> obligation) {
-        var compact = new ArrayList<GmwrItem<KeyType, ValueType>>();
-        for (var item : obligation.items) {
-            boolean dominated = false;
-            for (int index = 0; index < compact.size();) {
-                var existing = compact.get(index);
-                if (item.repairs.containsAll(existing.repairs)) {
-                    existing.multiplicity += item.multiplicity;
-                    stats.mergedConstraints++;
-                    dominated = true;
-                    break;
-                }
-                if (existing.repairs.containsAll(item.repairs)) {
-                    compact.remove(index);
-                    stats.mergedConstraints++;
-                    continue;
-                }
-                index++;
-            }
-            if (!dominated) {
-                compact.add(item);
-            }
-        }
-        obligation.items.clear();
-        obligation.items.addAll(compact);
-    }
-
     private void dirtyGmwrAffectedBy(Transaction<KeyType, ValueType> from,
                                      Transaction<KeyType, ValueType> to) {
         dirtyGmwrTouching(from);
@@ -403,7 +336,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
         gmwrByTxn.clear();
         workQueue.clear();
         queuedGmwr.clear();
-        lastReachabilityTouched.clear();
     }
 
     void releaseEncodedState() {
@@ -436,12 +368,8 @@ final class GmwrPropagationState<KeyType, ValueType> {
             }
         }
         precedence.add(from, to);
-        lastReachabilityTouched.add(from);
-        lastReachabilityTouched.add(to);
         if (!suppressDirtyNotifications) {
             for (var pair : newlyReachable) {
-                lastReachabilityTouched.add(pair.from);
-                lastReachabilityTouched.add(pair.to);
                 dirtyGmwrAffectedBy(pair.from, pair.to);
             }
         }
@@ -478,7 +406,7 @@ final class GmwrPropagationState<KeyType, ValueType> {
     }
 
     private long residualGmwrCount() {
-        return gmwrByPair.values().stream()
+        return gmwrObligations().stream()
                 .filter(gmwr -> !gmwr.resolved && !gmwr.satisfied).count();
     }
 
@@ -501,7 +429,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
         long forcedRepairs;
         long satisfied;
         long conflicts;
-        long mergedConstraints;
         long residualSatVariables;
         long residualSatConstraints;
     }
@@ -583,12 +510,10 @@ final class GmwrPropagationState<KeyType, ValueType> {
 
     static final class GmwrItem<KeyType, ValueType> {
         final LinkedHashSet<Transaction<KeyType, ValueType>> repairs;
-        long multiplicity;
         ReductionReason lastReason;
 
-        GmwrItem(Set<Transaction<KeyType, ValueType>> repairs, long multiplicity) {
+        GmwrItem(Set<Transaction<KeyType, ValueType>> repairs) {
             this.repairs = new LinkedHashSet<>(repairs);
-            this.multiplicity = multiplicity;
         }
     }
 

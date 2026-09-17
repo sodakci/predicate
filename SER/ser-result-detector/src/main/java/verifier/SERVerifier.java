@@ -30,12 +30,6 @@ public class SERVerifier<KeyType, ValueType> {
         REACHABILITY
     }
 
-    public enum SerPropagationMode {
-        WW_ONLY,
-        WW_GMWR_ONEWAY,
-        WW_GMWR
-    }
-
     public enum AuditResult {
         ACCEPT(0, "[[[[ ACCEPT ]]]]"),
         REJECT(-1, "[[[[ REJECT ]]]]"),
@@ -76,32 +70,24 @@ public class SERVerifier<KeyType, ValueType> {
                 Collection<monosat.Lit> assumptions);
     }
 
-    /**
-     * Independent solver knobs. Predicate encoding, GMWR pre-propagation,
-     * WW feedback, witness coalescing and graph-edge interning are not
-     * implied by each other.
-     */
+    /** Internal solver settings retained for differential tests and embedding. */
     public static final class SolverSettings {
-        public PredicateSolvingMode predicateSolvingMode = PredicateSolvingMode.EAGER;
+        public PredicateSolvingMode predicateSolvingMode = PredicateSolvingMode.GMWR;
         public PruningMode pruningMode = PruningMode.REACHABILITY;
-        public SerPropagationMode serPropagationMode = SerPropagationMode.WW_ONLY;
-        public boolean gmwrPrepropagation;
-        public boolean predicateWitnessCoalescing;
-        public boolean graphEdgeInterning;
+        public boolean gmwrPrepropagation = true;
+        public boolean predicateWitnessCoalescing = true;
+        public boolean graphEdgeInterning = true;
         public int solverTimeoutSeconds;
         public boolean detailedPredicateMetrics;
         public SatSolveBackend satSolveBackend;
         public Consumer<AuditStage> auditProgressListener = ignored -> { };
 
         public static SolverSettings forModes(PredicateSolvingMode predicate,
-                                              PruningMode pruning,
-                                              SerPropagationMode propagation) {
+                                              PruningMode pruning) {
             var settings = new SolverSettings();
             settings.predicateSolvingMode = Objects.requireNonNull(
                     predicate, "predicateSolvingMode");
             settings.pruningMode = Objects.requireNonNull(pruning, "pruningMode");
-            settings.serPropagationMode = Objects.requireNonNull(
-                    propagation, "serPropagationMode");
             boolean gmwr = predicate == PredicateSolvingMode.GMWR;
             settings.gmwrPrepropagation = gmwr;
             settings.predicateWitnessCoalescing = true;
@@ -114,47 +100,31 @@ public class SERVerifier<KeyType, ValueType> {
     private final boolean detailedPredicateMetrics;
     private final PredicateSolvingMode predicateSolvingMode;
     private final PruningMode pruningMode;
-    private final SerPropagationMode serPropagationMode;
     private final SolverSettings solverSettings;
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader) {
-        this(loader, false, PredicateSolvingMode.EAGER,
-                PruningMode.REACHABILITY, SerPropagationMode.WW_ONLY);
+        this(loader, false, PredicateSolvingMode.GMWR, PruningMode.REACHABILITY);
     }
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
             boolean detailedPredicateMetrics) {
-        this(loader, detailedPredicateMetrics, PredicateSolvingMode.EAGER,
-                PruningMode.REACHABILITY, SerPropagationMode.WW_ONLY);
+        this(loader, detailedPredicateMetrics, PredicateSolvingMode.GMWR,
+                PruningMode.REACHABILITY);
     }
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
             boolean detailedPredicateMetrics,
             PredicateSolvingMode predicateSolvingMode) {
         this(loader, detailedPredicateMetrics, predicateSolvingMode,
-                PruningMode.REACHABILITY,
-                predicateSolvingMode == PredicateSolvingMode.GMWR
-                        ? SerPropagationMode.WW_GMWR
-                        : SerPropagationMode.WW_ONLY);
+                PruningMode.REACHABILITY);
     }
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
             boolean detailedPredicateMetrics,
             PredicateSolvingMode predicateSolvingMode,
             PruningMode pruningMode) {
-        this(loader, detailedPredicateMetrics, predicateSolvingMode, pruningMode,
-                predicateSolvingMode == PredicateSolvingMode.GMWR
-                        ? SerPropagationMode.WW_GMWR
-                        : SerPropagationMode.WW_ONLY);
-    }
-
-    public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
-            boolean detailedPredicateMetrics,
-            PredicateSolvingMode predicateSolvingMode,
-            PruningMode pruningMode,
-            SerPropagationMode serPropagationMode) {
-        this(loader, SolverSettings.forModes(predicateSolvingMode, pruningMode,
-                serPropagationMode), detailedPredicateMetrics);
+        this(loader, SolverSettings.forModes(predicateSolvingMode, pruningMode),
+                detailedPredicateMetrics);
     }
 
     public SERVerifier(HistoryLoader<KeyType, ValueType> loader,
@@ -166,9 +136,8 @@ public class SERVerifier<KeyType, ValueType> {
         this.detailedPredicateMetrics = detailedPredicateMetrics;
         this.predicateSolvingMode = Objects.requireNonNull(
                 solverSettings.predicateSolvingMode, "predicateSolvingMode");
-        this.pruningMode = Objects.requireNonNull(solverSettings.pruningMode, "pruningMode");
-        this.serPropagationMode = Objects.requireNonNull(
-                solverSettings.serPropagationMode, "serPropagationMode");
+        this.pruningMode = Objects.requireNonNull(
+                solverSettings.pruningMode, "pruningMode");
     }
 
     public int getTransactionCount() {

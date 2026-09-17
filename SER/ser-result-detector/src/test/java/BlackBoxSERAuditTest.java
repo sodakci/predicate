@@ -51,7 +51,7 @@ class BlackBoxSERAuditTest {
         assertTrue(result.stderr.contains("Timing\nWW:"));
         assertTrue(result.stderr.contains("Peak memory:"));
         assertTrue(result.stderr.contains("\nGMWR\n"));
-        assertTrue(result.stderr.contains("GMWR-WW reduced:"));
+        assertFalse(result.stderr.contains("GMWR-WW reduced:"));
         assertFalse(result.stderr.contains("ENTIRE_EXPERIMENT:"));
         assertFalse(result.stderr.contains("Pruning round"));
         assertFalse(result.stderr.contains("post-check"));
@@ -64,12 +64,14 @@ class BlackBoxSERAuditTest {
         var help = result.stdout + result.stderr;
 
         assertEquals(0, result.exitCode);
-        assertTrue(help.contains("--predicate-encoding"));
+        assertTrue(help.contains("--[no-]gmwr"));
+        assertTrue(help.contains("--[no-]gmwr-prepropagation"));
         assertTrue(help.contains("--solver-timeout-seconds"));
         assertTrue(help.contains("--solver-stats"));
+        assertFalse(help.contains("--predicate-encoding"));
         assertFalse(help.contains("--predicate-mode"));
         assertFalse(help.contains("--ser-propagation-mode"));
-        assertFalse(help.contains("--gmwr-prepropagation"));
+        assertFalse(help.contains("--gmwr-bundle-compaction"));
         assertFalse(help.contains("--predicate-witness-coalescing"));
         assertFalse(help.contains("--graph-edge-interning"));
         assertFalse(help.contains("--ww-pruning"));
@@ -145,7 +147,7 @@ class BlackBoxSERAuditTest {
     }
 
     @Test
-    void auditCli_enablesPredicateDependencyPruningOnlyWhenRequested() throws Exception {
+    void auditCli_noGmwrDisablesGmwrFrontierAndPrepropagationTogether() throws Exception {
         var historyDir = writePrhist("predicate-pruning-mode", "[]", List.of(
                 "{\"session\":0,\"txn\":0,\"kind\":\"writer\",\"status\":\"commit\",\"ops\":["
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_x\",\"value\":400000001,\"semantic\":40,\"write_id\":1},"
@@ -154,20 +156,21 @@ class BlackBoxSERAuditTest {
                         + "{\"type\":\"pr\",\"predicate\":{\"kind\":\"inventory_threshold\",\"key_prefix\":\"inventory_onhand_\",\"comparator\":\"ge\",\"threshold\":100},\"results\":[]}]}"));
 
         var disabled = runAuditCommand("audit", "--solver-stats",
-                "--predicate-encoding=eager", "--no-predicate-witness-coalescing",
-                historyDir.toString());
+                "--no-gmwr", historyDir.toString());
         var enabled = runAuditCommand("audit", "--solver-stats",
-                "--predicate-encoding=GMWR", historyDir.toString());
+                "--gmwr", "--no-gmwr-prepropagation", historyDir.toString());
 
         assertEquals(disabled.exitCode, enabled.exitCode);
+        assertTrue(disabled.stderr.contains("gmwr=false"));
         assertTrue(disabled.stderr.contains("predicate-encoding=eager"));
-        assertTrue(disabled.stderr.contains("ser-propagation-mode=ww-only"));
         assertTrue(disabled.stderr.contains("gmwr-prepropagation=false"));
         assertTrue(disabled.stderr.contains("graph-edge-interning=true"));
         assertFalse(disabled.stderr.contains("Predicate dependency prune:"));
+        assertTrue(enabled.stderr.contains("gmwr=true"));
         assertTrue(enabled.stderr.contains("predicate-encoding=gmwr"));
+        assertTrue(enabled.stderr.contains("gmwr-prepropagation=false"));
         assertTrue(enabled.stderr.contains("\nGMWR\n"));
-        assertTrue(enabled.stderr.contains("GMWR-WW reduced:"));
+        assertFalse(enabled.stderr.contains("GMWR-WW reduced:"));
         assertTrue(enabled.stderr.indexOf("Timing\n")
                         < enabled.stderr.indexOf("ENTIRE_EXPERIMENT:"));
         assertTrue(enabled.stderr.stripTrailing().endsWith(
@@ -203,52 +206,42 @@ class BlackBoxSERAuditTest {
         assertEquals(0, result.exitCode);
         assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"));
         assertTrue(result.stderr.contains("backend=monosat"), () -> "stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains("gmwr=true"));
         assertTrue(result.stderr.contains("predicate-encoding=gmwr"));
-        assertTrue(result.stderr.contains("ser-propagation-mode=ww-gmwr"));
         assertTrue(result.stderr.contains("gmwr-prepropagation=true"));
         assertTrue(result.stderr.contains("predicate-witness-coalescing=true"));
         assertTrue(result.stderr.contains("graph-edge-interning=true"));
     }
 
     @Test
-    void auditCliSupportsNoneAndReachabilityWwPruning() throws Exception {
-        var historyDir = writeTextHistoryAsPrhist("prun-pruning-history", List.of(
-                "w(1,1,1,1)",
-                "w(1,2,2,2)",
-                "w(2,2,2,2)",
-                "r(1,1,3,3)",
-                "r(2,2,3,3)"));
+    void bareSolverSettingsUseTheSameFullyAcceleratedDefaultsAsCli() {
+        var settings = new SERVerifier.SolverSettings();
 
-        var reachability = runAuditCommand("audit", "--ww-pruning=REACHABILITY",
-                historyDir.toString());
-        var none = runAuditCommand("audit", "--ww-pruning=NONE",
-                historyDir.toString());
-
-        assertEquals(reachability.exitCode, none.exitCode);
-        assertEquals(0, reachability.exitCode);
-        assertEquals(0, none.exitCode);
-        assertFalse(reachability.stderr.contains("Pruning round"),
-                () -> "stderr was:\n" + reachability.stderr);
-        assertFalse(none.stderr.contains("Pruning round"),
-                () -> "stderr was:\n" + none.stderr);
+        assertEquals(SERVerifier.PredicateSolvingMode.GMWR,
+                settings.predicateSolvingMode);
+        assertEquals(SERVerifier.PruningMode.REACHABILITY,
+                settings.pruningMode);
+        assertTrue(settings.gmwrPrepropagation);
+        assertTrue(settings.predicateWitnessCoalescing);
+        assertTrue(settings.graphEdgeInterning);
     }
 
     @Test
-    void auditCli_skipsPruningWhenThereAreNoWwConstraints() throws Exception {
-        var historyDir = writeTextHistoryAsPrhist("no-ww-constraints", List.of(
+    void auditCli_rejectsRemovedAlgorithmOptions() throws Exception {
+        var historyDir = writeTextHistoryAsPrhist("prun-pruning-history", List.of(
+                "w(1,1,1,1)",
                 "r(1,0,1,1)"));
 
-        for (var mode : List.of("REACHABILITY", "NONE")) {
-            var result = runAuditCommand("audit", "--ww-pruning=" + mode,
+        for (var option : List.of(
+                "--predicate-encoding=eager",
+                "--ww-pruning=none",
+                "--no-predicate-witness-coalescing",
+                "--no-graph-edge-interning")) {
+            var result = runAuditCommand("audit", option,
                     historyDir.toString());
-
-            assertEquals(0, result.exitCode);
-            assertTrue(result.stderr.contains("WW\n0 -> 0"),
-                    () -> "stderr was:\n" + result.stderr);
-            assertFalse(result.stderr.contains("pruning round"),
-                    () -> "stderr was:\n" + result.stderr);
-            assertFalse(result.stderr.contains("post-check"),
-                    () -> "stderr was:\n" + result.stderr);
+            assertEquals(2, result.exitCode, () -> "option=" + option);
+            assertTrue(result.stderr.contains("Unknown option"),
+                    () -> "option=" + option + " stderr:\n" + result.stderr);
         }
     }
 
@@ -263,13 +256,13 @@ class BlackBoxSERAuditTest {
                 "w(2,1,2,2)"));
 
         var monosat = runAuditCommand("audit", historyDir.toString());
-        var withoutWwPruning = runAuditCommand("audit",
-                "--ww-pruning=NONE", historyDir.toString());
+        var withoutPrepropagation = runAuditCommand("audit",
+                "--no-gmwr-prepropagation", historyDir.toString());
 
         assertEquals(-1, monosat.exitCode);
-        assertEquals(monosat.exitCode, withoutWwPruning.exitCode);
+        assertEquals(monosat.exitCode, withoutPrepropagation.exitCode);
         assertTrue(monosat.stderr.contains("SER audit result: REJECT"));
-        assertTrue(withoutWwPruning.stderr.contains("SER audit result: REJECT"));
+        assertTrue(withoutPrepropagation.stderr.contains("SER audit result: REJECT"));
     }
 
     @Test
@@ -722,7 +715,8 @@ class BlackBoxSERAuditTest {
     private void assertOptionMatrix(Path historyPath, int expectedExitCode) throws Exception {
         var optionSets = List.of(
                 List.<String>of(),
-                List.of("--ww-pruning=none"));
+                List.of("--no-gmwr-prepropagation"),
+                List.of("--no-gmwr"));
 
         for (var options : optionSets) {
             var args = new java.util.ArrayList<String>();

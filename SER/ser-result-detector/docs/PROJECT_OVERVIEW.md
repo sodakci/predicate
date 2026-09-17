@@ -41,7 +41,7 @@ guard = guard(k1) OR guard(k2)
 (a,b,PR_WR,k1) + (a,b,WR,k1)
 ```
 
-不会在语义层或谓词合并层被改写成同一种依赖。Java 层仍分别保留 `PR_WR` 和 `WR`；它们只在投影到 `serializationGraph` 时可共用同一条 `(a,b)` native edge，因为无环性只取决于端点和方向。生产 G2/E2 均默认启用该内部实现，旧 `--[no-]graph-edge-interning` 仅作为隐藏实验兼容参数。
+不会在语义层或谓词合并层被改写成同一种依赖。Java 层仍分别保留 `PR_WR` 和 `WR`；它们只在投影到 `serializationGraph` 时共用同一条 `(a,b)` native edge，因为无环性只取决于端点和方向。graph-edge interning 是固定开启的生产实现，不再暴露 CLI 开关。
 
 因此准确答案不是二选一，而是：
 
@@ -246,7 +246,7 @@ pruning 只提前物化已经被已知可达性唯一决定的分支；未决分
 
 `encodeKnownTypedEdges` 会把 `SO/WR/WW/RW/PR_WR/PR_RW` 保留为 logical dependency metadata，它们的端点方向与已知顺序的传递约简共同进入 `serializationGraph`。
 
-Java checker侧的确定性precedence查询统一由 `PrecedenceOracle`提供：`before(a,b)`、`successor(a)`、`predecessor(b)`、`wouldCycle(a,b)`。`SERVerifier`为每次audit创建唯一实例，并通过constructor injection传给WW reachability、solver、GMWR propagation与GMWR-WW bridge；任一阶段加入deterministic fact后，所有阶段看到同一 `before relation`。MonoSAT的residual WW、frontier和order decision variables不进入oracle。
+Java checker侧的确定性precedence查询统一由 `PrecedenceOracle`提供：`before(a,b)`、`successor(a)`、`predecessor(b)`、`wouldCycle(a,b)`。`SERVerifier`为每次audit创建唯一实例，先将它交给WW reachability完成确定性WW/RW剪枝，再通过constructor injection交给solver和GMWR propagation；后续阶段消费baseline发布的确定事实，但GMWR不再反向固定残余WW choice。MonoSAT的residual WW、frontier和order decision variables不进入oracle。
 
 ### 5.4 谓词边如何产生
 
@@ -289,7 +289,7 @@ selected(S,R,k) AND beforeWrite(S,U)
 
 row-local 查询可以逐 key 预编码。JOIN、DISTINCT 或其他 general query 会在 SAT 给出候选 frontier 后执行完整 `QueryPlan`；若模型结果与记录不一致，则加入 no-good 后继续求解。refinement 改变的是 frontier 组合的合法性，不会在模型验证阶段临时发明新的边类型。
 
-## 6. 核心算法一：谓词语义驱动的 WW 剪枝
+## 6. 核心算法一：GMWR obligation 预传播
 
 ### 6.1 它比普通 WW 剪枝多知道什么
 
@@ -319,16 +319,14 @@ $$
 \boxed{T_g \prec T_r}.
 $$
 
-原来未决的 WW 方向由此确定。这不是把可达性算法写得更快，而是给可达性剪枝增加了原本没有利用的谓词观察语义。
+这些顺序是谓词义务的逻辑后果，可直接加入确定性 precedence。当前实现不会用它们反向选择或重新扫描 residual WW constraint；普通 WW/RW reachability 在进入 `SERSolverAR` 前独立完成。
 
-### 6.2 核心过程：删候选、推事实、反馈 WW
+### 6.2 核心过程：删候选、推确定事实
 
 算法状态可以分成三部分：
 
 $$
 P=\text{已确定的顺序事实},
-\qquad
-U=\text{未决的 WW 选择},
 \qquad
 \mathcal O=\text{尚未解决的谓词义务}.
 $$
@@ -359,21 +357,21 @@ $$
 
 这里必须遵守一个原则：只能删除已证明不可能的候选，不能把“当前没有可达路径”当成“不可能”。
 
-推导出的新顺序进入 $P$，然后重新检查 WW 选择。某个 WW 分支及其伴随依赖可能因此与新事实形成环，于是该分支被排除；固定的 WW 方向又可能让更多覆盖候选变得不可能。由此形成固定点传播：
+推导出的新顺序进入 $P$，随后继续化简受影响的谓词义务，直到 worklist 中没有新的候选删除、满足状态或确定事实：
 
 $$
 \boxed{
-\text{WW 顺序事实}
+\text{已知 precedence}
 \;\longrightarrow\;
 \text{谓词义务化简}
 \;\longrightarrow\;
-\text{新顺序事实}
+\text{新确定 precedence}
 \;\longrightarrow\;
-\text{更多 WW 剪枝}
+\text{更多谓词义务化简}
 }
 $$
 
-这一过程持续到没有新事实、候选删除或 WW 定向为止。
+这一过程不会执行 GMWR-to-WW feedback，也不会替代 baseline WW reachability。
 
 ### 6.3 输出是更小的搜索问题，而不是完整答案
 
@@ -385,15 +383,7 @@ $$
 
 两个候选都可行时，传播过程不能擅自选择其中一个；这个选择仍交给求解器。因此，该算法的职责是提前确定必然成立的事实、排除必然错误的分支，并保留真正无法确定的部分。
 
-一条已有实验记录将这种增量效果区分为：
-
-| 阶段 | WW choices |
-| --- | ---: |
-| 初始 | 112,032 |
-| WW reachability 之后 | 1,742 |
-| GMWR 之后 | 1,565 |
-
-该记录中的 `GMWR_TO_WW_FORCED=177` 对应最后一段额外定向，而不是把基础 WW 剪枝的全部收益也计入 GMWR。第一个算法贡献可以概括为：利用谓词观察强化 WW 推理，在进入完整求解之前缩小未决搜索空间。
+因此本阶段的贡献应从 `GMWR_INITIAL_CONSTRAINTS -> GMWR_RESIDUAL_CONSTRAINTS`、forced facts、residual clauses/literals 和最终 SAT 规模衡量，不能再用“GMWR 额外减少了多少 WW choice”归因。
 
 ## 7. 核心算法二：因子化谓词编码与延迟物化
 
@@ -417,7 +407,7 @@ $$
 
 如果逐个义务独立处理，就可能反复构造顺序表达式、覆盖条件和条件依赖；有些义务最后还会被已知事实完全解决。问题不只是最终出现重复边，而是在知道这些结构是否必要之前，就已经付出了展开和构造成本。
 
-### 7.2 第一层：把共享结构组织成 bundle
+### 7.2 共享 outside-order，但显式保留每个 item
 
 假设多个义务具有相同的读取事务 $r$ 和 bad writer $b$。记：
 
@@ -441,7 +431,7 @@ a\lor\bigwedge_{i=1}^{m}R_i
 } \tag{2}
 $$
 
-可以把它们组织成一个共享结构：要么整个写事务 $b$ 在读取之后；否则，它带来的每一项问题都必须分别得到修复。这就是 bundle 的核心含义：共享公共条件，同时保留各个 item 的独立语义。
+这些公式共享同一个 order literal $a$，但当前实现逐个保留并物化 item clause。`GmwrPropagationState` 可以按相同 `(reader,badWriter)` 复用 outside-order 和传播索引；它不再执行 bundle compaction、item 去重或包含消除。
 
 特别需要注意：
 
@@ -457,9 +447,9 @@ $$
 
 后者只要求修复其中一个问题，会漏掉另一个 key 上的错误。同样，不同 item 可以由不同 good writer 修复，不能强行要求它们共享同一个 repair witness。
 
-### 7.3 第二层：删除重复和被包含的义务
+### 7.3 第二层：删除不可能候选并消解已满足义务
 
-因子化之后，还可以在语义表示上继续化简。例如：
+预传播只依据已知 precedence 删除不可能 repair，并消解已满足或已经被确定事实强制的义务。下述包含关系是逻辑上成立的例子，但当前生产实现不再用它压缩 item：
 
 $$
 C_1=a\lor x\lor y,
@@ -473,13 +463,13 @@ $$
 C_1\Rightarrow C_2,
 $$
 
-两者同时要求成立时，只保留 $C_1$ 即可。这里的 $x,y,z$ 可以代表完整的覆盖条件，例如：
+这里的 $x,y,z$ 可以代表完整的覆盖条件，例如：
 
 $$
 x=(b\prec g_1)\land(g_1\prec r).
 $$
 
-包含判断比较的必须是实际逻辑条件，不能仅凭两个候选列表的事务编号相似，就认定它们等价。已有运行记录中的 `BUNDLES`、`DUPLICATE_ITEM_CLAUSES`、`SUBSUMED_ITEM_CLAUSES` 和 `RESIDUAL_CLAUSES` 分别记录这些不同层次的数量，不能统称为“图边去重”。
+当前保留的统计是 item obligations、materialized item clauses、residual clauses/literals 和 interval candidates pruned；旧 bundle/duplicate/subsumed 统计已删除。
 
 ### 7.4 第三层：只物化化简后仍然需要的部分
 
@@ -492,9 +482,9 @@ $$
   -> 后续处理再发现其中一部分不需要
 
 GMWR：
-建立语义义务和 bundle
+建立显式语义义务
   -> 用已知顺序删除不可能的候选
-  -> 消解已满足义务、合并重复项、执行包含消除
+  -> 消解已满足义务并传播确定事实
   -> 只为剩余部分构造 SAT 公式和必要的条件依赖
 ```
 
@@ -520,11 +510,11 @@ $$
 
 | 技术 | 主要处理的对象 |
 | --- | --- |
-| GMWR 因子化与延迟物化 | 语义义务及其公式结构，避免不必要的展开 |
+| GMWR 预传播与延迟物化 | 语义义务及其候选，避免编码已解决或不可能的部分 |
 | Witness coalescing | 多个 witness 对同一逻辑依赖的重复支持 |
 | Edge interning | 同一物理图中重复创建的边对象 |
 
-GMWR 可以让某些候选、公式和依赖从一开始就不被构造；后两者主要避免已经进入相应构造阶段的重复表示。所以第二个算法贡献应概括为：通过共享公共条件、消除冗余义务，并延迟实例化残余依赖，构造等价但更紧凑的谓词约束表示。
+GMWR 可以让某些候选、公式和依赖从一开始就不被构造；后两者主要避免已经进入相应构造阶段的重复表示。当前实现的贡献应概括为 frontier 候选缩减、obligation 预传播和 residual clause 延迟物化，不再归因于 bundle compaction。
 
 ## 8. 边的收集、合并和最终物化
 
@@ -574,7 +564,7 @@ guard = g1 OR g2
 
 不会在这一层合并，因为 type 不同。`PR_WR` 与 `WR` 也不会在这一层合并，因为该过程只处理 predicate candidates，而且分组键仍包含 type。
 
-这个内部设置是 `predicateWitnessCoalescing`，生产 G2/E2 均开启；隐藏参数 `--predicate-witness-coalescing` 仅供实验覆盖。WW constraint 始终由 `generateConstraintsCoalesce()` 按事务对合并。
+这个内部设置是 `predicateWitnessCoalescing`，生产 EAGER/GMWR 均固定开启。WW constraint 始终由 `generateConstraintsCoalesce()` 按事务对合并。
 
 ### 8.3 Serialization graph-edge interning：按 `(from,to)`
 
@@ -661,17 +651,16 @@ D_M 有有向环  <=>  π(D_M) 有有向环
 
 ## 10. 当前开关、默认值和各自解决的问题
 
-本节的“默认值”指 `audit` 命令的实际默认路径。CLI 会调用 `SolverSettings.forModes(...)`，而不是直接使用一个未初始化的裸 `SolverSettings` 对象。若测试或外部调用方自行 `new SolverSettings()` 且不再赋值，Java 的 boolean 字段初值是 `false`；这不是 `audit` CLI 的默认配置。
+CLI 和裸 `SolverSettings` 现在使用同一套默认值：WW reachability、GMWR、frontier、GMWR prepropagation、predicate witness coalescing 与 graph-edge interning 全部开启。bundle compaction 与 GMWR-to-WW feedback 已删除。
 
-### 10.1 不传任何可选参数时的实际配置
+### 10.1 不传可选参数时
 
 ```text
 history type                    PRHIST
-pruning mode                   REACHABILITY
+WW pruning                     REACHABILITY
 predicate solving mode         GMWR
-SER propagation mode           WW_GMWR
+frontier pruning               true
 GMWR prepropagation            true
-WW constraint coalescing       true
 predicate witness coalescing   true
 graph-edge interning           true
 solver                         monosat
@@ -679,151 +668,39 @@ solver timeout                 600 seconds
 detailed solver stats          false
 ```
 
-按当前实验命名，这个无参数组合属于完整 `G2`：`GMWR + WW_GMWR + prepropagation + witness coalescing + graph-edge interning`。
+WW reachability、witness coalescing 和 graph-edge interning 是固定的生产实现，不再具有 CLI 开关。细粒度字段仅保留在 `SolverSettings` 中供嵌入与差分测试使用。
 
-如果显式使用：
+### 10.2 两个算法开关
 
-```text
---predicate-encoding=eager
-```
-
-则切换为论文 E2 baseline：
-
-```text
-predicate solving mode         EAGER
-SER propagation mode           WW_ONLY
-GMWR prepropagation            false
-```
-
-WW reachability、predicate witness coalescing 和 graph-edge interning 仍开启。E1/G1 所需的物理展开或 one-way propagation 只通过隐藏 experimental flags 保留给 benchmark。
-
-### 10.2 两个物理压缩实验开关
-
-下表 CLI 均为隐藏 experimental 参数；生产 G2/E2 不要求用户指定。
-
-| CLI | 内部设置 | 默认 | 解决的问题 | 关闭后的直接变化 |
-| --- | --- | --- | --- | --- |
-| `--[no-]predicate-witness-coalescing` | `predicateWitnessCoalescing` | 开启 | 多个 key 产生相同 `(from,to,type)` 的 `PR_WR/PR_RW` witness | 不再把 keys 和 guards 合并，每个 predicate witness 单独进入依赖队列 |
-| `--[no-]graph-edge-interning` | `graphEdgeInterning` | 开启 | 不同 type/key 最终可能产生相同 `(from,to)` 的 MonoSAT serialization edge | 每个送入 `encodeDependencyEdge` 的 Java typed edge各建一条 serialization edge |
-
-三者处理的不是同一个对象：
-
-```text
-PR_WR/PR_RW typed witnesses
-    --[no-]predicate-witness-coalescing 控制
-
-MonoSAT serializationGraph edge
-    --[no-]graph-edge-interning 控制
-```
-
-两个开关都以保持 ACCEPT/REJECT 等价为目标，改变的是公式规模和物理表示，不改变六类 Adya relation 的定义。
-
-#### `PR_WR(a,b)` 与 `WR(a,b)` 共用 native edge 是否由开关控制
-
-是，直接由 `graphEdgeInterning` 控制。
-
-`SolverSettings.forModes(...)` 无条件设置：
-
-```text
-predicateWitnessCoalescing = true
-graphEdgeInterning         = true
-```
-
-随后 `Main.Audit.call()` 只在用户显式传入正向或负向参数时覆盖对应值。`encodeDependencyEdge` 的分支为：
-
-```text
-graphEdgeInterning = false
-    每条 logical dependency 调用 serializationGraph.addEdge(from,to)
-
-graphEdgeInterning = true
-    复用 serializationEdgeCache[(from,to)]
-```
-
-因此：
-
-```text
-# 默认：PR_WR(a,b) 与 WR(a,b) 共用 E(a,b)
-audit history
-
-# 关闭：二者各自创建一条 MonoSAT native edge
-audit --no-graph-edge-interning history
-
-# 显式开启，与默认相同
-audit --graph-edge-interning history
-```
-
-关闭后，Java 语义层没有变化，只是 MonoSAT 中重新出现同向平行边；预期 verdict 不变，native edge 数量和求解成本可能增大。
-
-### 10.3 隐藏实验 WW/RW pruning 开关
-
-| CLI | 默认 | 解决的问题 | 对 Adya 图的影响 |
-| --- | --- | --- | --- |
-| `--ww-pruning=NONE` | 否 | 保留全部未决 WW 分支，作为无剪枝实验基线 | 不预先物化分支，全部交给 SAT |
-| `--ww-pruning=REACHABILITY` | 是 | 删除会立即与已知依赖闭包成环的 WW/RW 分支 | 只提前固定被可达性唯一决定的 typed edges |
-
-这些开关发生在 `SERSolverAR` 构造之前，主要减少残余 `SERConstraint`。它们不会把某种 typed edge 改成另一种类型。
-
-### 10.4 谓词编码模式
-
-| CLI | 默认 | 解决的问题 | 保留的语义 |
-| --- | --- | --- | --- |
-| `--predicate-encoding=eager` | 否 | row-local 谓词逐 key 直接生成结果合法性 clause，对应 E2 | 仍构造 source-aware `PR_WR/PR_RW`，general query 仍做模型 refinement |
-| `--predicate-encoding=gmwr` | 是 | 合并 `(reader,badWriter)` obligations、剪除不可能 source/frontier，并减少残余 clause，对应完整 G2 | 不改变 recorded source、`PR_WR/PR_RW` 定义或完整查询结果校验 |
-
-`--predicate-encoding` 是公开的完整 predicate solving mode，不是 WW pruning 开关。旧 `--predicate-mode` 已删除。
-
-`predicateWitnessCoalescing` 与该模式独立，CLI 默认在 EAGER 和 GMWR 下都开启；不要把“选择 GMWR”误解为“才会开启 `(from,to,type)` witness 合并”。
-
-### 10.5 GMWR prepropagation 与 WW feedback
-
-内部 `gmwrPrepropagation` 控制是否在 SAT 编码前运行 GMWR 化简；生产 G2 固定开启，`--[no-]gmwr-prepropagation` 仅为隐藏实验覆盖：
-
-| 当前 predicate mode | 默认 | 行为 |
+| CLI | 默认 | 作用 |
 | --- | --- | --- |
-| EAGER | 关 | `propagateBeforeEncoding` 直接返回；即使手动打开该开关，当前 EAGER 路径也不执行 GMWR propagation |
-| GMWR | 开 | 先传播确定事实、消解已经满足或冲突的 GMWR obligations，再编码残余部分 |
+| `--[no-]gmwr` | 开 | 开启时同时使用 GMWR formulation 与普通/absent-key 两条 frontier 剪枝路径；关闭时切到 EAGER 并关闭这些 frontier 剪枝。 |
+| `--[no-]gmwr-prepropagation` | 开 | 控制 GMWR obligation 在 SAT 编码前的传播；关闭 GMWR 时无效且实际值为 false。 |
 
-关闭 prepropagation 不会关闭 GMWR obligation 构造，也不会退回 EAGER；它只是不在 SAT 前化简这些 obligations。
+三种有意义的实验配置为：
 
-内部 `serPropagationMode` 控制 GMWR 信息是否反向固定残余 WW choice；生产 G2 固定为 `WW_GMWR`，`--ser-propagation-mode` 仅为隐藏实验覆盖：
+```text
+audit --no-gmwr --no-gmwr-prepropagation HISTORY  # NO_GMWR
+audit --gmwr --no-gmwr-prepropagation HISTORY     # NO_PREPROP
+audit --gmwr --gmwr-prepropagation HISTORY        # FULL（默认）
+```
 
-| 值 | 默认条件 | 当前作用 |
+因此归因链为：
+
+```text
+NO_GMWR --(GMWR + frontier)--> NO_PREPROP --(prepropagation)--> FULL
+```
+
+关闭 prepropagation 不会退回 EAGER；它只保留全部 GMWR residual obligations 给 SAT。关闭 GMWR 则同时关闭 GMWR formulation 和 frontier 剪枝，避免把同一机制从两个角度拆成互相重叠的公开开关。
+
+### 10.3 运维参数
+
+| CLI | 默认 | 作用 |
 | --- | --- | --- |
-| `ww-only` | EAGER 默认 | 不运行 GMWR-to-WW bridge |
-| `ww-gmwr-oneway` | 非默认实验值 | 允许既有 WW/known facts 参与 GMWR 化简，但不把 GMWR 结果反馈成 WW 分支 |
-| `ww-gmwr` | GMWR 默认 | 运行 `propagateGmwrToWwFixpoint`，用 GMWR definite facts 检查并固定只能取一侧的 WW constraint，再把新 WW 同步回传播状态 |
+| `--solver-timeout-seconds=600` | 600 秒 | 从 `solve()` 开始限制 MonoSAT 时间；`0` 表示不设 backend timeout。 |
+| `--solver-stats` | 关 | 输出 SAT、GMWR、frontier、物理边与内存统计，不改变公式。 |
 
-当前 `SERSolverAR` 中只有 `WW_GMWR` 会进入 `GmwrWwBridge`；`WW_ONLY` 和 `WW_GMWR_ONEWAY` 都不会反向物化 WW。并且只有 `predicate mode=GMWR` 时才会构造 GMWR propagation state。
-
-### 10.6 公开运行控制与隐藏实验开关
-
-| CLI | 默认 | 作用 | 是否进入正常 Adya verdict 语义 |
-| --- | --- | --- | --- |
-| `--predicate-encoding=gmwr` | GMWR | 选择默认 G2；`eager` 切换为 E2 | 是，选择等价实现路径 |
-| `--solver-timeout-seconds=600` | 600 秒 | 从 `solve()` 开始限制 MonoSAT 时间；`0` 表示不设 backend timeout | 不改变公式，但可能返回 `TIMEOUT` 而不是等到 SAT/UNSAT |
-| `--solver-stats` | 关 | 输出 SAT、GMWR、coalescing 和 native edge 统计 | 否，只增加统计 |
-
-普通 `audit --help` 只展示以上三项。E1/G1 和剪枝消融使用的 `--ser-propagation-mode`、GMWR prepropagation、witness coalescing、edge interning 与 WW pruning 仍可解析，但均隐藏并标记 experimental。固定 backend/loader、旧谓词参数和诊断参数已经删除。
-
-### 10.7 如何通过隐藏实验参数验证某个压缩开关
-
-若只想确认 `PR_WR/WR` 的 native edge 共享是否影响结果，应保持其他参数不变，只切换 graph-edge interning：
-
-```bash
-audit --graph-edge-interning /path/to/history
-audit --no-graph-edge-interning /path/to/history
-```
-
-若要关闭两层谓词物理压缩：
-
-```bash
-audit \
-  --no-predicate-witness-coalescing \
-  --no-graph-edge-interning \
-  /path/to/history
-```
-
-前一组只隔离 `(from,to)` native edge 复用；后一组会同时扩大 predicate witness 队列和 MonoSAT native 图，不能把性能差异只归因于 graph-edge interning。
+生产 CLI 已删除 predicate encoding、WW pruning、witness coalescing、edge interning、bundle 和 propagation mode 的旧参数。完整消融由 `tools/run_ser_acceleration_ablation.py` 统一执行。
 
 ## 11. 完整例子
 

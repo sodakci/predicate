@@ -8,7 +8,6 @@ import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
-import picocli.CommandLine.ITypeConverter;
 import util.Profiler;
 import verifier.SERVerifier;
 
@@ -29,33 +28,8 @@ public class Main implements Callable<Integer> {
     }
 }
 
-enum WwPruningMode {
-    NONE,
-    REACHABILITY;
-
-    SERVerifier.PruningMode asVerifierMode() {
-        return this == NONE
-                ? SERVerifier.PruningMode.NONE
-                : SERVerifier.PruningMode.REACHABILITY;
-    }
-}
-
 @Command(name = "audit", mixinStandardHelpOptions = true, description = "Verify a history")
 class Audit implements Callable<Integer> {
-    static final class SerPropagationModeConverter
-            implements ITypeConverter<SERVerifier.SerPropagationMode> {
-        @Override
-        public SERVerifier.SerPropagationMode convert(String value) {
-            return SERVerifier.SerPropagationMode.valueOf(
-                    value.trim().toUpperCase().replace('-', '_'));
-        }
-    }
-
-    @Option(names = { "--ww-pruning" },
-            hidden = true,
-            description = "[experimental] WW pruning: ${COMPLETION-CANDIDATES}")
-    private WwPruningMode wwPruning = WwPruningMode.REACHABILITY;
-
     @Option(names = { "--solver-timeout-seconds" }, description = "SAT solver timeout in seconds measured from solve(); 0 disables backend timeout")
     private int solverTimeoutSeconds = 600;
 
@@ -63,30 +37,13 @@ class Audit implements Callable<Integer> {
             description = "print SAT backend and detailed predicate encoding statistics")
     private final Boolean solverStats = false;
 
-    @Option(names = { "--predicate-encoding" },
-            description = "predicate encoding: ${COMPLETION-CANDIDATES} (default: gmwr)")
-    private SERVerifier.PredicateSolvingMode predicateEncoding;
-
-    @Option(names = { "--ser-propagation-mode" },
-            converter = SerPropagationModeConverter.class,
-            hidden = true,
-            description = "[experimental] internal GMWR propagation mode")
-    private SERVerifier.SerPropagationMode serPropagationMode;
+    @Option(names = { "--gmwr" }, negatable = true,
+            description = "enable GMWR encoding and frontier pruning")
+    private Boolean gmwr;
 
     @Option(names = { "--gmwr-prepropagation" }, negatable = true,
-            hidden = true,
-            description = "[experimental] override GMWR prepropagation")
+            description = "enable GMWR prepropagation (effective only with GMWR)")
     private Boolean gmwrPrepropagation;
-
-    @Option(names = { "--predicate-witness-coalescing" }, negatable = true,
-            hidden = true,
-            description = "[experimental] override witness coalescing")
-    private Boolean predicateWitnessCoalescing;
-
-    @Option(names = { "--graph-edge-interning" }, negatable = true,
-            hidden = true,
-            description = "[experimental] override graph edge interning")
-    private Boolean graphEdgeInterning;
 
     @Parameters(paramLabel = "HISTORY", description = "history path")
     private Path path;
@@ -115,27 +72,17 @@ class Audit implements Callable<Integer> {
         profiler.clear();
         var loader = new PredicateHistoryLoader(path);
 
-        var selectedPruningMode = wwPruning.asVerifierMode();
-        selectedPredicateEncoding = predicateEncoding != null
-                ? predicateEncoding
-                : SERVerifier.PredicateSolvingMode.GMWR;
-        var selectedPropagationMode = serPropagationMode != null
-                ? serPropagationMode
-                : selectedPredicateEncoding == SERVerifier.PredicateSolvingMode.GMWR
-                        ? SERVerifier.SerPropagationMode.WW_GMWR
-                        : SERVerifier.SerPropagationMode.WW_ONLY;
+        boolean gmwrEnabled = gmwr == null || gmwr;
+        boolean prepropagationEnabled = gmwrPrepropagation == null
+                || gmwrPrepropagation;
+        selectedPredicateEncoding = gmwrEnabled
+                ? SERVerifier.PredicateSolvingMode.GMWR
+                : SERVerifier.PredicateSolvingMode.EAGER;
         var settings = SERVerifier.SolverSettings.forModes(
-                selectedPredicateEncoding, selectedPruningMode,
-                selectedPropagationMode);
-        if (gmwrPrepropagation != null) {
-            settings.gmwrPrepropagation = gmwrPrepropagation;
-        }
-        if (predicateWitnessCoalescing != null) {
-            settings.predicateWitnessCoalescing = predicateWitnessCoalescing;
-        }
-        if (graphEdgeInterning != null) {
-            settings.graphEdgeInterning = graphEdgeInterning;
-        }
+                selectedPredicateEncoding, SERVerifier.PruningMode.REACHABILITY);
+        settings.gmwrPrepropagation = gmwrEnabled && prepropagationEnabled;
+        settings.predicateWitnessCoalescing = true;
+        settings.graphEdgeInterning = true;
         settings.solverTimeoutSeconds = solverTimeoutSeconds;
         settings.detailedPredicateMetrics = solverStats;
         settings.auditProgressListener = this::printCompletedSection;
@@ -156,10 +103,9 @@ class Audit implements Callable<Integer> {
                 System.err.printf("%s: %d\n", p.getKey(), p.getValue());
             }
             System.err.println("[solver-stats] backend=monosat");
+            System.err.printf("[solver-stats] gmwr=%s%n", gmwrEnabled);
             System.err.printf("[solver-stats] predicate-encoding=%s%n",
                     selectedPredicateEncoding.name().toLowerCase());
-            System.err.printf("[solver-stats] ser-propagation-mode=%s%n",
-                    selectedPropagationMode.name().toLowerCase().replace('_', '-'));
             System.err.printf("[solver-stats] gmwr-prepropagation=%s%n",
                     settings.gmwrPrepropagation);
             System.err.printf("[solver-stats] predicate-witness-coalescing=%s%n",
@@ -212,50 +158,32 @@ class Audit implements Callable<Integer> {
         long reachabilityForced = profiler.getCount("WW_REACHABILITY_FORCED");
 
         System.err.println("WW");
-        if (selectedPredicateEncoding == SERVerifier.PredicateSolvingMode.GMWR) {
-            System.err.printf(Locale.ROOT, "%s -> %s -> %s%n",
-                    grouped(initial), grouped(wwAfterReachability),
-                    grouped(profiler.getCount("WW_AFTER_GMWR")));
-        } else {
-            System.err.printf(Locale.ROOT, "%s -> %s%n",
-                    grouped(initial), grouped(wwAfterReachability));
-        }
+        System.err.printf(Locale.ROOT, "%s -> %s%n",
+                grouped(initial), grouped(wwAfterReachability));
         System.err.printf(Locale.ROOT, "Reachability forced: %s (%.1f%%)%n",
                 grouped(reachabilityForced), percentage(reachabilityForced, initial));
-        if (selectedPredicateEncoding == SERVerifier.PredicateSolvingMode.GMWR) {
-            long gmwrReduced = Math.max(0L, wwAfterReachability
-                    - profiler.getCount("WW_AFTER_GMWR"));
-            System.err.printf(Locale.ROOT, "GMWR-WW reduced:      %s (%.1f%%)%n",
-                    grouped(gmwrReduced), percentage(gmwrReduced, wwAfterReachability));
-        }
         System.err.println();
     }
 
     private void printGmwrSummary() {
         long wwInitial = profiler.getCount("WW_INITIAL_CHOICES");
         long wwAfterReachability = profiler.getCount("WW_AFTER_REACHABILITY");
-        long wwAfterGmwr = profiler.getCount("WW_AFTER_GMWR");
         long gmwrInitial = profiler.getCount("GMWR_INITIAL_CONSTRAINTS");
         long gmwrResidual = profiler.getCount("GMWR_RESIDUAL_CONSTRAINTS");
         long gmwrMs = profiler.getTime("GMWR_BUILD_MS")
-                + profiler.getTime("GMWR_REDUCTION_MS")
-                + profiler.getTime("GMWR_WW_BRIDGE_MS");
+                + profiler.getTime("GMWR_REDUCTION_MS");
         System.err.println("GMWR");
         printSummaryTransition("Constraints:", gmwrInitial, gmwrResidual);
-        printSummaryTransition("Bundles:",
-                profiler.getCount("SER_GMWR_BUNDLES_COUNT"),
-                profiler.getCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT"));
         System.err.printf(Locale.ROOT,
                 "PRUNING_COMPARISON_STATS ww_original=%d ww_residual=%d ww_reduced=%d "
-                        + "ww_time_ms=%d gmwr_original=%d gmwr_residual=%d "
-                        + "gmwr_reduced=%d gmwr_time_ms=%d "
-                        + "gmwr_obligations_original=%d gmwr_obligations_residual=%d%n",
+                        + "ww_time_ms=%d gmwr_obligations_original=%d "
+                        + "gmwr_obligations_residual=%d gmwr_obligations_reduced=%d "
+                        + "gmwr_time_ms=%d%n",
                 wwInitial, wwAfterReachability,
                 Math.max(0L, wwInitial - wwAfterReachability),
                 profiler.getTime("WW_REACHABILITY_PRUNE_MS"),
-                wwAfterReachability, wwAfterGmwr,
-                Math.max(0L, wwAfterReachability - wwAfterGmwr), gmwrMs,
-                gmwrInitial, gmwrResidual);
+                gmwrInitial, gmwrResidual, Math.max(0L, gmwrInitial - gmwrResidual),
+                gmwrMs);
         System.err.println();
     }
 
@@ -288,8 +216,7 @@ class Audit implements Callable<Integer> {
 
     private void printTimingSummary() {
         long gmwrMs = profiler.getTime("GMWR_BUILD_MS")
-                + profiler.getTime("GMWR_REDUCTION_MS")
-                + profiler.getTime("GMWR_WW_BRIDGE_MS");
+                + profiler.getTime("GMWR_REDUCTION_MS");
         System.err.println("Timing");
         if (selectedPredicateEncoding == SERVerifier.PredicateSolvingMode.GMWR) {
             System.err.printf(Locale.ROOT,

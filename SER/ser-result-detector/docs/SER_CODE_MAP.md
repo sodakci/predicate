@@ -113,10 +113,9 @@ Main.main
 
 | 模式 | 文件 / 入口 | 真实作用 |
 | --- | --- | --- |
-| `NONE` | `SERVerifier.audit()` switch | 不做 checker pruning。 |
+| `NONE`（仅内部测试） | `SERVerifier.audit()` switch | 不做 checker pruning；生产 CLI 不再暴露。 |
 | `REACHABILITY`（默认） | `new Pruning(precedence)::pruneConstraints()` | 用 A+B 中非 predicate edge填充 audit唯一的 `PrecedenceOracle`；由 oracle判定整个branch加入后是否成环；一侧非法则提交另一侧WW/RW到 `KnownGraph`并删除constraint；两侧非法直接冲突。 |
 | GMWR preprop | `GmwrPropagationState.propagate()` | solver 构造阶段的第二层 checker propagation；削减 GMWR repair/frontier domain，产生 definite order/typed facts或冲突。 |
-| WW feedback | `SERSolverAR.propagateGmwrToWwFixpoint()` -> injected `GmwrWwBridge.scan[affected]()` | 仅 `serPropagationMode=WW_GMWR`：用共享 deterministic precedence判断 residual WW branches，提交 forced WW/RW，重跑 baseline reachability prune，再同步回 GMWR。 |
 
 ### 6.1 REACHABILITY
 
@@ -124,7 +123,7 @@ Main.main
 
 ### 6.2 唯一 deterministic before relation
 
-`SERVerifier`创建一次 `PrecedenceOracle<Transaction>`，并经constructor injection传给 `Pruning`、`SERSolverAR`、`GmwrPropagationState`和 `GmwrWwBridge`。所有生产组件的 `before(a,b)`读取同一实例，solver known-order不再另建 closure。
+`SERVerifier`创建一次 `PrecedenceOracle<Transaction>`，先交给 `Pruning` 完成 baseline WW/RW 剪枝，再经 constructor injection 传给 `SERSolverAR` 和 `GmwrPropagationState`。所有生产组件的 `before(a,b)`读取同一实例，solver known-order不再另建 closure。当前没有 GMWR-to-WW feedback。
 
 oracle只保存history/known graph、pruning结论与GMWR forced facts等 deterministic order。residual WW guard、frontier selection和其他MonoSAT decision literal只存在于Boolean/theory encoding，绝不反写oracle。独立的conflict-extraction solve拥有自己的solve context，不与主solve共享可变oracle。
 
@@ -136,7 +135,7 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 
 1. 创建 `monosat.Solver`、唯一 `serializationGraph` 及 real transaction nodes（bottom 不进 MonoSAT 图）。
 2. 建 write/key 索引。
-3. `propagateBeforeEncoding()`：GMWR obligation/frontier 构造及可选预传播、WW feedback。
+3. `propagateBeforeEncoding()`：GMWR obligation/frontier 构造及可选预传播。
 4. `buildKnownOrder()`：把 A+B 的已知 transaction precedence 送入 `PrecedenceOracle`，并生成 transitive reduction。
 5. `encodeKnownEdges()`。
 6. `encodeRemainingWwChoices()`：WW decision 同时排队分支内的 WW/RW。
@@ -181,10 +180,10 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | 共享 | `createKeyFrontier()` | EAGER 将完整候选交给 checker；GMWR 先做现有 source/reachability/interval 缩减再调用；随后建立 PR_WR/PR_RW 候选。 |
 | 共享 | `encodeSelectedPredicateDependencies()` | selected source guard 激活 PR_WR；`selected AND source<later AND delta` 激活 PR_RW。 |
 | EAGER | `encodeRowLocalPredicateEager()` | recorded source 与 absent frontier 均直接复用 `LatestVisibleChecker`；absent key 对每个 bad visible writer 立即建立完整 blocking disjunction。 |
-| GMWR | `collectGmwrLogicalConstraints()` | row-local absent key 产生 `(reader,badWriter)` GMWR item，repair 是产生空贡献的 good writers；相同 pair bundle 化。 |
+| GMWR | `collectGmwrLogicalConstraints()` | row-local absent key 产生 `(reader,badWriter)` GMWR item，repair 是产生空贡献的 good writers；item 显式保留。 |
 | GMWR | `GmwrPropagationState` | `PrecedenceOracle` + obligation/frontier worklist；去除不可能 repair，识别 satisfied/conflict，强制 outside/single repair/unique PR_WR。 |
-| GMWR | `encodeRowLocalPredicateGmwr()` | typed predicate frontier仍 source-aware；absent result 的 Boolean validity clauses由 GMWR bundle代替。 |
-| GMWR | `resolveAndEncodeGmwrBundles()` / `encodeResidualGmwr()` | 未由 checker 决定的每个 item进入 SAT：`reader<bad OR OR(bad<repair AND repair<reader)`。这些是 order literals/Boolean clauses，不直接产生 typed graph edge。 |
+| GMWR | `encodeRowLocalPredicateGmwr()` | typed predicate frontier仍 source-aware；absent result 的 Boolean validity clauses由 GMWR obligations 表示。 |
+| GMWR | `resolveAndEncodeGmwrObligations()` / `encodeResidualGmwr()` | 未由 checker 决定的每个 item进入 SAT：`reader<bad OR OR(bad<repair AND repair<reader)`。这些是 order literals/Boolean clauses，不直接产生 typed graph edge。 |
 | General | `refineGeneralPredicateConstraints()` | 从 SAT model 选各 key frontier，执行真实 `QueryPlan.evaluate()`；不匹配则加入所选组合的 no-good clause并重新 solve。GMWR monotone case可只取新增 input keys 作 witness。 |
 
 ## 9. MonoSAT 接口与图理论回传
@@ -203,11 +202,12 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 
 | CLI | 默认 | 消费位置 |
 | --- | --- | --- |
-| `--predicate-encoding` | `GMWR` | 公开算法选择；默认映射完整 G2，`eager` 映射 E2。 |
+| `--[no-]gmwr` | 开 | 同时控制 GMWR formulation 与普通/absent-key frontier 剪枝；关闭时使用 EAGER。 |
+| `--[no-]gmwr-prepropagation` | 开 | 控制 GMWR SAT 编码前传播；仅在 GMWR 开启时有效。 |
 | `--solver-timeout-seconds` | 600 | `SERSolverAR.solveOnce()`。 |
 | `--solver-stats` | false | detailed predicate counts和配置输出。 |
 
-普通 `audit --help` 只公开上述三项。E1/G1 与剪枝实验仍可使用隐藏的 `--ww-pruning`、`--ser-propagation-mode`、`--[no-]gmwr-prepropagation`、`--[no-]predicate-witness-coalescing` 和 `--[no-]graph-edge-interning`。固定 backend/loader、旧谓词别名、非合并 WW、增量校验和派生图诊断入口均已删除。
+生产 CLI 不再解析 `--predicate-encoding`、`--ww-pruning`、witness coalescing 或 graph-edge interning 开关。WW reachability、predicate witness coalescing 和 graph-edge interning 固定开启；内部 `SolverSettings` 只为嵌入和差分测试保留细粒度字段。
 
 ## 11. Statistics / timing / debug 索引
 
@@ -217,12 +217,12 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | `SERVerifier.audit()` | `SER_VERIFY_INT`、`SER_GEN_PREC_GRAPH`、`SER_GEN_CONSTRAINTS`、`WW_REACHABILITY_PRUNE_MS`、`SER_AR_ENCODE`、`SER_AR_SOLVE`、`ONESHOT_*`。 |
 | `SERSolverAR` constructor | 分阶段 `SER_AR_ENCODE_SETUP/KNOWN_EDGES/WW/RW/PREDICATE/DEPENDENCIES/TOTAL_ORDER`。 |
 | `SERSolverAR.solve()` | `SER_MONOSAT_SOLVE`、`SER_AR_PREDICATE_REFINEMENT`、`SER_AR_CONFLICT_EXTRACTION`。 |
-| `Pruning` / `GmwrPropagationState` | `SER_PRUNE*`、`GMWR_BUILD_MS`、`GMWR_REDUCTION_MS`、`GMWR_WW_BRIDGE_MS`。 |
+| `Pruning` / `GmwrPropagationState` | `SER_PRUNE*`、`GMWR_BUILD_MS`、`GMWR_REDUCTION_MS`。 |
 | `publishResidualSatStats()` | residual WW choice 数、`solver.nVars()`、`solver.nClauses()`。 |
-| `PredicateEncodingMetrics.publish()` / `publishGmwrMetrics()` | source/scope/frontier/witness/physical edge/blocking clause/GMWR bundle 与各子阶段耗时。 |
+| `PredicateEncodingMetrics.publish()` / `publishGmwrMetrics()` | source/scope/frontier/witness/physical edge/blocking clause/GMWR obligation 与各子阶段耗时。 |
 | `Main.Audit.call()` | 遍历输出全部 duration/count、solver 配置、最大内存和最终 marker。 |
 | `SERVerifier.emitRejectDiagnostics()` | 输出 typed-dependency UNSAT 原因、`!A1 | !A2 -> reason` 映射或当前 conflict core 摘要。 |
-| `SERSolverARDifferentialTest.predicateWriterModeMatrixMatchesExhaustiveOracle()` | predicate × writer pattern × EAGER/GMWR/WWBridge 配置，逐项要求生产 SER verdict 等于穷举 AR oracle。 |
+| `SERSolverARDifferentialTest.predicateWriterModeMatrixMatchesExhaustiveOracle()` | predicate × writer pattern × EAGER/GMWR 配置，逐项要求生产 SER verdict 等于穷举 AR oracle。 |
 | `SERAcceptanceSuiteTest` | 按T1-T8编号组织的验收入口；常规运行覆盖基础WR/SO、WW/RW、predicate、模式与剪枝等价、共享oracle、单serialization graph结构和论文指标契约。 |
 
 ### 11.1 T1-T8 验收测试映射
@@ -233,10 +233,10 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | T2 | `WwRwEncoding`：WW合法分支、SO强制的WW/RW冲突、三 writer 的三个 client WW choice。 |
 | T3 | `PredicateCorrectness`：returned/stale/overwrite、absent matching writer、bad/repair writer、INTERNAL和mixed key。T3.4按“写入值满足谓词但结果为空”的本意使用`x=20, x>10`；若使用`x<10`，`20`本身不属于结果，不能推出writer必须位于reader之后。 |
 | T4 | 常规测试比较手工predicate corpus；`SER_ACCEPTANCE_EXTENDED=true`时额外执行100,000个生成history的EAGER/GMWR verdict差分。 |
-| T5 | 对`Pruning`、`GmwrPropagationState`、`GmwrWwBridge`、`SERSolverAR`做同实例断言，并验证fact可见性和反向关系立即冲突。 |
+| T5 | 对`Pruning`、`GmwrPropagationState`、`SERSolverAR`做共享 oracle 断言，并验证 fact 可见性和反向关系立即冲突。 |
 | T6 | 反射守卫确保`SERSolverAR`只保留`serializationGraph`，并比较endpoint interning开关的verdict；小history语义基准继续由`SERSolverARDifferentialTest`的独立穷举AR oracle提供。 |
-| T7 | `NONE/REACHABILITY`、GMWR和WWBridge对同一corpus必须与baseline verdict一致；另直接验证reachability删除成环branch。 |
-| T8 | 验证EAGER/GMWR发布runner消费的candidate、residual SAT vars/clauses和GMWR obligation指标；实际规模、内存和运行时间由`tools/run_ser_baseline_vs_gmwr.py`在独立进程中采集。 |
+| T7 | 内部 `NONE/REACHABILITY` 与 EAGER/GMWR 对同一 corpus 必须保持 verdict 一致；另直接验证 reachability 删除成环 branch。 |
+| T8 | 验证 EAGER/GMWR 发布 candidate、residual SAT vars/clauses 和 GMWR obligation 指标；实际规模、内存和运行时间由 `tools/run_ser_acceleration_ablation.py` 在独立进程中采集。 |
 
 常规验收测试：
 

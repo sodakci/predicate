@@ -1,103 +1,94 @@
-# SER 结构优化与剪枝实验
+# SER 两开关消融实验
 
-## 冻结边界
+## 实验目标
 
-以下 correctness-critical 模块冻结；除修复已确认 bug 外，不再重构：
+生产路径只保留两个算法开关：
 
-- `KnownGraph`
-- WW/RW constraint semantics
-- predicate latest-visible semantics
-- GMWR obligation semantics
-- `PrecedenceOracle`
-- serialization graph encoding
+- `--[no-]gmwr`：同时控制 GMWR formulation 与两条 frontier 剪枝路径。
+- `--[no-]gmwr-prepropagation`：控制 GMWR obligation 在 SAT 编码前的确定性传播；关闭 GMWR 时该开关不生效。
 
-实验所需的生产代码改动仅为只读计数：`PrecedenceOracle` 记录关系加入、闭包更新和成环检查次数；`SERSolverAR` 发布 MonoSAT 图规模、propagation/conflict 数。计数器不创建约束、不选择分支，也不改变求解控制流。
+WW reachability、predicate witness coalescing 和 graph-edge interning 在三组实验中始终开启，不再作为 CLI 消融变量。bundle compaction 已删除，不再进入实验矩阵。
 
 ## Runner
 
-统一入口是：
+查看默认样本和运行数：
 
 ```bash
-python3 tools/run_ser_ablation.py HISTORY_ROOT --suite pruning
+python3 tools/run_ser_acceleration_ablation.py --plan-only
 ```
 
-只比较 WW 与 GMWR 的剪枝能力、且不进入 MonoSAT 求解时，使用：
+执行实验：
 
 ```bash
-python3 tools/run_ww_gmwr_pruning_comparison.py
+python3 tools/run_ser_acceleration_ablation.py \
+  --out-dir results/ser-acceleration-ablation
 ```
 
-该脚本默认读取 `predicateHistories/kvpredicate/test-ser%`。每条历史只运行一次
-`REACHABILITY + GMWR + WW_GMWR`：WW 削减量为
-`WW_INITIAL_CHOICES - WW_AFTER_REACHABILITY`，GMWR 的增量削减为
-`WW_AFTER_REACHABILITY - WW_AFTER_GMWR`。取得两阶段计数和耗时后立即结束 JVM，不运行 SAT solver。输出逐历史 `raw.csv`、按谓词操作比例取中位数的
-`summary.csv`，以及 `pruning_time.svg`、`pruned_constraints.svg`。
+默认抽样规则：
 
-三个 suite：
+- `predicateHistories/kvpredicate/test-ser`：每个参数目录取 `hist-00000`；
+- `predicateHistories/kvpredicate/test-ser%`：只取目录名义谓词比例严格小于 `0.10` 的参数目录，每个取 `hist-00000`；
+- 每条历史重复两次，配置顺序按 repeat 反转，并按 history 轮换。
 
-| suite | 配置 | 用途 |
+## 三个有效配置
+
+| 配置 | CLI | 含义 |
 | --- | --- | --- |
-| `pruning` | `NONE → REACHABILITY → GMWR → GMWR_WWFeedback` | WW reachability 与 GMWR 剪枝消融 |
-| `eager-gmwr` | `REACHABILITY → GMWR` | 固定其余公共开关，比较相同 predicate semantics 的编码成本 |
-| `structure` | `REACHABILITY` | 对同一配置比较外部提供的实现 variant |
+| `NO_GMWR` | `--no-gmwr --no-gmwr-prepropagation` | EAGER；GMWR 与 frontier 均关闭 |
+| `NO_PREPROP` | `--gmwr --no-gmwr-prepropagation` | 开启 GMWR 与 frontier，但不做预传播 |
+| `FULL` | `--gmwr --gmwr-prepropagation` | 生产默认完整加速 |
 
-结构对比不把旧实现放回主源码。旧 dual-graph 版本单独编译到外部目录后，通过 classpath 前缀运行；第一个 variant 是基线：
+由此形成两个单变量步骤和一个端到端对比：
 
-```bash
-python3 tools/run_ser_ablation.py HISTORY_ROOT \
-  --suite structure \
-  --variant dual=/tmp/ser-dual-baseline/classes \
-  --variant single
+```text
+NO_GMWR --(GMWR + frontier)--> NO_PREPROP --(prepropagation)--> FULL
+    \----------------------------------------------------------/
+                              full_stack
 ```
 
-默认每个 history 重复 3 次、单次硬超时 180 秒。12 GB 机器默认使用 `-Xmx5g`，每 200 ms 检查系统 `MemAvailable`；低于 2048 MiB 时只终止当前 JVM并记录 `MEMORY_GUARD`，已完成行仍保存在 `raw.csv`。`--xmx`、`--min-available-memory-mb`、`--post-verdict-grace-seconds`、`--repeats`、`--timeout-seconds`、`--limit` 和重复的 `--config` 可控制资源与实验规模。runner 始终串行执行 JVM，不并发运行多个 checker。不同配置/variant 的运行顺序会轮换，减少固定顺序造成的缓存偏差。
+`NO_GMWR + prepropagation` 没有独立配置，因为 EAGER 路径不会构造 GMWR propagation state，该组合与 `NO_GMWR` 等价。
 
-## 指标定义
+## 输出
 
-| 输出列 | 定义 |
-| --- | --- |
-| `initial_candidates` | 初始 WW candidate 与 GMWR obligation 数之和 |
-| `deleted_candidates` | 初始 candidate 减去预处理后 residual candidate |
-| `forced_orders` | reachability、GMWR 和 WW feedback 推导出的 forced order 总数 |
-| `residual_constraints` | residual WW constraint 与 residual GMWR constraint 总数 |
-| `preprocessing_ms` | known precedence graph、reachability pruning、GMWR build/reduction 和 WW feedback 时间之和 |
-| `SER_AR_ENCODE` | 整个 MonoSAT encoding 时间 |
-| `SER_MONOSAT_SOLVE` | MonoSAT 求解时间 |
-| `ENTIRE_EXPERIMENT` | checker 端到端时间 |
-| `peak_rss_mb` | GNU `time -v` 记录的进程峰值 RSS；不是 JVM heap 上限 |
-| `SER_PROP_MONOSAT_GRAPH_EDGES_COUNT` | 实际创建的 MonoSAT graph edge 数；dual variant 为两张图之和 |
-| `SER_PROP_RESIDUAL_SAT_VARIABLES_COUNT` | 进入求解器的变量数 |
-| `SER_PRECEDENCE_CLOSURE_BUILDS_COUNT` | audit 内构造 precedence closure/oracle 的实例次数 |
-| `SER_PRECEDENCE_CLOSURE_UPDATES_COUNT` | 接受的非冗余 precedence relation 更新次数 |
-| `SER_PROP_MONOSAT_PROPAGATIONS_COUNT` | MonoSAT 报告的 propagation 数 |
-| `timeout_rate` | 同一 history/variant/config 下 timeout 次数除以总尝试次数；不以 solver time 代替 |
+- `raw.csv`：每次 JVM 运行的状态、verdict、时间、峰值 RSS 和全部 profiler 指标。
+- `paired.csv`：同一 history/repeat 的 `gmwr_frontier`、`prepropagation`、`full_stack` 配对结果。
+- `summary.csv`：按全部样本、`test-ser`、`test-ser%` 汇总的 paired median/geomean、hard-tail、OOM/timeout rescue。
+- `by_history.csv`：逐 history/config 的重复运行中位数。
+- `raw.json`：可恢复的逐次 checkpoint；`--resume` 只补跑未完成配置。
+- `logs/`：stdout、stderr 和 GNU `time -v` 日志。
+- `runtime/`、`environment.json`、`plan.json`、`worktree.diff`：冻结 classpath/native library 与复现信息。
 
-`preprocessing_ms` 的子阶段位于 `SER_AR_ENCODE` 内部时，两列可能重叠，不能相加。它们分别用于回答“剪枝成本”和“总编码成本”。结构对比同时保留 peak RSS、encoding、MonoSAT solving 和 end-to-end time；oracle 对比额外保留 closure builds/updates。
+timeout、OOM、系统内存保护停止和 verdict mismatch 都作为删失结果，不参与运行时间比。只有双方均完成且 verdict 一致的 paired run 才计算 speedup。
 
-输入维度随每个 history 自动解析并写入 CSV：operation/transaction/key/point-read count、predicate operation count/ratio、predicate transaction count/ratio、empty-result ratio、predicate selectivity、returned-result cardinality 的 mean/median/max，以及全 key 和已写 key 口径下的 distinct writers/key。这里 selectivity 定义为 `返回行数 / (predicate count × manifest.initial_keys)`；absent-result 定义为 `result.values` 为空。
+## GMWR 与 NO_GMWR 耗时图
 
-## 输出与 correctness 门禁
+实验完成后，使用 `raw.csv` 生成四张受控变量 SVG 图：
 
-每次实验生成：
+```bash
+python3 tools/plot_ser_gmwr_vs_no_gmwr.py \
+  results/ser-acceleration-ablation/raw.csv \
+  --out-dir results/ser-acceleration-ablation/svg
+```
 
-- `raw.csv`：每次独立运行的完整指标和日志路径。
-- `summary.csv`：按 history/variant/config 取 complete runs 的中位数。
-- `causal_chain.csv`：并列给出 initial/deleted/residual candidates、preprocessing、encoding、solver、total、RSS、变量和图边，用于绘制“候选约束 → 剩余约束 → solver time”的因果图。
-- `step_deltas.csv`：相邻 pruning 级别的预处理、solver、total、candidate 和图规模增量。
-- `structure_deltas.csv`：第一个 variant 相对后续 variant 的绝对变化和降幅。
-- `equivalence.csv`：所有完成运行的 verdict 一致性。
-- `machine_and_config.json` 和 `logs/`：机器、参数及原始日志。
+脚本只读取 `test-ser`，比较 `FULL`（GMWR）与 `NO_GMWR`，并以 `20_100_15_5000_0.20_uniform` 为共同基线，每次只改变一个参数。输出为：
 
-只有完成的 `ACCEPT/REJECT` 参与语义比较；timeout/error 标为不完整，不伪装成 verdict。任何完成运行之间的 verdict difference 都使 runner 返回退出码 2。
+- `transactions.svg`：每个 session 的事务数；
+- `operations_per_transaction.svg`：每个事务的操作数；
+- `keys.svg`：key 数量；
+- `predicate_ratio.svg`：谓词读比例；
+- `gmwr_vs_no_gmwr.csv`：各点运行数、状态分布、双方完成运行的端到端耗时中位数及加速比。
 
-## Smoke 验证
+SVG 的纵轴为完成运行中 `ENTIRE_EXPERIMENT` 的中位数（秒）。timeout、OOM 等状态保留在汇总 CSV 中，但不作为耗时点绘制；某一点必须同时存在 `FULL` 和 `NO_GMWR` 的完成运行才会进入曲线。
 
-`results/ser-ablation-smoke-20260912` 在一个 100-transaction real PostgreSQL multikv history 上完成六级消融：6/6 为 `ACCEPT`，semantic mismatch 为 0。该单 history、单 repeat 结果只验证实验链路，不作为论文性能结论。
+## 关键指标
 
-`results/ser-eager-gmwr-smoke-20260912` 使用同一 history 单独运行 EAGER/GMWR suite：2/2 为 `ACCEPT`，semantic mismatch 为 0。
+至少关注：
 
-`results/ser-structure-smoke-20260912` 使用仅有 graph-architecture 差异的相邻历史快照，对同一 history 比较 dual 与 single serialization graph：两者均为 `ACCEPT`；本次观测 MonoSAT graph edge 从 2088 降到 214，SAT variable 从 2189 降到 278。
+- 端到端与阶段时间：`ENTIRE_EXPERIMENT`、`GMWR_BUILD_MS`、`GMWR_REDUCTION_MS`、`SER_AR_ENCODE`、`SER_AR_ENCODE_PREDICATE`、`SER_MONOSAT_SOLVE`；
+- 搜索空间：`SER_PROP_RESIDUAL_SAT_VARIABLES_COUNT`、`SER_PROP_RESIDUAL_SAT_CONSTRAINTS_COUNT`、`SER_PROP_MONOSAT_GRAPH_EDGES_COUNT`；
+- solver 行为：`SER_PROP_MONOSAT_PROPAGATIONS_COUNT`、`SER_PROP_MONOSAT_CONFLICTS_COUNT`；
+- GMWR：`GMWR_INITIAL_CONSTRAINTS`、`GMWR_RESIDUAL_CONSTRAINTS`、`GMWR_REMOVED_CANDIDATES`、`GMWR_FORCED_FACTS`、residual clauses/literals；
+- frontier/latest：`SER_PRED_FRONTIER_CANDIDATES_COUNT`、`SER_PRED_LATEST_WRITER_INPUT_WRITES_COUNT`、`SER_PRED_LATEST_WRITER_RESULTS_COUNT`、`SER_GMWR_INTERVAL_CANDIDATES_PRUNED_COUNT`；
+- 资源：GNU `time -v` 的 peak RSS、timeout/OOM/rescue。
 
-`results/ser-oracle-smoke-20260912` 使用 shared-oracle 注入前后的相邻历史快照，在 `GMWR_WWFeedback` 下比较 local 与 shared：两者均为 `ACCEPT`；closure build `3→1`、closure update `1952→217`、branch-pruned candidate `3958→3968`、preprocessing `162→145 ms`。
-
-以上均为单 history、单 repeat；timing 和 RSS 存在噪声，正式报告必须使用多 history、多 repeat 的中位数。
+归因时先看 `NO_GMWR -> NO_PREPROP` 是否减少 latest/frontier 候选和残余 SAT 规模，再看 `NO_PREPROP -> FULL` 是否进一步减少 residual obligations、propagation/conflicts 和 solve time。不要用单独的 obligation 数下降代替搜索空间或运行时间结论。

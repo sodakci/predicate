@@ -10,6 +10,7 @@ JSON/CSV outputs suitable for paper tables.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import hashlib
 import json
@@ -17,6 +18,7 @@ import os
 import pathlib
 import platform
 import re
+import signal
 import shlex
 import socket
 import subprocess
@@ -24,12 +26,79 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from run_ser_baseline_vs_gmwr import parse_stderr, run_one, write_csv_atomic
-
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_JAR = ROOT / "build" / "libs" / "ser-result-detector-1.0.0-SNAPSHOT.jar"
 DEFAULT_MONOSAT_NATIVE_DIR = ROOT / "build" / "monosat"
+METRIC_RE = re.compile(r"^([A-Z][A-Z0-9_]*):\s+([0-9]+)(ms)?\s*$")
+MEM_RE = re.compile(r"^Max memory:\s+(.+?)\s*$")
+
+
+def parse_stderr(text: str):
+    if "SER audit result: ACCEPT" in text or "[[[[ ACCEPT ]]]]" in text:
+        verdict = "ACCEPT"
+    elif "SER audit result: REJECT" in text or "[[[[ REJECT ]]]]" in text:
+        verdict = "REJECT"
+    elif "SER audit result: TIMEOUT" in text or "[[[[ TIMEOUT ]]]]" in text:
+        verdict = "TIMEOUT"
+    elif "[[[[ INVALID_HISTORY ]]]]" in text:
+        verdict = "INVALID_HISTORY"
+    else:
+        verdict = ""
+    metrics = {}
+    memory = ""
+    for line in text.splitlines():
+        metric = METRIC_RE.match(line.strip())
+        if metric:
+            metrics[metric.group(1)] = int(metric.group(2))
+        peak = MEM_RE.match(line.strip())
+        if peak:
+            memory = peak.group(1)
+    status = "COMPLETE" if verdict in ("ACCEPT", "REJECT") else (
+        verdict if verdict else "ERROR"
+    )
+    return status, verdict or status, metrics, memory
+
+
+def terminate_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def run_one(cmd, env, stdout_path, stderr_path, timeout_seconds):
+    started = time.monotonic()
+    with stdout_path.open("w", encoding="utf-8") as stdout, \
+            stderr_path.open("w", encoding="utf-8") as stderr:
+        process = subprocess.Popen(
+            cmd, stdout=stdout, stderr=stderr, env=env, text=True,
+            start_new_session=True)
+        try:
+            return process.wait(timeout=timeout_seconds), \
+                time.monotonic() - started, False
+        except subprocess.TimeoutExpired:
+            terminate_tree(process)
+            return 124, time.monotonic() - started, True
+
+
+def write_csv_atomic(path, rows, fieldnames):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames,
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
 
 
 def load_json(path: pathlib.Path) -> Any:
@@ -164,8 +233,7 @@ def run_case(case: Dict[str, Any], args: argparse.Namespace, output_root: pathli
         "audit",
         "--solver-timeout-seconds",
         str(args.solver_timeout_seconds),
-        "--predicate-encoding",
-        args.predicate_encoding,
+        "--gmwr" if args.gmwr else "--no-gmwr",
     ]
     if args.solver_stats:
         cmd.append("--solver-stats")
@@ -276,8 +344,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Timeout passed to the solver backend")
     parser.add_argument("--timeout-seconds", type=int, default=2100,
                         help="Wall-clock timeout per case enforced by this runner")
-    parser.add_argument("--predicate-encoding", choices=("eager", "gmwr"), default="gmwr",
-                        help="Predicate encoding passed to audit")
+    parser.add_argument("--gmwr", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable the combined GMWR/frontier path")
     parser.add_argument("--solver-stats", action="store_true", help="Print and parse solver stats when supported")
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N catalog cases")
     parser.add_argument("--fail-fast", action="store_true", help="Stop after first mismatch, runtime error, or timeout")
@@ -324,7 +392,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "jvm_opt": args.jvm_opt,
         "solver_timeout_seconds": args.solver_timeout_seconds,
         "runner_timeout_seconds": args.timeout_seconds,
-        "predicate_encoding": args.predicate_encoding,
+        "gmwr": args.gmwr,
         "solver_stats": args.solver_stats,
     }
     dump_json(output_root / "config.json", config)

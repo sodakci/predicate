@@ -346,7 +346,7 @@ class SERSolverARSatEncodingTest {
     }
 
     @Test
-    void gmwrPrRwCyclePruningDoesNotInferWwFromTransactionReachability() {
+    void wwReachabilityPruningForcesWwBeforeGmwrEncoding() {
         var profiler = Profiler.getInstance();
         profiler.clear();
         var history = new History<String, Integer>();
@@ -364,13 +364,24 @@ class SERSolverARSatEncodingTest {
 
         var graph = new KnownGraph<>(history);
         graph.putEdge(source, badWriter, new Edge<>(EdgeType.SO, null));
-        new SERSolverAR<>(
-                history, graph, generateConstraints(history, graph), true, true,
-                SERVerifier.PredicateSolvingMode.GMWR);
+        var constraints = generateConstraints(history, graph);
+        var precedence = SERVerifier.createPrecedenceOracle(history);
+        assertFalse(new Pruning<String, Integer>(precedence, false)
+                .pruneConstraints(graph, constraints));
 
         assertTrue(graph.getKnownGraphA().edgeValue(source, badWriter)
                         .orElse(List.of()).contains(new Edge<>(EdgeType.WW, "kv:x")),
-                "SO(source,bad) makes WW(bad,source,k) cyclic, so propagation must force WW(source,bad,k)");
+                "baseline WW pruning must force the only acyclic WW direction");
+        new SERSolverAR<>(
+                history, graph, constraints, true, true,
+                SERVerifier.SolverSettings.forModes(
+                        SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.REACHABILITY),
+                precedence);
+
+        assertTrue(graph.getKnownGraphA().edgeValue(source, badWriter)
+                        .orElse(List.of()).contains(new Edge<>(EdgeType.WW, "kv:x")),
+                "GMWR encoding must preserve the WW fact published by baseline pruning");
     }
 
     @Test
@@ -397,8 +408,7 @@ class SERSolverARSatEncodingTest {
         assertEquals(1L, profiler.getCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT"));
         assertEquals(0L, profiler.getCount("SER_PRED_EXTERNAL_SOURCED_KEYS_COUNT"));
         assertEquals(1L, profiler.getCount("SER_PRED_EXTERNAL_SOURCELESS_KEYS_COUNT"));
-        assertEquals(1L, profiler.getCount("SER_GMWR_BUNDLES_COUNT"));
-        assertEquals(0L, profiler.getCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_GMWR_RESIDUAL_CLAUSES_COUNT"));
         assertEquals(0L, profiler.getCount("SER_GMWR_FORCED_ORDERS_COUNT"));
     }
 
@@ -432,7 +442,7 @@ class SERSolverARSatEncodingTest {
     }
 
     @Test
-    void gmwrSubsumesProjectionAcrossKeysWithoutDroppingSemanticObligations() {
+    void gmwrKeepsProjectionAcrossKeysAsExplicitSemanticItems() {
         var profiler = Profiler.getInstance();
         profiler.clear();
         var history = new History<String, Integer>();
@@ -462,10 +472,9 @@ class SERSolverARSatEncodingTest {
         assertEquals(2L, profiler.getCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT"));
         assertEquals(2L, profiler.getCount(
                 "SER_GMWR_SEMANTIC_ITEM_OBLIGATIONS_COUNT"));
-        assertEquals(1L, profiler.getCount("SER_GMWR_BUNDLES_COUNT"));
-        assertEquals(1L, profiler.getCount("SER_GMWR_UNIQUE_ITEM_CLAUSES_COUNT"));
-        assertEquals(1L, profiler.getCount("SER_GMWR_SUBSUMED_ITEM_CLAUSES_COUNT"));
-        assertEquals(1L, profiler.getCount("SER_GMWR_RESIDUAL_CLAUSES_COUNT"));
+        assertEquals(2L, profiler.getCount(
+                "SER_GMWR_MATERIALIZED_ITEM_CLAUSES_COUNT"));
+        assertEquals(2L, profiler.getCount("SER_GMWR_RESIDUAL_CLAUSES_COUNT"));
     }
 
     @Test

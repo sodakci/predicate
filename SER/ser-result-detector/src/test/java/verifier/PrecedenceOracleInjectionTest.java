@@ -21,13 +21,11 @@ class PrecedenceOracleInjectionTest {
                 history.getTransactions());
         var reachability = new Pruning<String, Integer>(oracle);
         var propagation = new GmwrPropagationState<>(history, graph, oracle);
-        var bridge = new GmwrWwBridge<String, Integer>(oracle);
         var solver = new SERSolverAR<>(history, graph, List.of(), true, false,
                 eagerSettings(), oracle);
 
         assertSame(oracle, reachability.precedenceOracle());
         assertSame(oracle, propagation.precedenceOracle());
-        assertSame(oracle, bridge.precedenceOracle());
         assertSame(oracle, solver.precedenceOracle());
 
         var first = history.getTransaction(1L);
@@ -35,7 +33,6 @@ class PrecedenceOracleInjectionTest {
         assertTrue(propagation.addKnownFact(first, second, EdgeType.PR_WR, "k"));
         assertTrue(reachability.precedenceOracle().before(first, second));
         assertTrue(propagation.precedenceOracle().before(first, second));
-        assertTrue(bridge.precedenceOracle().before(first, second));
         assertTrue(solver.precedenceOracle().before(first, second));
     }
 
@@ -71,7 +68,6 @@ class PrecedenceOracleInjectionTest {
     private static SERVerifier.SolverSettings eagerSettings() {
         return SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.EAGER,
-                SERVerifier.PruningMode.NONE,
-                SERVerifier.SerPropagationMode.WW_ONLY);
+                SERVerifier.PruningMode.NONE);
     }
 }

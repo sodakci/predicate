@@ -74,14 +74,9 @@ class SERSolverARDifferentialTest {
             new StructuredQueryParser<>(INTEGER_VALUES, RELATIONS);
     private static final List<MatrixMode> MATRIX_MODES = List.of(
             new MatrixMode("EAGER", SERVerifier.PredicateSolvingMode.EAGER,
-                    SERVerifier.PruningMode.REACHABILITY,
-                    SERVerifier.SerPropagationMode.WW_ONLY),
+                    SERVerifier.PruningMode.REACHABILITY),
             new MatrixMode("GMWR", SERVerifier.PredicateSolvingMode.GMWR,
-                    SERVerifier.PruningMode.REACHABILITY,
-                    SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY),
-            new MatrixMode("GMWR+WWBridge", SERVerifier.PredicateSolvingMode.GMWR,
-                    SERVerifier.PruningMode.REACHABILITY,
-                    SERVerifier.SerPropagationMode.WW_GMWR));
+                    SERVerifier.PruningMode.REACHABILITY));
 
     @TempDir
     Path tempDir;
@@ -219,7 +214,7 @@ class SERSolverARDifferentialTest {
             Pruning.setEnablePruning(true);
 
             var settings = SERVerifier.SolverSettings.forModes(
-                    mode.predicateMode, mode.pruningMode, mode.propagationMode);
+                    mode.predicateMode, mode.pruningMode);
             settings.gmwrPrepropagation = mode.predicateMode
                     == SERVerifier.PredicateSolvingMode.GMWR;
             settings.predicateWitnessCoalescing = true;
@@ -561,17 +556,13 @@ class SERSolverARDifferentialTest {
             String label) {
         var configs = List.of(
                 namedSettings("E1", SERVerifier.PredicateSolvingMode.EAGER,
-                        SERVerifier.SerPropagationMode.WW_ONLY, false, false),
+                        false, false),
                 namedSettings("E2", SERVerifier.PredicateSolvingMode.EAGER,
-                        SERVerifier.SerPropagationMode.WW_ONLY, false, true),
-                namedSettings("G1", SERVerifier.PredicateSolvingMode.GMWR,
-                        SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY, true, true),
-                namedSettings("G2", SERVerifier.PredicateSolvingMode.GMWR,
-                        SERVerifier.SerPropagationMode.WW_GMWR, true, true),
-                namedSettings("G1-nopreprop", SERVerifier.PredicateSolvingMode.GMWR,
-                        SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY, false, true),
-                namedSettings("G2-nopreprop", SERVerifier.PredicateSolvingMode.GMWR,
-                        SERVerifier.SerPropagationMode.WW_GMWR, false, true));
+                        false, true),
+                namedSettings("GMWR", SERVerifier.PredicateSolvingMode.GMWR,
+                        true, true),
+                namedSettings("GMWR-nopreprop", SERVerifier.PredicateSolvingMode.GMWR,
+                        false, true));
         for (var config : configs) {
             assertEquals(expected, solveSer(history, config.settings),
                     () -> "direct SERSolverAR mismatch for " + label
@@ -582,11 +573,10 @@ class SERSolverARDifferentialTest {
     private static NamedSettings namedSettings(
             String name,
             SERVerifier.PredicateSolvingMode predicate,
-            SERVerifier.SerPropagationMode propagation,
             boolean gmwrPrepropagation,
             boolean graphEdgeInterning) {
         var settings = SERVerifier.SolverSettings.forModes(
-                predicate, SERVerifier.PruningMode.REACHABILITY, propagation);
+                predicate, SERVerifier.PruningMode.REACHABILITY);
         settings.gmwrPrepropagation = gmwrPrepropagation;
         settings.graphEdgeInterning = graphEdgeInterning;
         return new NamedSettings(name, settings);
@@ -1358,17 +1348,14 @@ class SERSolverARDifferentialTest {
         private final String name;
         private final SERVerifier.PredicateSolvingMode predicateMode;
         private final SERVerifier.PruningMode pruningMode;
-        private final SERVerifier.SerPropagationMode propagationMode;
 
         private MatrixMode(
                 String name,
                 SERVerifier.PredicateSolvingMode predicateMode,
-                SERVerifier.PruningMode pruningMode,
-                SERVerifier.SerPropagationMode propagationMode) {
+                SERVerifier.PruningMode pruningMode) {
             this.name = name;
             this.predicateMode = predicateMode;
             this.pruningMode = pruningMode;
-            this.propagationMode = propagationMode;
         }
     }
 

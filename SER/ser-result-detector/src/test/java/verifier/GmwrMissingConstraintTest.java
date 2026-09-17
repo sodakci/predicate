@@ -36,27 +36,21 @@ class GmwrMissingConstraintTest {
         for (boolean interning : List.of(true, false)) {
             var eager = SERVerifier.SolverSettings.forModes(
                     SERVerifier.PredicateSolvingMode.EAGER,
-                    SERVerifier.PruningMode.NONE,
-                    SERVerifier.SerPropagationMode.WW_ONLY);
+                    SERVerifier.PruningMode.NONE);
             eager.graphEdgeInterning = interning;
             eager.predicateWitnessCoalescing = interning;
             eager.gmwrPrepropagation = false;
             configs.add(eager);
         }
         for (boolean preprop : List.of(true, false)) {
-            for (boolean feedback : List.of(true, false)) {
-                for (boolean interning : List.of(true, false)) {
-                    var gmwr = SERVerifier.SolverSettings.forModes(
-                            SERVerifier.PredicateSolvingMode.GMWR,
-                            SERVerifier.PruningMode.NONE,
-                            feedback
-                                    ? SERVerifier.SerPropagationMode.WW_GMWR
-                                    : SERVerifier.SerPropagationMode.WW_GMWR_ONEWAY);
-                    gmwr.gmwrPrepropagation = preprop;
-                    gmwr.graphEdgeInterning = interning;
-                    gmwr.predicateWitnessCoalescing = true;
-                    configs.add(gmwr);
-                }
+            for (boolean interning : List.of(true, false)) {
+                var gmwr = SERVerifier.SolverSettings.forModes(
+                        SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.NONE);
+                gmwr.gmwrPrepropagation = preprop;
+                gmwr.graphEdgeInterning = interning;
+                gmwr.predicateWitnessCoalescing = true;
+                configs.add(gmwr);
             }
         }
         return configs;
@@ -128,7 +122,6 @@ class GmwrMissingConstraintTest {
     private static String describe(SERVerifier.SolverSettings settings) {
         return "mode=" + settings.predicateSolvingMode
                 + " preprop=" + settings.gmwrPrepropagation
-                + " prop=" + settings.serPropagationMode
                 + " interning=" + settings.graphEdgeInterning
                 + " coalescing=" + settings.predicateWitnessCoalescing;
     }

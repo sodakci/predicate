@@ -57,13 +57,10 @@ class SERSolverAR<KeyType, ValueType> {
     private final boolean collectConflicts;
     private final boolean collectPredicateMetrics;
     private final SERVerifier.PredicateSolvingMode predicateSolvingMode;
-    private final SERVerifier.SerPropagationMode serPropagationMode;
     private final boolean gmwrPrepropagation;
     private final boolean predicateWitnessCoalescing;
     private final boolean graphEdgeInterning;
     private final PrecedenceOracle<Transaction<KeyType, ValueType>> precedence;
-    private final Pruning<KeyType, ValueType> reachabilityPruning;
-    private final GmwrWwBridge<KeyType, ValueType> gmwrWwBridge;
     private final LatestVisibleChecker<KeyType, ValueType> latestVisibleChecker =
             new LatestVisibleChecker<>();
     private long solveDeadlineNanos;
@@ -74,11 +71,6 @@ class SERSolverAR<KeyType, ValueType> {
     private KnownOrder knownOrder;
     private GmwrPropagationState<KeyType, ValueType> propagation;
     private boolean propagationConflict;
-    private long gmwrWwBridgeScans;
-    private long gmwrWwBridgeConstraintsScanned;
-    private long gmwrWwFixpointRounds;
-    private long gmwrToWwForced;
-    private long gmwrToWwConflicts;
     private long residualWwChoiceVariables;
     private long residualWwChoiceConstraints;
     // The only MonoSAT graph. Logical dependency types/keys remain in the Java
@@ -134,17 +126,12 @@ class SERSolverAR<KeyType, ValueType> {
     // One source constraint is encoded for every external predicate-read key:
     // either a recorded source is fixed or a latest-visible frontier is chosen.
     private long predicateSourceConstraintCount;
-    // GMWR row-local item obligations are quotiented by (reader,bad-writer).
+    // GMWR row-local item obligations sharing (reader,bad-writer) reuse one
+    // outside-snapshot branch and propagation state. Items remain explicit.
     // Multi-relation QueryPlans use the common eager explicit JOIN encoding;
     // GMWR remains a row-local acceleration only.
-    private BitSet[] gmwrSeenBadWritersByReader;
-    private long gmwrBundleCount;
     private long gmwrItemObligations;
     private long gmwrAbsentItemObligations;
-    private long gmwrDuplicateItemClauses;
-    private long gmwrSubsumedItemClauses;
-    private long gmwrResolvedBundles;
-    private long gmwrResidualBundles;
     private long gmwrResidualClauses;
     private long gmwrResidualLiterals;
     private long gmwrResolutionRounds;
@@ -214,9 +201,8 @@ class SERSolverAR<KeyType, ValueType> {
                 Collection<SERConstraint<KeyType, ValueType>> constraints) {
         this(history, graph, constraints, true, false,
                 SERVerifier.SolverSettings.forModes(
-                        SERVerifier.PredicateSolvingMode.EAGER,
-                        SERVerifier.PruningMode.REACHABILITY,
-                        SERVerifier.SerPropagationMode.WW_ONLY));
+                        SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.REACHABILITY));
     }
 
     SERSolverAR(History<KeyType, ValueType> history,
@@ -226,9 +212,8 @@ class SERSolverAR<KeyType, ValueType> {
                 boolean collectPredicateMetrics) {
         this(history, graph, constraints, collectConflicts, collectPredicateMetrics,
                 SERVerifier.SolverSettings.forModes(
-                        SERVerifier.PredicateSolvingMode.EAGER,
-                        SERVerifier.PruningMode.REACHABILITY,
-                        SERVerifier.SerPropagationMode.WW_ONLY));
+                        SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.REACHABILITY));
     }
 
     SERSolverAR(History<KeyType, ValueType> history,
@@ -240,21 +225,7 @@ class SERSolverAR<KeyType, ValueType> {
         this(history, graph, constraints, collectConflicts, collectPredicateMetrics,
                 SERVerifier.SolverSettings.forModes(
                         predicateSolvingMode,
-                        SERVerifier.PruningMode.REACHABILITY,
-                        predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR
-                                ? SERVerifier.SerPropagationMode.WW_GMWR
-                                : SERVerifier.SerPropagationMode.WW_ONLY));
-    }
-
-    SERSolverAR(History<KeyType, ValueType> history,
-                KnownGraph<KeyType, ValueType> graph,
-                Collection<SERConstraint<KeyType, ValueType>> constraints,
-                boolean collectConflicts,
-                boolean collectPredicateMetrics,
-                SERVerifier.PredicateSolvingMode predicateSolvingMode,
-                SERVerifier.SerPropagationMode serPropagationMode) {
-        this(history, graph, constraints, collectConflicts, collectPredicateMetrics,
-                settingsFor(predicateSolvingMode, serPropagationMode));
+                        SERVerifier.PruningMode.REACHABILITY));
     }
 
     SERSolverAR(History<KeyType, ValueType> history,
@@ -284,20 +255,15 @@ class SERSolverAR<KeyType, ValueType> {
             this.collectPredicateMetrics = collectPredicateMetrics;
             this.settings = solverSettings == null
                     ? SERVerifier.SolverSettings.forModes(
-                            SERVerifier.PredicateSolvingMode.EAGER,
-                            SERVerifier.PruningMode.REACHABILITY,
-                            SERVerifier.SerPropagationMode.WW_ONLY)
+                            SERVerifier.PredicateSolvingMode.GMWR,
+                            SERVerifier.PruningMode.REACHABILITY)
                     : solverSettings;
-            this.serPropagationMode = Objects.requireNonNull(
-                    this.settings.serPropagationMode, "serPropagationMode");
             this.predicateSolvingMode = Objects.requireNonNull(
                     this.settings.predicateSolvingMode, "predicateSolvingMode");
             this.gmwrPrepropagation = this.settings.gmwrPrepropagation;
             this.predicateWitnessCoalescing = this.settings.predicateWitnessCoalescing;
             this.graphEdgeInterning = this.settings.graphEdgeInterning;
             this.precedence = Objects.requireNonNull(precedence, "precedence");
-            this.reachabilityPruning = new Pruning<>(this.precedence, false);
-            this.gmwrWwBridge = new GmwrWwBridge<>(this.precedence);
             this.solver = new Solver();
             this.solveDeadlineNanos = 0L;
             this.txns = history.getTransactions().stream()
@@ -331,15 +297,6 @@ class SERSolverAR<KeyType, ValueType> {
 
     PrecedenceOracle<Transaction<KeyType, ValueType>> precedenceOracle() {
         return precedence;
-    }
-
-    private static SERVerifier.SolverSettings settingsFor(
-            SERVerifier.PredicateSolvingMode predicateSolvingMode,
-            SERVerifier.SerPropagationMode serPropagationMode) {
-        return SERVerifier.SolverSettings.forModes(
-                predicateSolvingMode,
-                SERVerifier.PruningMode.REACHABILITY,
-                serPropagationMode);
     }
 
     /**
@@ -723,61 +680,12 @@ class SERSolverAR<KeyType, ValueType> {
             profiler.endTick("GMWR_BUILD_MS");
         }
         if (gmwrPrepropagation) {
-            propagation.clearLastReachabilityTouched();
             propagationConflict |= propagation.propagate();
-            if (!propagationConflict
-                    && serPropagationMode == SERVerifier.SerPropagationMode.WW_GMWR) {
-                propagateGmwrToWwFixpoint();
-            }
             knownWwSuccessorsByKey.clear();
             knownWwSuccessorsByKey.putAll(buildKnownWwSuccessorsByKey(graph));
         }
         publishPropagationMetrics();
         propagation.releasePropagationIndexes();
-    }
-
-    private void propagateGmwrToWwFixpoint() {
-        long bridgedGmwrFacts = 0L;
-        boolean firstEpoch = true;
-        while (!propagationConflict
-                && propagation.definiteFactCount() > bridgedGmwrFacts) {
-            bridgedGmwrFacts = propagation.definiteFactCount();
-            gmwrWwFixpointRounds++;
-            var profiler = Profiler.getInstance();
-            GmwrWwBridge.Result result;
-            var affected = firstEpoch
-                    ? null
-                    : new ArrayList<>(propagation.lastReachabilityTouched());
-            propagation.clearLastReachabilityTouched();
-            profiler.startTick("GMWR_WW_BRIDGE_MS");
-            try {
-                result = firstEpoch
-                        ? gmwrWwBridge.scan(graph, constraints)
-                        : gmwrWwBridge.scanAffected(graph, constraints, affected);
-            } finally {
-                profiler.endTick("GMWR_WW_BRIDGE_MS");
-            }
-            firstEpoch = false;
-            gmwrWwBridgeScans++;
-            gmwrWwBridgeConstraintsScanned += result.scannedConstraints;
-            if (result.conflict) {
-                gmwrToWwConflicts++;
-                propagationConflict = true;
-                break;
-            }
-            gmwrToWwForced += result.forcedConstraints;
-            if (result.forcedConstraints == 0) {
-                break;
-            }
-
-            if (reachabilityPruning.pruneConstraints(graph, constraints)) {
-                gmwrToWwConflicts++;
-                propagationConflict = true;
-                break;
-            }
-            propagation.syncKnownDependencies();
-            propagationConflict |= propagation.propagate();
-        }
     }
 
     private void publishPropagationMetrics() {
@@ -788,9 +696,6 @@ class SERSolverAR<KeyType, ValueType> {
         if (profiler.getCounter("GMWR_REDUCTION_MS") == 0) {
             profiler.addDurationNanos("GMWR_REDUCTION_MS", 0L);
         }
-        if (profiler.getCounter("GMWR_WW_BRIDGE_MS") == 0) {
-            profiler.addDurationNanos("GMWR_WW_BRIDGE_MS", 0L);
-        }
         long initial = propagation == null ? 0L : propagation.stats.initialConstraints;
         long residual = propagation == null ? 0L : propagation.stats.residualConstraints;
         long removed = propagation == null ? 0L : propagation.stats.removedCandidates;
@@ -799,13 +704,6 @@ class SERSolverAR<KeyType, ValueType> {
         profiler.addCount("GMWR_RESIDUAL_CONSTRAINTS", residual);
         profiler.addCount("GMWR_REMOVED_CANDIDATES", removed);
         profiler.addCount("GMWR_FORCED_FACTS", forced);
-        profiler.addCount("GMWR_TO_WW_FORCED", gmwrToWwForced);
-        profiler.addCount("WW_AFTER_GMWR", constraints.size());
-        profiler.addCount("GMWR_TO_WW_CONFLICTS", gmwrToWwConflicts);
-        profiler.addCount("GMWR_WW_BRIDGE_SCANS", gmwrWwBridgeScans);
-        profiler.addCount("GMWR_WW_BRIDGE_CONSTRAINTS_SCANNED",
-                gmwrWwBridgeConstraintsScanned);
-        profiler.addCount("GMWR_WW_FIXPOINT_ROUNDS", gmwrWwFixpointRounds);
     }
 
     private void collectGmwrLogicalConstraints() {
@@ -848,7 +746,6 @@ class SERSolverAR<KeyType, ValueType> {
                 for (var obligation : analysis.obligations) {
                     gmwrItemObligations++;
                     gmwrAbsentItemObligations++;
-                    gmwrMarkBundleSeen(obligation.reader, obligation.badWriter);
                     var repairs = obligation.repairs.isEmpty()
                             ? List.<Transaction<KeyType, ValueType>>of()
                             : new ArrayList<>(obligation.repairs.get(0));
@@ -857,7 +754,6 @@ class SERSolverAR<KeyType, ValueType> {
                 }
             }
         }
-        gmwrSubsumedItemClauses = propagation.stats.mergedConstraints;
     }
 
     /**
@@ -916,7 +812,9 @@ class SERSolverAR<KeyType, ValueType> {
                 goodWriterTxns.add(write.getTxn());
             }
         }
-        var frontierWrites = possibleExternalFrontierWrites(candidates, reader);
+        var frontierWrites = predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR
+                ? possibleExternalFrontierWrites(candidates, reader)
+                : candidates;
         var badWrites = new ArrayList<KnownGraph.WriteRef<KeyType, ValueType>>();
         var obligations = new ArrayList<BadWriterObligation<KeyType, ValueType>>();
         var repairSets = List.<Set<Transaction<KeyType, ValueType>>>of(
@@ -1300,7 +1198,7 @@ class SERSolverAR<KeyType, ValueType> {
             currentPredicateAssumption = null;
             if (predicateSolvingMode == SERVerifier.PredicateSolvingMode.GMWR) {
                 publishGmwrSourcePruning();
-                resolveAndEncodeGmwrBundles();
+                resolveAndEncodeGmwrObligations();
                 propagation.releaseEncodedState();
             }
             flushPredicateDependencies();
@@ -1930,13 +1828,12 @@ class SERSolverAR<KeyType, ValueType> {
     /**
      * Independent GMWR encoding for row-local predicate reads.
      *
-     * <p>The formal predicate semantics remain item-wise.  The solver-side
-     * representation is quotiented before SAT: every bad writer B for reader R
-     * contributes one item clause to a generalized (R,B) bundle.  All clauses
-     * in the bundle share the same outside-snapshot branch R&lt;B.  Recorded
-     * sources and absent-result candidates are separately passed through the
-     * source-aware typed frontier encoder; the bundle only compresses the
-     * result-validity clauses.</p>
+     * <p>The formal predicate semantics remain item-wise. Every bad writer B
+     * for reader R contributes an explicit item clause. Items sharing (R,B)
+     * reuse the same outside-snapshot branch R&lt;B and propagation state, but
+     * their repair sets are neither deduplicated nor subsumed. Recorded sources
+     * and absent-result candidates are separately passed through the
+     * source-aware typed frontier encoder.</p>
      */
     private void encodeRowLocalPredicateGmwr(
             KnownGraph.PredicateObservation<KeyType, ValueType> observation,
@@ -2005,7 +1902,7 @@ class SERSolverAR<KeyType, ValueType> {
                         predicateEncodingMetrics.badWrites += analysis.badWrites.size();
                     }
 
-                    // GMWR compresses the result-validity clauses below, while
+                    // GMWR builds the result-validity obligations below, while
                     // typed predicate dependencies remain source-aware.  ARmax is
                     // still computed over every visible writer, but only good
                     // writers can be a legal source on an absent key, so guarded
@@ -2026,30 +1923,11 @@ class SERSolverAR<KeyType, ValueType> {
         }
     }
 
-    private void gmwrMarkBundleSeen(
-            Transaction<KeyType, ValueType> reader,
-            Transaction<KeyType, ValueType> badWriter) {
-        if (gmwrSeenBadWritersByReader == null) {
-            gmwrSeenBadWritersByReader = new BitSet[txns.size()];
-            for (int index = 0; index < txns.size(); index++) {
-                gmwrSeenBadWritersByReader[index] = new BitSet(txns.size() + 1);
-            }
-        }
-        int readerId = txnIndex.get(reader);
-        int badId = isBottomTxn(badWriter) ? txns.size() : txnIndex.get(badWriter);
-        var seen = gmwrSeenBadWritersByReader[readerId];
-        if (!seen.get(badId)) {
-            seen.set(badId);
-            gmwrBundleCount++;
-        }
-    }
-
-
     /**
      * Encodes only residual GMWR obligations that the live fixpoint could not
      * decide. Satisfied and forced obligations stay out of MonoSAT.
      */
-    private void resolveAndEncodeGmwrBundles() {
+    private void resolveAndEncodeGmwrObligations() {
         var started = System.nanoTime();
         try {
             if (predicateSolvingMode != SERVerifier.PredicateSolvingMode.GMWR) {
@@ -2057,26 +1935,22 @@ class SERSolverAR<KeyType, ValueType> {
             }
             Objects.requireNonNull(propagation, "GMWR propagation state");
             gmwrResolutionRounds = Math.max(1L, propagation.stats.reductionSteps);
-            long uniqueItemClauses = 0L;
+            long materializedItemClauses = 0L;
             for (var gmwr : propagation.gmwrObligations()) {
                 if (gmwr.resolved || gmwr.satisfied) {
-                    gmwrResolvedBundles++;
                     continue;
                 }
-                uniqueItemClauses += gmwr.items.size();
-                gmwrResidualBundles++;
+                materializedItemClauses += gmwr.items.size();
                 encodeResidualGmwr(gmwr);
             }
-            gmwrResolvedBundles = Math.max(gmwrResolvedBundles,
-                    Math.max(0L, gmwrBundleCount - gmwrResidualBundles));
-            this.gmwrUniqueItemClauses = uniqueItemClauses;
+            this.gmwrMaterializedItemClauses = materializedItemClauses;
         } finally {
             gmwrResolutionNanos += System.nanoTime() - started;
             publishGmwrMetrics();
         }
     }
 
-    private long gmwrUniqueItemClauses;
+    private long gmwrMaterializedItemClauses;
 
     private void encodeResidualGmwr(
             GmwrPropagationState.GmwrObligation<KeyType, ValueType> gmwr) {
@@ -2115,9 +1989,8 @@ class SERSolverAR<KeyType, ValueType> {
             var assumption = newAssumption(
                     AssumptionKind.GMWR_RULE,
                     String.format(
-                            "reader=%s badWriter=%s keys=%s repairs=%s multiplicity=%d",
-                            gmwr.reader, gmwr.badWriter, gmwr.keys,
-                            item.repairs, item.multiplicity),
+                            "reader=%s badWriter=%s keys=%s repairs=%s",
+                            gmwr.reader, gmwr.badWriter, gmwr.keys, item.repairs),
                     null);
             assertClauseUnderAssumption(assumption, clause);
         }
@@ -2151,15 +2024,13 @@ class SERSolverAR<KeyType, ValueType> {
         profiler.addDurationNanos("SER_GMWR_RESOLUTION", gmwrResolutionNanos);
         long forcedOrders = propagation == null ? 0L : propagation.stats.forcedFacts;
         profiler.addCount("SER_GMWR_FORCED_ORDERS_COUNT", forcedOrders);
-        profiler.addCount("SER_GMWR_BUNDLES_COUNT", gmwrBundleCount);
-        profiler.addCount("SER_GMWR_RESIDUAL_BUNDLES_COUNT", gmwrResidualBundles);
         if (!collectPredicateMetrics) {
             return;
         }
-        long uniqueItemClauses = gmwrUniqueItemClauses;
-        if (uniqueItemClauses == 0L && propagation != null) {
+        long materializedItemClauses = gmwrMaterializedItemClauses;
+        if (materializedItemClauses == 0L && propagation != null) {
             for (var gmwr : propagation.gmwrObligations()) {
-                uniqueItemClauses += gmwr.items.size();
+                materializedItemClauses += gmwr.items.size();
             }
         }
         profiler.addCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT", gmwrItemObligations);
@@ -2168,13 +2039,8 @@ class SERSolverAR<KeyType, ValueType> {
         profiler.addCount("SER_GMWR_RETURNED_ITEM_OBLIGATIONS_COUNT", 0L);
         profiler.addCount("SER_GMWR_ABSENT_ITEM_OBLIGATIONS_COUNT",
                 gmwrAbsentItemObligations);
-        profiler.addCount("SER_GMWR_UNIQUE_ITEM_CLAUSES_COUNT", uniqueItemClauses);
-        profiler.addCount("SER_GMWR_MATERIALIZED_ITEM_CLAUSES_COUNT", uniqueItemClauses);
-        profiler.addCount("SER_GMWR_DUPLICATE_ITEM_CLAUSES_COUNT",
-                gmwrDuplicateItemClauses);
-        profiler.addCount("SER_GMWR_SUBSUMED_ITEM_CLAUSES_COUNT",
-                gmwrSubsumedItemClauses);
-        profiler.addCount("SER_GMWR_RESOLVED_BUNDLES_COUNT", gmwrResolvedBundles);
+        profiler.addCount("SER_GMWR_MATERIALIZED_ITEM_CLAUSES_COUNT",
+                materializedItemClauses);
         profiler.addCount("SER_GMWR_RESIDUAL_CLAUSES_COUNT", gmwrResidualClauses);
         profiler.addCount("SER_GMWR_RESIDUAL_LITERALS_COUNT", gmwrResidualLiterals);
         profiler.addCount("SER_GMWR_INTERVAL_CANDIDATES_PRUNED_COUNT",

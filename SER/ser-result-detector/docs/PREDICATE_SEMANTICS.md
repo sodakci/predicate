@@ -41,7 +41,7 @@ PredicateObservation
 
 `encodeSnapshotPredicate()` 直接按“是否有查询前自写”确定哪些 key 需要外部 frontier；不会把单表的重复覆盖快捷分类用作完整快照。`refinePredicateConstraints()` 直接执行公共语义检查，删除了原来的 general 专属转发层。
 
-保留单表 GMWR bundle、WW 传播、紧凑结果表示、行贡献缓存与现有 multi-key refinement。没有将 JOIN 全部提前展开，没有引入通用 witness 传播器，也没有为单表新增持久化完整快照。
+保留单表 GMWR obligation、预传播、紧凑结果表示、行贡献缓存与现有 multi-key refinement。每个 item obligation 仍显式保留，不再进行 bundle compaction。没有将 JOIN 全部提前展开，没有引入通用 witness 传播器，也没有为单表新增持久化完整快照。
 
 ## 5. 回归与正常构建
 
@@ -57,4 +57,4 @@ PredicateObservation
 ./gradlew jar
 ```
 
-需要更新 JAR 后再运行原来的 `audit --predicate-encoding=EAGER` 或 `audit --predicate-encoding=GMWR`。输入目录和其他运行参数不变。
+需要更新 JAR 后再运行 `audit --no-gmwr HISTORY`（EAGER）或默认的 `audit HISTORY`（GMWR + frontier + prepropagation）。输入目录和其他运行参数不变。
