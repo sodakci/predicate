@@ -9,7 +9,7 @@ class PredicateSemanticsRegressionTest {
     Path directory;
 
     @Test
-    void acceleratedAndSnapshotStrategiesAgreeWithSerialExecution() throws Exception {
+    void singleSolveEncodingsAgreeWithSerialExecution() throws Exception {
         PredicateSemanticsRegression.runAll(directory);
     }
 }

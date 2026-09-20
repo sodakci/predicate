@@ -12,7 +12,7 @@ PRHIST
   -> predicate encoding（默认 GMWR + frontier）
   -> 可选 GMWR prepropagation
   -> residual Boolean clauses + 唯一 serializationGraph
-  -> MonoSAT acyclicity + query model refinement
+  -> MonoSAT acyclicity（单次求解）
   -> ACCEPT / REJECT / TIMEOUT
 ```
 
@@ -86,18 +86,20 @@ branch 2: WW(B,A) + 与该选择绑定的 RW
 
 ## 6. Predicate frontier
 
-`createKeyFrontier()` 为普通 external key 生成 latest-visible source candidates。`analyzeAbsentKey()` 为 absent-result key 生成 bad-writer obligations。
+固定 `recordedSource=A` 时，直接断言 `A<R`，并对每个其他 external final write `B` 断言 `NOT(A<B AND B<R)`，所有子句保留 observation assumption。latest 校验覆盖全部竞争写，包括不改变谓词结果的写；PR_RW 仍只针对满足结果变化条件的后继写。固定来源只做 O(m) 比较，不为全部候选构造 latest；row-local 路径不创建 frontier/candidate 容器，general/JOIN 仅保留来源 A 的单候选 handle。
+
+未固定来源时，`createExternalKeyFrontier()` 为 row-local external key 生成 latest-visible source candidates。`analyzeAbsentKey()` 为 absent-result key 生成 bad-writer obligations。row-local absent key 在原有候选缩减后只剩一个来源、且已确定 `source<reader` 时，直接检查空贡献并生成依赖；可见性未定则仍走通用 checker。该简化主要减少 Java 容器、stream 和候选对象分配；`frontiers`/`frontierCandidates` 统计保留逻辑域/候选计数，不等于实际分配的对象数。
 
 两条路径遵循同一个开关边界：
 
 ```text
 GMWR:
   possibleExternalFrontierWrites(...)
-  -> LatestVisibleChecker / GMWR obligation
+  -> 确定单候选简化 / LatestVisibleChecker；GMWR obligation
 
 EAGER (--no-gmwr):
   完整 external candidates
-  -> LatestVisibleChecker / eager blocking clauses
+  -> 确定单候选简化 / LatestVisibleChecker；eager blocking clauses
 ```
 
 因此 frontier 不再是独立开关。它和 GMWR 是同一搜索域缩减机制的两个入口，由 `--[no-]gmwr` 一起控制。
@@ -111,7 +113,7 @@ EAGER (--no-gmwr):
 - recorded source 检查；
 - `LatestVisibleChecker`；
 - source-aware `PR_WR/PR_RW`；
-- general query 的完整 `QueryPlan` model refinement；
+- 受支持 JOIN 的完整 binding 编码；
 - 唯一 `serializationGraph`；
 - witness coalescing 和 physical edge interning。
 
@@ -119,7 +121,7 @@ EAGER (--no-gmwr):
 
 ### 7.2 EAGER
 
-EAGER 对每个 row-local key 直接建立 latest-visible 与 bad-writer blocking clause。使用完整 external candidate 集，不运行 GMWR propagation。
+EAGER 使用完整 external candidate 集，不运行 GMWR propagation。固定来源和确定可见的单候选使用上述简化路径，其余 row-local key 建立通用 latest-visible 与 bad-writer blocking clause。
 
 ### 7.3 GMWR
 
@@ -162,22 +164,24 @@ R < B  OR  OR_G(B < G AND G < R)
 7. 将 guarded logical dependencies 映射到 serialization edge；
 8. assert `serializationGraph.acyclic()`。
 
-`encodeDependencyEdge()` 建立的是：
+`encodeDependencyEdge()` 对每个 support 直接提交单向条件子句：
 
 ```text
-semantic guard -> serialization edge literal
+assumption AND selectedSource AND WW AND changeContext -> serialization edge
+等价子句：NOT assumption OR NOT selectedSource OR NOT WW OR NOT changeContext OR edge
 ```
 
-不是双向等价。物理 edge 为真不会反推出某个具体 typed witness guard 为真。
+row-local PR_RW 仍要求来源成立、对应 WW 成立且写入改变谓词结果：匹配变不匹配、不匹配变匹配，或都匹配但贡献值改变；结果变化在 Java 中判断，非 row-local 路径保留原有 context 条件。来源/latest 本身的语义约束不变。
 
-## 10. General query refinement
+依赖激活不再创建 AND guard、各 support 的 OR 链或 implication 辅助变量；同端点仍合并 typed key metadata、复用物理边，每个不同 support 分别提交子句。assumption 保留在子句中用于冲突解释。物理 edge 为真不会反推出某个具体来源、WW 或匹配条件。
 
-JOIN、DISTINCT 或其他不能证明 row-local 的 query 不做逐 key GMWR 公式替代。第一次 SAT model 选出各 key frontier 后，checker 执行真实 `QueryPlan`：
+## 10. 单次求解与查询范围
 
-- 与 recorded result 一致：接受该 model；
-- 不一致：为当前 frontier 组合加入 no-good clause 并重新 solve；
-- UNSAT：`REJECT`；
-- backend timeout：`TIMEOUT`。
+当前检测器采用 `(key, value)` 唯一模型，不支持 DISTINCT，也不保留自定义全快照谓词的循环后备路径。构造期在分配 native solver 前检查谓词形态，不支持的形态抛出 `QueryException`，不会忽略查询后返回 ACCEPT。
+
+声明 `isRowLocal()` 的谓词统一进入 EAGER/GMWR 完整编码，包括程序构造的逐行谓词。非 row-local 的单调 `QueryPlan`（当前受支持 JOIN）在求解前枚举产生结果的 binding，固定 recorded sources、排除额外 binding 并生成 PR_WR/PR_RW；所有约束保留 observation assumption。
+
+`solve()` 仅调用一次 MonoSAT：SAT 返回 ACCEPT，UNSAT 提取 conflict reasons 并返回 REJECT，backend 超时返回 TIMEOUT。solver timeout 直接传给这一次后端调用，不再维护跨轮 deadline。旧快照组合记录、model refinement、no-good 追加和 monotone witness 后备分支已删除。
 
 ## 11. 性能归因
 
@@ -209,7 +213,7 @@ NO_GMWR --(GMWR + frontier)--> NO_PREPROP --(prepropagation)--> FULL
 | `src/main/java/verifier/SERVerifier.java` | audit 生命周期、默认 `SolverSettings`、ordinary constraint 与 baseline pruning。 |
 | `src/main/java/verifier/Pruning.java` | WW/RW branch-cycle reachability。 |
 | `src/main/java/verifier/PrecedenceOracle.java` | 唯一 deterministic precedence relation。 |
-| `src/main/java/verifier/SERSolverAR.java` | GMWR/EAGER、frontier、SAT/MonoSAT encoding、solve/refinement。 |
+| `src/main/java/verifier/SERSolverAR.java` | GMWR/EAGER、frontier、SAT/MonoSAT encoding、单次 solve。 |
 | `src/main/java/verifier/GmwrPropagationState.java` | GMWR obligation worklist 与预传播。 |
 | `src/main/java/verifier/LatestVisibleChecker.java` | latest-visible candidate 公式。 |
 | `tools/run_ser_acceleration_ablation.py` | 三配置 paired ablation。 |

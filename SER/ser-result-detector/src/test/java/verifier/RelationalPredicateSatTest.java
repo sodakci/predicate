@@ -3,6 +3,10 @@ package verifier;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import graph.KnownGraph;
+import history.query.QueryException;
 
 import history.loaders.PredicateHistoryLoader;
 import java.nio.file.Files;
@@ -142,8 +146,6 @@ class RelationalPredicateSatTest {
 
         assertFalse(audit(history, SERVerifier.PredicateSolvingMode.GMWR));
         assertEquals(1L, profiler.getCount("SER_GMWR_GENERAL_OBSERVATIONS_COUNT"));
-        assertEquals(0L, profiler.getCount("SER_GMWR_GENERAL_WITNESSES_COUNT"));
-        assertEquals(0L, profiler.getCount("SER_GMWR_GENERAL_WITNESS_KEYS_COUNT"));
         assertTrue(profiler.getCount("SER_PRED_BLOCKING_CLAUSES_COUNT") > 0);
     }
 
@@ -195,28 +197,17 @@ class RelationalPredicateSatTest {
     }
 
     @Test
-    void distinctSingleTableQueryKeepsWholeSnapshotSemantics() throws Exception {
-        var initialState = "["
-                + "{\"key\":\"kv:k0\",\"value\":7},"
-                + "{\"key\":\"kv:k1\",\"value\":7}]";
-        var inputs = "["
-                + "{\"key\":\"kv:k0\",\"value\":7},"
-                + "{\"key\":\"kv:k1\",\"value\":7}]";
-
-        var correct = writeHistory(
-                "distinct-correct",
-                initialState,
-                transaction(0, 10,
-                        singleTableRead(true, inputs, "[{\"value\":7}]")));
-        var duplicate = writeHistory(
-                "distinct-duplicate",
-                initialState,
-                transaction(0, 10,
-                        singleTableRead(true, inputs,
-                                "[{\"value\":7},{\"value\":7}]")));
-
-        assertTrue(audit(correct));
-        assertFalse(audit(duplicate));
+    void distinctIsOutsideTheUniqueKeyValueSolverModel() throws Exception {
+        var inputs = "[{\"key\":\"kv:k0\",\"value\":7}]";
+        var path = writeHistory("distinct-unsupported", inputs,
+                transaction(0, 10, singleTableRead(true, inputs, "[{\"value\":7}]")));
+        for (var mode : SERVerifier.PredicateSolvingMode.values()) {
+            var history = new PredicateHistoryLoader(path).loadHistory();
+            var graph = new KnownGraph<>(history);
+            var error = assertThrows(QueryException.class, () -> new SERSolverAR<>(
+                    history, graph, SERVerifier.generateConstraintsSER(history, graph), true, true, mode));
+            assertTrue(error.getMessage().contains("DISTINCT"));
+        }
     }
 
     @Test

@@ -8,6 +8,11 @@ import history.Event;
 import history.History;
 import history.Transaction;
 import history.query.QueryPlan;
+import history.query.PredicateEvaluator;
+import history.query.QueryEvaluation;
+import history.query.QueryException;
+import history.query.QueryScope;
+import history.query.VisibleState;
 import history.query.QueryValue;
 import history.query.RelationResolver;
 import history.query.StructuredQueryParser;
@@ -118,6 +123,304 @@ class SERSolverARSatEncodingTest {
     }
 
     @Test
+    void rowLocalPredicateIsFullyEncodedBeforeTheSingleBackendCall() {
+        for (var mode : SERVerifier.PredicateSolvingMode.values()) {
+            var solveStarted = new boolean[] { false };
+            var calls = new int[] { 0 };
+            var predicate = new PredicateFixtures.RowPredicate<String, Integer>() {
+                @Override
+                public boolean test(String key, Integer value) {
+                    return value > 5;
+                }
+
+                @Override
+                public QueryEvaluation<String, Integer> evaluate(VisibleState<String, Integer> state) {
+                    assertFalse(solveStarted[0], "predicate evaluation must finish before SAT solving");
+                    return PredicateFixtures.RowPredicate.super.evaluate(state);
+                }
+            };
+            var history = makeHistory(Set.of(1L, 2L),
+                    Map.of(1L, List.of(1L), 2L, List.of(2L)),
+                    Map.of(1L, List.of(Triple.of(WRITE, "x", 10))),
+                    Map.of(2L, Pair.of(predicate, List.of(new Event.PredResult<>("x", 10)))));
+            commitAll(history);
+            var graph = new KnownGraph<>(history);
+            var settings = SERVerifier.SolverSettings.forModes(mode, SERVerifier.PruningMode.NONE);
+            settings.satSolveBackend = (nativeSolver, remaining, assumptions) -> {
+                calls[0]++;
+                solveStarted[0] = true;
+                return java.util.Optional.of(nativeSolver.solve(assumptions));
+            };
+            var solver = new SERSolverAR<>(history, graph,
+                    generateConstraints(history, graph), true, true, settings);
+            assertEquals(SolveStatus.SAT, solver.solve());
+            assertEquals(1, calls[0]);
+        }
+    }
+
+    @Test
+    void unsupportedWholeSnapshotPredicateIsNotSilentlyAccepted() {
+        var plan = kvPlan("value > 5");
+        var predicate = new PredicateEvaluator<String, Integer>() {
+            @Override public QueryScope<String> scope() { return plan.scope(); }
+            @Override public Object identity() { return this; }
+            @Override public QueryEvaluation<String, Integer> evaluate(VisibleState<String, Integer> state) {
+                return plan.evaluate(state);
+            }
+        };
+        var history = singleTxnHistory();
+        history.addPredicateReadEvent(history.getTransaction(1L), predicate, List.of());
+        var graph = new KnownGraph<>(history);
+        var error = assertThrows(QueryException.class,
+                () -> new SERSolverAR<>(history, graph, List.of()));
+        assertTrue(error.getMessage().contains("whole-snapshot"));
+    }
+
+    @Test
+    void recordedSourceComparesOnlyThatSourceWithCompetingWriters() {
+        for (var mode : SERVerifier.PredicateSolvingMode.values()) {
+            var history = new History<String, Integer>();
+            int writers = 20;
+            for (int index = 1; index <= writers; index++) {
+                var writer = history.addTransaction(history.addSession(index), index);
+                history.addEvent(writer, WRITE, "kv:x", index + 10);
+            }
+            var reader = history.addTransaction(history.addSession(100L), 100L);
+            history.addPredicateReadEvent(reader, kvPlan("value > 5"),
+                    List.of(new Event.PredResult<>("kv:x", 11)));
+            commitAll(history);
+            var graph = new KnownGraph<>(history);
+            var profiler = Profiler.getInstance();
+            profiler.clear();
+            var solver = new SERSolverAR<>(history, graph,
+                    generateConstraints(history, graph), true, true, mode);
+            long comparisons = profiler.getCount("SER_PRED_BEFORE_WRITE_CALLS_COUNT");
+            assertEquals(SolveStatus.SAT, solver.solve());
+            assertTrue(comparisons <= 2L * writers,
+                    mode + " fixed-source comparisons must be linear; got " + comparisons);
+            assertEquals(1L, profiler.getCount("SER_PRED_FRONTIER_CANDIDATES_COUNT"),
+                    "a recorded source does not need validity objects for other candidates");
+        }
+    }
+
+    @Test
+    void rowLocalSingleCandidateRequiresKnownVisibilityBeforeSimplifying() {
+        for (var mode : SERVerifier.PredicateSolvingMode.values()) {
+            for (boolean knownVisible : List.of(false, true)) {
+                for (int value : List.of(0, 10)) {
+                    var history = new History<String, Integer>();
+                    var writerSession = history.addSession(1L);
+                    var writer = history.addTransaction(writerSession, 1L);
+                    var reader = history.addTransaction(knownVisible
+                            ? writerSession : history.addSession(2L), 2L);
+                    history.addEvent(writer, WRITE, "kv:x", value);
+                    history.addPredicateReadEvent(reader, kvPlan("value > 5"), List.of());
+                    commitAll(history);
+                    var graph = new KnownGraph<>(history);
+                    var solver = new SERSolverAR<>(history, graph,
+                            generateConstraints(history, graph), true, true, mode);
+                    assertEquals(knownVisible && value > 5 ? SolveStatus.UNSAT : SolveStatus.SAT,
+                            solver.solve(), mode + " visible=" + knownVisible + " value=" + value);
+                }
+            }
+        }
+    }
+
+    @Test
+    void fixedSourceLatestChecksEveryCompetingWriteAndPreservesOrderChoices() throws Exception {
+        var history = new History<String, Integer>();
+        var source = history.addTransaction(history.addSession(1L), 1L);
+        var competitor = history.addTransaction(history.addSession(2L), 2L);
+        var reader = history.addTransaction(history.addSession(3L), 3L);
+        // Both writes are nonmatching for value > 5. Latest validation must
+        // still reject source < competitor < reader independently of PR_RW.
+        history.addEvent(source, WRITE, "kv:x", 0);
+        history.addEvent(competitor, WRITE, "kv:x", 1);
+        commitAll(history);
+        var graph = new KnownGraph<>(history);
+        var encoder = new SERSolverAR<>(history, graph,
+                List.of(), true, true,
+                SERVerifier.PredicateSolvingMode.EAGER);
+        var solverField = SERSolverAR.class.getDeclaredField("solver");
+        solverField.setAccessible(true);
+        try (var nativeSolver = (Solver) solverField.get(encoder)) {
+            var sourceWrite = graph.getAllWrites().stream()
+                    .filter(write -> write.getTxn().equals(source)).findFirst().orElseThrow();
+            var check = SERSolverAR.class.getDeclaredMethod("assertFixedSourceLatest",
+                    Transaction.class, KnownGraph.WriteRef.class, List.class);
+            check.setAccessible(true);
+            var newAssumption = SERSolverAR.class.getDeclaredMethod("newAssumption",
+                    SERSolverAR.AssumptionKind.class, String.class, SERConstraint.class);
+            newAssumption.setAccessible(true);
+            var reason = newAssumption.invoke(encoder,
+                    SERSolverAR.AssumptionKind.PREDICATE_OBLIGATION, "fixed source regression", null);
+            var literalField = SERSolverAR.AssumptionReason.class.getDeclaredField("literal");
+            literalField.setAccessible(true);
+            var predicateAssumption = (Lit) literalField.get(reason);
+            var assumptionField = SERSolverAR.class.getDeclaredField("currentPredicateAssumption");
+            assumptionField.setAccessible(true);
+            assumptionField.set(encoder, reason);
+            check.invoke(encoder, reader, sourceWrite, graph.getAllWrites());
+            var order = SERSolverAR.class.getDeclaredMethod(
+                    "orderLiteral", Transaction.class, Transaction.class);
+            order.setAccessible(true);
+            var sourceBeforeReader = (Lit) order.invoke(encoder, source, reader);
+            var sourceBeforeCompetitor = (Lit) order.invoke(encoder, source, competitor);
+            var competitorBeforeReader = (Lit) order.invoke(encoder, competitor, reader);
+            assertTrue(nativeSolver.solve(List.of(predicateAssumption, sourceBeforeReader,
+                    sourceBeforeCompetitor.not(), competitorBeforeReader)));
+            assertTrue(nativeSolver.solve(List.of(predicateAssumption, sourceBeforeReader,
+                    sourceBeforeCompetitor, competitorBeforeReader.not())));
+            assertFalse(nativeSolver.solve(List.of(predicateAssumption, sourceBeforeReader,
+                    sourceBeforeCompetitor, competitorBeforeReader)),
+                    "even a non-result-changing competitor invalidates an older fixed source");
+            assertFalse(nativeSolver.solve(List.of(predicateAssumption, sourceBeforeReader.not())),
+                    "a recorded source must be visible");
+            assertTrue(nativeSolver.solve(List.of(predicateAssumption.not(), sourceBeforeReader,
+                    sourceBeforeCompetitor, competitorBeforeReader)),
+                    "latest constraints must retain their observation assumption");
+        }
+    }
+
+    @Test
+    void repeatedPredicateSupportsOnlyAllocateObservationAssumptions() {
+        long single = repeatedPredicateVariableCount(1);
+        long repeated = repeatedPredicateVariableCount(32);
+        assertEquals(31L, repeated - single,
+                "repeated supports for the same known edge need only their observation assumptions, not OR gates");
+    }
+
+    private static long repeatedPredicateVariableCount(int observations) {
+        var history = new History<String, Integer>();
+        var session = history.addSession(1L);
+        var writer = history.addTransaction(session, 1L);
+        var reader = history.addTransaction(history.addSession(2L), 2L);
+        history.addEvent(writer, WRITE, "kv:x", 10);
+        for (int index = 0; index < observations; index++) {
+            history.addPredicateReadEvent(reader, kvPlan("value > " + (-index)),
+                    List.of(new Event.PredResult<>("kv:x", 10)));
+        }
+        commitAll(history);
+        var graph = new KnownGraph<>(history);
+        var profiler = Profiler.getInstance();
+        profiler.clear();
+        var solver = new SERSolverAR<>(history, graph,
+                generateConstraints(history, graph), true, true,
+                SERVerifier.PredicateSolvingMode.EAGER);
+        long variables = profiler.getCount("SER_PROP_RESIDUAL_SAT_VARIABLES_COUNT");
+
+        assertEquals(SolveStatus.SAT, solver.solve());
+        assertEquals(observations, solver.getAssumptionReasons().stream()
+                .filter(reason -> reason.getKind()
+                        == SERSolverAR.AssumptionKind.PREDICATE_OBLIGATION).count());
+        assertTrue(solver.getLogicalDependencies().stream().anyMatch(edge ->
+                edge.getType() == EdgeType.PR_WR
+                        && edge.getFrom().equals(writer)
+                        && edge.getTo().equals(reader)
+                        && edge.getKeys().contains("kv:x")));
+        return variables;
+    }
+
+    @Test
+    void predicateRwRetainsAllThreeResultChangesAndSkipsUnchangedNonmatches() {
+        // matching -> nonmatching, nonmatching -> matching, changed matching
+        // value, and nonmatching -> nonmatching, respectively.
+        int[][] values = { { 10, 0 }, { 0, 10 }, { 10, 20 }, { 0, -1 } };
+        boolean[] expectedRw = { true, true, true, false };
+        for (var mode : SERVerifier.PredicateSolvingMode.values()) {
+            for (int index = 0; index < values.length; index++) {
+                var history = new History<String, Integer>();
+                var session = history.addSession(1L);
+                var source = history.addTransaction(session, 1L);
+                var reader = history.addTransaction(session, 2L);
+                var later = history.addTransaction(session, 3L);
+                history.addEvent(source, WRITE, "kv:x", values[index][0]);
+                history.addPredicateReadEvent(reader, kvPlan("value > 5"),
+                        values[index][0] > 5
+                                ? List.of(new Event.PredResult<>("kv:x", values[index][0]))
+                                : List.of());
+                history.addEvent(later, WRITE, "kv:x", values[index][1]);
+                commitAll(history);
+                var graph = new KnownGraph<>(history);
+                var constraints = generateConstraints(history, graph);
+                var precedence = SERVerifier.createPrecedenceOracle(history);
+                assertFalse(new Pruning<String, Integer>(precedence, false)
+                        .pruneConstraints(graph, constraints));
+                var solver = new SERSolverAR<>(history, graph, constraints, true, true,
+                        SERVerifier.SolverSettings.forModes(
+                                mode, SERVerifier.PruningMode.REACHABILITY), precedence);
+                assertEquals(SolveStatus.SAT, solver.solve());
+                assertTrue(solver.getLogicalDependencies().stream().anyMatch(edge ->
+                        edge.getType() == EdgeType.PR_WR
+                                && edge.getFrom().equals(source)
+                                && edge.getTo().equals(reader)));
+                boolean hasRw = solver.getLogicalDependencies().stream().anyMatch(edge ->
+                        edge.getType() == EdgeType.PR_RW
+                                && edge.getFrom().equals(reader)
+                                && edge.getTo().equals(later));
+                assertEquals(expectedRw[index], hasRw, mode + " transition " + index);
+            }
+        }
+    }
+
+    @Test
+    void dependencySupportsAreOneWayClausesWithoutAuxiliaryVariables() throws Exception {
+        // Exercise the production dependency encoder directly so each support
+        // can be independently toggled, including a false source with a true edge.
+        var history = new History<String, Integer>();
+        var reader = history.addTransaction(history.addSession(1L), 1L);
+        var later = history.addTransaction(history.addSession(2L), 2L);
+        var graph = new KnownGraph<>(history);
+        var encoder = new SERSolverAR<>(history, graph, List.of(), true, true,
+                SERVerifier.PredicateSolvingMode.EAGER);
+        var solverField = SERSolverAR.class.getDeclaredField("solver");
+        solverField.setAccessible(true);
+        try (var nativeSolver = (Solver) solverField.get(encoder)) {
+            var order = SERSolverAR.class.getDeclaredMethod(
+                    "orderLiteral", Transaction.class, Transaction.class);
+            order.setAccessible(true);
+            var edge = (Lit) order.invoke(encoder, reader, later);
+            var source = new Lit(nativeSolver);
+            var ww = new Lit(nativeSolver);
+            var change = new Lit(nativeSolver);
+            var alternate = new Lit(nativeSolver);
+            int before = nativeSolver.nVars();
+
+            var add = SERSolverAR.class.getDeclaredMethod(
+                    "addDependencyEdge", SEREdge.class, Lit[].class);
+            add.setAccessible(true);
+            add.invoke(encoder, new SEREdge<>(reader, later, EdgeType.PR_RW, "x"),
+                    new Lit[] { source, ww, change });
+            add.invoke(encoder, new SEREdge<>(reader, later, EdgeType.PR_RW, "y"),
+                    new Lit[] { alternate });
+            add.invoke(encoder, new SEREdge<>(reader, later, EdgeType.PR_RW, "z"),
+                    new Lit[] { ww, ww.not() });
+            for (var methodName : List.of("flushPredicateDependencies", "encodeDependencyEdges")) {
+                var method = SERSolverAR.class.getDeclaredMethod(methodName);
+                method.setAccessible(true);
+                method.invoke(encoder);
+            }
+            assertEquals(before, nativeSolver.nVars(),
+                    "encoding supports must not materialize AND/OR/implication gates");
+            assertTrue(encoder.getLogicalDependencies().stream().anyMatch(dependency ->
+                    dependency.getType() == EdgeType.PR_RW
+                            && dependency.getKeys().equals(Set.of("x", "y"))));
+            for (int mask = 0; mask < 32; mask++) {
+                var literals = List.of(source, ww, change, alternate, edge);
+                var assumptions = new ArrayList<Lit>();
+                for (int bit = 0; bit < literals.size(); bit++) {
+                    assumptions.add((mask & (1 << bit)) != 0
+                            ? literals.get(bit) : literals.get(bit).not());
+                }
+                boolean supportActive = (mask & 7) == 7 || (mask & 8) != 0;
+                boolean edgeActive = (mask & 16) != 0;
+                assertEquals(!supportActive || edgeActive, nativeSolver.solve(assumptions),
+                        "support/edge assignment " + mask);
+            }
+        }
+    }
+
+    @Test
     void arTotalOrderCreatesVariablesForEveryTransactionPair() {
         var history = makeHistory(
                 Set.of(1L),
@@ -152,7 +455,6 @@ class SERSolverARSatEncodingTest {
         assertEquals(1, profiler.getCounter("SER_AR_ENCODE_DEPENDENCIES"));
         assertEquals(1, profiler.getCounter("SER_AR_ENCODE_ACYCLIC"));
         assertEquals(1, profiler.getCounter("SER_MONOSAT_SOLVE"));
-        assertEquals(1, profiler.getCounter("SER_AR_PREDICATE_REFINEMENT"));
     }
 
     @Test
@@ -175,7 +477,8 @@ class SERSolverARSatEncodingTest {
         assertEquals(1, profiler.getCount("SER_PRED_OBSERVATIONS_COUNT"));
         assertEquals(1, profiler.getCount("SER_PRED_RESULT_SOURCES_COUNT"));
         assertEquals(1, profiler.getCount("SER_PRED_SCOPED_KEYS_COUNT"));
-        assertEquals(1, profiler.getCount("SER_PRED_GENERAL_COUNT"));
+        assertEquals(1, profiler.getCount("SER_PRED_ROW_LOCAL_ENCODED_COUNT"));
+        assertEquals(0, profiler.getCount("SER_PRED_GENERAL_COUNT"));
         assertEquals(1, profiler.getCount("SER_PRED_FRONTIERS_COUNT"));
         assertEquals(1, profiler.getCount("SER_PRED_FRONTIER_CANDIDATES_COUNT"));
         assertTrue(profiler.getCount("SER_PRED_DEPENDENCY_ATTEMPTS_COUNT") > 0);
@@ -226,7 +529,6 @@ class SERSolverARSatEncodingTest {
                 history, graph, generateConstraints(history, graph), true, true,
                 SERVerifier.PredicateSolvingMode.EAGER);
 
-        assertEquals(0L, profilerCountOrZero("SER_PRED_ROW_LOCAL_FALLBACKS_COUNT"));
         assertEquals(SolveStatus.UNSAT, solver.solve());
     }
 
@@ -731,7 +1033,8 @@ class SERSolverARSatEncodingTest {
                 history, graph, generateConstraints(history, graph), true, true);
 
         assertEquals(1, profiler.getCount("SER_PRED_FRONTIERS_COUNT"));
-        assertEquals(2, profiler.getCount("SER_PRED_FRONTIER_CANDIDATES_COUNT"));
+        assertEquals(1, profiler.getCount("SER_PRED_FRONTIER_CANDIDATES_COUNT"),
+                "only the recorded final write needs a latest-visible candidate");
         assertEquals(SolveStatus.SAT, solver.solve(),
                 "the second write of txn 1 must remain its only external frontier candidate");
 

@@ -196,7 +196,7 @@ PRHIST
        PREDICATE
        DEPENDENCIES
        TOTAL_ORDER
-  -> solve / predicate refinement
+  -> 单次 solve
   -> ACCEPT、REJECT 或 TIMEOUT
 ```
 
@@ -270,7 +270,7 @@ selected_i = visible_i
 
 因此，source 由 MonoSAT 求出的全局 serialization order 决定：若 `S1 < S2 < R`，则 `S2` 遮蔽 `S1`，只有 `selected(S2,R,k)` 成立；若 `S2 < S1 < R`，结果反过来；排在 `R` 后的 writer 不可见，也不会遮蔽 source。在 serialization order 为全序且至少存在一个可见 writer 时，这些公式自然保证恰好一个 AR-max writer 被选中，而不是靠额外的任意选择。每个 writer transaction 对该 key 只有最后一次写可以进入 external source 候选集，同事务内更早的写不会成为 external source。
 
-若谓词结果已经记录了 `(k,value)`，紧凑历史先按唯一 `(k,value)` 解析出 `recordedSource`，随后直接断言该候选的 `selected` 条件；其他 writer 的相对顺序只能服从这一条件，否则模型不可满足。同一 `(k,value)` 对应多个 write 会被内部一致性检查判为 source 歧义。若没有 recorded source（例如未返回的 key），则由 serialization order 产生的 AR-max writer 与结果合法性 clause/GMWR obligation 共同决定哪些选择可行；不符合记录谓词结果的 frontier 会被约束或 refinement 排除。
+若谓词结果已经记录了 `(k,value)`，紧凑历史先按唯一 `(k,value)` 解析出 `recordedSource`，随后直接断言该候选的 `selected` 条件；其他 writer 的相对顺序只能服从这一条件，否则模型不可满足。同一 `(k,value)` 对应多个 write 会被内部一致性检查判为 source 歧义。若没有 recorded source（例如未返回的 key），则由 serialization order 产生的 AR-max writer 与结果合法性 clause/GMWR obligation 共同决定哪些选择可行；不符合记录谓词结果的 frontier 在求解前由完整约束排除。
 
 当 `S` 被选为 source 时：
 
@@ -287,7 +287,7 @@ selected(S,R,k) AND beforeWrite(S,U)
 
 这里的“改变 observation”由 `writeChangesPredicateResult` 判断：包括匹配/不匹配发生变化，以及两边都匹配但输入或投影贡献不同。不会改变谓词结果的写不产生额外 `PR_RW`。
 
-row-local 查询可以逐 key 预编码。JOIN、DISTINCT 或其他 general query 会在 SAT 给出候选 frontier 后执行完整 `QueryPlan`；若模型结果与记录不一致，则加入 no-good 后继续求解。refinement 改变的是 frontier 组合的合法性，不会在模型验证阶段临时发明新的边类型。
+row-local 查询逐 key 完整编码；受支持的非 row-local 单调 `QueryPlan`（包括 JOIN）在求解前枚举 contributing bindings，固定记录来源、排除额外 binding 并建立带 context 的 PR_WR/PR_RW。随后只调用一次 MonoSAT，不再进行 model refinement。当前 `(key,value)` 唯一模型不支持 DISTINCT 或自定义全快照 evaluator；这类谓词在 native solver 分配前明确报错。
 
 ## 6. 核心算法一：GMWR obligation 预传播
 

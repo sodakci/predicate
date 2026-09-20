@@ -7,15 +7,12 @@ import history.HistoryLoader;
 import history.Transaction;
 import history.loaders.PredicateHistoryLoader;
 import history.query.MapVisibleState;
-import history.query.PredicateEvaluator;
-import history.query.QueryEvaluation;
 import history.query.QueryScope;
 import history.query.QueryValue;
 import history.query.RecordedQueryResult;
 import history.query.RelationResolver;
 import history.query.StructuredQueryParser;
 import history.query.ValueAdapter;
-import history.query.VisibleState;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -31,8 +28,7 @@ import util.Profiler;
 
 /**
  * Semantic regressions runnable from JUnit or directly with main().
- * A snapshot-only wrapper deliberately disables every row-local optimization;
- * it is test-only and adds no production switch. The independent serial oracle
+ * The independent serial oracle
  * executes complete transactions, not predicate constraints or frontiers.
  */
 public final class PredicateSemanticsRegression {
@@ -44,7 +40,7 @@ public final class PredicateSemanticsRegression {
 
     public PredicateSemanticsRegression(Path root) {
         this.root = root;
-        results.add("case\tstrategy\tencoding\tpruning\tpropagation\texpected\tactual");
+        results.add("case\tencoding\tpruning\texpected\tactual");
     }
 
     public static void main(String[] args) throws Exception {
@@ -113,9 +109,8 @@ public final class PredicateSemanticsRegression {
         history("legacy-kv-key-in-multi-table-query-omitted", false, legacyInputs,
                 txn(0, 10, read(legacyJoin, EMPTY, EMPTY)));
 
-        var compact = rowQuery("kv", true, false);
-        var projection = rowQuery("kv", false, false);
-        var distinct = rowQuery("kv", false, true);
+        var compact = rowQuery("kv", true);
+        var projection = rowQuery("kv", false);
         var kv0 = row("kv:k0", 7);
         var kv1 = row("kv:k1", 7);
         var kvInputs = array(kv0, kv1);
@@ -123,12 +118,6 @@ public final class PredicateSemanticsRegression {
                 txn(0, 10, read(projection, kvInputs, "[{\"value\":7},{\"value\":7}]")));
         history("row-local-bag-missing-duplicate", false, kvInputs,
                 txn(0, 10, read(projection, kvInputs, "[{\"value\":7}]")));
-        history("single-table-distinct", true, kvInputs,
-                txn(0, 10, read(distinct, kvInputs, "[{\"value\":7}]")));
-        history("single-table-distinct-incorrect-bag", false, kvInputs,
-                txn(0, 10, read(distinct, kvInputs, "[{\"value\":7},{\"value\":7}]")));
-        history("distinct-missing-contributing-input", false, kvInputs,
-                txn(0, 10, read(distinct, array(kv0), "[{\"value\":7}]")));
         history("compact-correct", true, array(kv0),
                 txn(0, 10, read(compact, array(kv0), "[{\"k\":\"k0\",\"value\":7}]")));
         history("compact-wrong-projection", false, array(kv0),
@@ -142,8 +131,8 @@ public final class PredicateSemanticsRegression {
                 txn(0, 10, read(compact, EMPTY, EMPTY), write("kv:k0", 7),
                         read(compact, EMPTY, EMPTY)));
 
-        var qa = rowQuery("A", true, false);
-        var qb = rowQuery("B", true, false);
+        var qa = rowQuery("A", true);
+        var qb = rowQuery("B", true);
         var readA1 = read(qa, array(a1), "[{\"k\":\"x\",\"value\":1}]");
         var readB0 = read(qb, array(row("B:y", 0)), "[{\"k\":\"y\",\"value\":0}]");
         var readB1 = read(qb, array(b1), "[{\"k\":\"y\",\"value\":1}]");
@@ -168,7 +157,7 @@ public final class PredicateSemanticsRegression {
         var scope = QueryScope.forRelations(java.util.Set.of("alpha"), fixed);
         check(scope.relationResolver() == fixed, "scope must expose its actual resolver");
         programmatic("fixed-resolver-not-key-prefix", fixed,
-                rowQuery("alpha", true, false), Map.of("physical:x", 7));
+                rowQuery("alpha", true), Map.of("physical:x", 7));
         RelationResolver<String> mapped = key -> key.equals("x") ? "A" : "B";
         programmatic("custom-mapping-two-tables", mapped,
                 joinQuery("A", "a", "B", "b"), Map.of("x", 7, "y", 7));
@@ -289,40 +278,16 @@ public final class PredicateSemanticsRegression {
                     ? List.of(SERVerifier.PruningMode.NONE, SERVerifier.PruningMode.REACHABILITY)
                     : List.of(SERVerifier.PruningMode.REACHABILITY);
             for (var pruning : pruningModes) {
-                for (int variant = 0; variant < (targeted ? 2 : 1); variant++) {
-                    var h = factory.get();
-                    if (variant == 1) { disableRowAcceleration(h); }
-                    Profiler.getInstance().clear();
-                    HistoryLoader<String, V> loader = () -> h;
-                    var actual = new SERVerifier<>(loader, false, mode, pruning).audit();
-                    results.add(name + "\t" + (variant == 0 ? "AUTO" : "SNAPSHOT_ONLY")
-                            + "\t" + mode + "\t" + pruning
-                            + "\t" + (expected ? "ACCEPT" : "REJECT") + "\t" + actual);
-                    if (actual != (expected ? SERVerifier.AuditResult.ACCEPT : SERVerifier.AuditResult.REJECT)) {
-                        failures++;
-                        System.err.println("MISMATCH " + results.get(results.size() - 1));
-                    }
+                var h = factory.get();
+                Profiler.getInstance().clear();
+                HistoryLoader<String, V> loader = () -> h;
+                var actual = new SERVerifier<>(loader, false, mode, pruning).audit();
+                results.add(name + "\t" + mode + "\t" + pruning
+                        + "\t" + (expected ? "ACCEPT" : "REJECT") + "\t" + actual);
+                if (actual != (expected ? SERVerifier.AuditResult.ACCEPT : SERVerifier.AuditResult.REJECT)) {
+                    failures++;
+                    System.err.println("MISMATCH " + results.get(results.size() - 1));
                 }
-            }
-        }
-    }
-
-    private static <V> void disableRowAcceleration(History<String, V> history) {
-        for (var txn : history.getTransactions()) {
-            var events = txn.getEvents();
-            for (int i = 0; i < events.size(); i++) {
-                var event = events.get(i);
-                if (event.getType() != Event.EventType.PREDICATE_READ) { continue; }
-                var original = event.getPredicate();
-                PredicateEvaluator<String, V> snapshotOnly = new PredicateEvaluator<>() {
-                    @Override public QueryScope<String> scope() { return original.scope(); }
-                    @Override public Object identity() { return original.identity(); }
-                    @Override public QueryEvaluation<String, V> evaluate(VisibleState<String, V> state) {
-                        return original.evaluate(state);
-                    }
-                };
-                events.set(i, new Event<>(txn, Event.EventType.PREDICATE_READ, null, null,
-                        snapshotOnly, event.getPredResults(), event.getRecordedPredicateResult()));
             }
         }
     }
@@ -407,9 +372,9 @@ public final class PredicateSemanticsRegression {
         return "{\"type\":\"pr\",\"query\":" + query + ",\"result\":{\"inputs\":"
                 + inputs + ",\"values\":" + values + "}}";
     }
-    private static String rowQuery(String table, boolean compact, boolean distinct) {
+    private static String rowQuery(String table, boolean compact) {
         return "{\"from\":{\"relation\":\"" + table + "\"},\"select\":{\"columns\":"
-                + (compact ? "[\"k\",\"value\"]" : "[\"value\"]") + ",\"distinct\":" + distinct
+                + (compact ? "[\"k\",\"value\"]" : "[\"value\"]") + ",\"distinct\":false"
                 + "},\"where\":[\"value > 0\"]}";
     }
     private static String joinQuery(String left, String leftAlias, String right, String rightAlias) {

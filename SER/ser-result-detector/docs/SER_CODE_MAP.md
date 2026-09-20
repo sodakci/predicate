@@ -10,8 +10,8 @@
 | SER 命令入口 | 同上 | `Audit.call()` | 解析 SER 配置，构造 `PredicateHistoryLoader`、`SERVerifier.SolverSettings`，调用 `SERVerifier.audit()`，打印 timing/count、最大内存和 verdict marker。 |
 | checker 总控 | `SER/ser-result-detector/src/main/java/verifier/SERVerifier.java` | `SERVerifier.audit()` | 串联一致性检查、`KnownGraph`、WW/RW constraint、基线 pruning、`SERSolverAR` 编码和求解，并映射到 verdict。 |
 | precedence primitive | `SER/ser-result-detector/src/main/java/verifier/PrecedenceOracle.java` | `before/successor/predecessor/wouldCycle` | 唯一 Java precedence engine；统一维护增量传递闭包和批量 branch 成环预判。 |
-| 求解入口 | `SER/ser-result-detector/src/main/java/verifier/SERSolverAR.java` | 构造函数；`solve()`；`solveOnce()` | 构造 logical dependency layer + 唯一 MonoSAT serialization graph；调用 MonoSAT；必要时做 predicate model refinement。 |
-| latest-visible primitive | `SER/ser-result-detector/src/main/java/verifier/LatestVisibleChecker.java` | `check(reader,key,candidateWriters,serializationOrder)` | 统一返回每个候选的 visible literal 与 latest-writer validity；EAGER 直接使用完整候选，GMWR 先缩减候选再调用。 |
+| 求解入口 | `SER/ser-result-detector/src/main/java/verifier/SERSolverAR.java` | 构造函数；`solve()`；`solveOnce()` | 构造 logical dependency layer + 唯一 MonoSAT serialization graph；构造前验证查询范围；完整编码后仅调用一次 MonoSAT。 |
+| latest-visible primitive | `SER/ser-result-detector/src/main/java/verifier/LatestVisibleChecker.java` | `check(reader,key,candidateWriters,serializationOrder)` | 为未确定的来源返回 visible literal 与 latest-writer validity；固定来源和 row-local 确定可见单候选绕过通用 checker。 |
 | verdict | `SERVerifier.AuditResult` | `ACCEPT/REJECT/TIMEOUT/INVALID_HISTORY` | `SAT -> ACCEPT(0)`；`UNSAT` 或 checker 提前冲突 -> `REJECT(-1)`；超时 -> `TIMEOUT(124)`。`INVALID_HISTORY(2)` 在当前 `audit()` 路径中没有显式转换点。 |
 
 主调用链：
@@ -37,7 +37,6 @@ Main.main
            -> encodeSerializationAcyclicity
         -> SERSolverAR.solve
            -> solveOnce -> monosat.Solver.solve[Limited]
-           -> refinePredicateConstraints [general queries, zero or more rounds]
         -> AuditResult
      -> print marker / return exit code
 ```
@@ -58,7 +57,7 @@ Main.main
 | `src/main/java/history/Transaction.java` | `Transaction` | `(session,id) + 有序 Event list + ONGOING/COMMIT`。 |
 | `src/main/java/history/Event.java` | `Event` / `PredResult` | `READ/WRITE/PREDICATE_READ`；点操作持有 key/value，谓词读持有 evaluator、结果来源项和 recorded result。 |
 | `src/main/java/history/query/StructuredQueryParser.java` | `parse()` | 把结构化 query JSON 解析为 relational/expression AST 和 `QueryPlan`。 |
-| `src/main/java/history/query/QueryPlan.java` | `evaluate()` / `isRowLocal()` / `isMonotone()` | 执行 query；返回投影值和实际输入版本；决定 row-local eager/GMWR 与 general lazy 路径。 |
+| `src/main/java/history/query/QueryPlan.java` | `evaluate()` / `isRowLocal()` / `isMonotone()` | 执行 query；返回投影值和实际输入版本；决定 row-local EAGER/GMWR 与显式 JOIN 编码；检测器不支持 DISTINCT。 |
 | `src/main/java/history/query/QueryEvaluation.java` | `QueryEvaluation` | 保存 `values`、`inputs`、值多重集、canonical inputs。 |
 | `src/main/java/history/query/RecordedQueryResult.java` | `GeneralRecordedQueryResult` / `RowLocalRecordedQueryResult` | 保存或紧凑表示 history 中记录的 query 结果，并提供 canonical equality。 |
 | `src/main/java/history/query/MapVisibleState.java` | `MapVisibleState` | checker 在具体候选 snapshot 上执行 query 时的 key/value 可见状态。 |
@@ -74,7 +73,7 @@ Main.main
 | `verifyInternalConsistency()` | 在构图前建立 `(key,value)->writes` 和 transaction-local write positions，逐个验证 point read 与 predicate read。失败由 `SERVerifier.audit()` 直接映射为 `REJECT`。 |
 | `checkItemRead()` | source 必须唯一；self-read 必须读最新先前 self write；external read 必须来自 writer transaction 对该 key 的最终 write，且 reader 之前不能已有 self write。 |
 | `checkPredicateRead()` | 校验结果 key 唯一、source 唯一且 committed/in-scope、internal latest-write、重复同谓词读继承规则以及 recorded inputs。 |
-| `predicateSnapshotMatches()` | 对全部 key 都能由 transaction-local writes 决定的 general query 立即执行完整 snapshot 校验；否则外部部分延迟给 solver。 |
+| `predicateSnapshotMatches()` | 编码前校验 recorded contributing inputs 是否重现完整结果及 provenance；不再用于 SAT model refinement。 |
 
 ## 4. KnownGraph 与关系产生位置
 
@@ -99,7 +98,7 @@ Main.main
 | WW | `SERVerifier.generateConstraintsCoalesce` 产生两方向候选；pruning/GMWR feedback 可把被迫分支提交到 A | residual 分支由 `SERSolverAR.encodeRemainingWwChoices()` 以 Boolean guard 编码。 |
 | RW | 同一 WW decision 分支内由固定 WR + 另一 writer 产生；forced 分支提交到 B，residual 分支由同一 guard 激活 | 无独立 RW 重建路径。 |
 | Pred-WR (`PR_WR`) | 主路径初始 `KnownGraph` 不生成 | `SERSolverAR` 的 recorded source / selected frontier 产生 fixed 或 guarded PR_WR；GMWR preprop 可产生 definite typed PR_WR。 |
-| Pred-RW (`PR_RW`) | 主路径初始 `KnownGraph` 不生成 | `LatestVisibleChecker` 产出 source validity，`assertLatestVisible()`、`encodeSelectedPredicateDependencies()` 根据 selected source、later write 和 result delta 产生 guarded PR_RW。 |
+| Pred-RW (`PR_RW`) | 主路径初始 `KnownGraph` 不生成 | `LatestVisibleChecker` 产出 source validity，`encodeRecordedSourceDependencies()`、`encodeSelectedSourceDependencies()` 根据 selected source、later write 和 result delta 产生 guarded PR_RW。 |
 
 ## 5. 普通 WW/RW candidate 与保存结构
 
@@ -150,11 +149,10 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | `serializationGraph` | 唯一 MonoSAT 物理图；承载 logical dependency、WW/source/frontier 比较和已知顺序的 endpoint 约束。 |
 | `serializationEdgeCache` / `comparablePairs` | `(from,to)` serialization theory-edge literal 与已建立 XOR 的无序 pair。 |
 | `wwOrder` | `(writerFrom,writerTo,key) -> Boolean guard`；多个产生路径以 OR 合并。 |
-| `dependencyEdgesA/B` / `GuardedDependencyEdge` | 等待最终物化的 typed logical edge + guard。 |
-| `predicateDependencyAccumulators` | 完整 activation guard 生成后立即按 `(from,to,type)` 合并的 PR_WR/PR_RW；不保留逐 witness candidate对象。 |
+| `dependencyEdgesA/B` / `GuardedDependencyEdge` | 等待最终物化的 typed logical edge + 条件项列表；多个 support 分别以单向子句激活同一边。 |
+| `predicateDependencyAccumulators` | 按 `(from,to,type)` 合并 PR_WR/PR_RW 的 key 与条件项集合；不创建合取 guard 或 support OR 辅助变量。 |
 | `logicalDependenciesByEndpoint` | `(from,to)` 对应的 `SEREdge(type,keys)`；编码后不再保留仅供物化使用的 guard/origin 包装，用于 explanation/debugging/paper description。 |
 | `KeyFrontier` / `FrontierCandidate` | 某 predicate reader/key 的 latest-visible source 候选及 `visible=writer<reader` literal。 |
-| `PredicateCheck` | general query 的 lazy snapshot refinement 记录。 |
 
 关键函数：
 
@@ -162,29 +160,29 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | --- | --- |
 | `encodeRemainingWwChoices()` | 普通 WW/RW 的唯一 SAT 来源：每个 residual `SERConstraint` 创建一个带`A<n>`的`WW_CHOICE` assumption和一个 fresh `Lit forward`；两侧branch guard分别为`A AND forward`与`A AND not(forward)`，branch 中 WW/RW 由同一 guard 激活。 |
 | `registerWwOrder()` / `wwOrderLiteral()` | 建 key-local WW guard；bottom 顺序返回常量；找不到明确 WW guard 时回退到 auxiliary `orderLiteral()`。 |
-| `addDependencyEdge()` | ordinary edge 入 A/B queue；predicate edge 先完成 assumption/source/latest-visible 等 guard 与 legality/dedup，再立即合入 `(from,to,type)` accumulator。 |
-| `flushPredicateDependencies()` | 将已在线合并的 predicate accumulator 排入 A/B；key 集合已合并，guard 为各 witness guard 的 OR。 |
-| `encodeDependencyEdge()` | 先记录 logical metadata，再 assert `guard -> serialization(from,to)`。fixed edge 的 guard 是 `True`。 |
+| `addDependencyEdge()` | ordinary edge 入 A/B queue；predicate edge 保留 assumption/source/latest-visible/WW/context 条件项，常量化简与去重后合入 `(from,to,type)` accumulator。 |
+| `flushPredicateDependencies()` | 将已在线合并的 predicate accumulator 排入 A/B；合并 key 并保留各 witness 的条件项，不物化 OR。 |
+| `encodeDependencyEdge()` | 先记录 logical metadata，再逐 support 提交 `not(term1) OR ... OR serialization(from,to)`；空条件列表表示确定边，不创建 implication 辅助变量。 |
 | `ensureComparable()` / `directSerializationEdge()` | 对实际被请求比较的 pair assert 两方向 serialization edge XOR；不是预先创建全体 pair。 |
 | `encodeSerializationAcyclicity()` | 断言唯一 `serializationGraph` 的 directed acyclicity literal 为 true。 |
-| `solve()` / `solveOnce()` | 将全部assumption literals传给`Solver.solveLimited(assumptions)`或`solve(assumptions)`；SAT model 后执行 general predicate refinement，直到无新 clause、UNSAT 或 TIMEOUT。 |
+| `solve()` / `solveOnce()` | 将全部assumption literals传给`Solver.solveLimited(assumptions)`或`solve(assumptions)`；每次 `solve()` 只调用一次后端，直接返回 SAT/UNSAT/TIMEOUT，无追加子句或重解。 |
 | `extractConflicts()` / `getConflictReasons()` | 直接读取MonoSAT conflict clause，对literal取反后映射到`A<n>`及`WW_CHOICE/PREDICATE_OBLIGATION/GMWR_RULE`原因；旧`getConflicts()`只保留WW/known-edge legacy输出兼容，不再重建solver缩核。 |
 
 ## 8. Predicate / SER 扩展编码索引
 
 | 路径 | 函数 | 作用 |
 | --- | --- | --- |
-| 共享 | `encodePredicateConstraints()` | 每个有效observation先注册`PREDICATE_OBLIGATION` assumption；按 observation 建 result-source map 和 query-scope write index；row-local 分派 EAGER/GMWR，general 路径建 frontiers 和 lazy check，所有直接断言、PR guards和后续no-good均受同一assumption守卫。 |
+| 共享 | `encodePredicateConstraints()` | 每个有效observation先注册`PREDICATE_OBLIGATION` assumption；按 observation 建 result-source map 和 query-scope write index；row-local 分派 EAGER/GMWR，非 row-local 的受支持单调 QueryPlan 显式编码 JOIN bindings；全部约束在求解前生成并受 observation assumption 守卫。 |
 | GMWR | `encodeKnownEdges()` / `encodeResidualGmwr()` | propagation forced fact、propagation conflict及每条materialized residual rule注册`GMWR_RULE` assumption，并以该literal守卫对应order或clause。 |
 | 共享 | `LatestVisibleChecker.check()` | 输入 reader、key、candidate writers 和 serialization order，统一计算 `writer<reader AND` 不存在更晚可见 writer 的 validity。 |
-| 共享 | `createKeyFrontier()` | EAGER 将完整候选交给 checker；GMWR 先做现有 source/reachability/interval 缩减再调用；随后建立 PR_WR/PR_RW 候选。 |
+| 共享 | `createExternalKeyFrontier()` / `createExplicitQueryFrontier()` | 前者处理 row-local 未定来源；后者处理 JOIN frontiers。固定来源由 `assertFixedSourceLatest()` 对全部竞争写直接提交 O(m) latest 子句，JOIN 仅保留单候选 handle。 |
 | 共享 | `encodeSelectedPredicateDependencies()` | selected source guard 激活 PR_WR；`selected AND source<later AND delta` 激活 PR_RW。 |
-| EAGER | `encodeRowLocalPredicateEager()` | recorded source 与 absent frontier 均直接复用 `LatestVisibleChecker`；absent key 对每个 bad visible writer 立即建立完整 blocking disjunction。 |
+| EAGER | `encodeRowLocalPredicateEager()` | recorded source 调用 `encodeFixedPredicateSource()`，不构造 frontier；absent key 由 `encodeAbsentRowLocalKey()` 在唯一来源已确定可见时直接编码，否则调用 checker 并建立 bad-writer blocking disjunction。 |
 | GMWR | `collectGmwrLogicalConstraints()` | row-local absent key 产生 `(reader,badWriter)` GMWR item，repair 是产生空贡献的 good writers；item 显式保留。 |
 | GMWR | `GmwrPropagationState` | `PrecedenceOracle` + obligation/frontier worklist；去除不可能 repair，识别 satisfied/conflict，强制 outside/single repair/unique PR_WR。 |
-| GMWR | `encodeRowLocalPredicateGmwr()` | typed predicate frontier仍 source-aware；absent result 的 Boolean validity clauses由 GMWR obligations 表示。 |
+| GMWR | `encodeRowLocalPredicateGmwr()` | 固定来源直接编码；absent key 保留原 source/interval 缩减，确定可见单候选绕过容器与 checker，其他候选仍 source-aware；absent validity 由 GMWR obligations 表示。 |
 | GMWR | `resolveAndEncodeGmwrObligations()` / `encodeResidualGmwr()` | 未由 checker 决定的每个 item进入 SAT：`reader<bad OR OR(bad<repair AND repair<reader)`。这些是 order literals/Boolean clauses，不直接产生 typed graph edge。 |
-| General | `refineGeneralPredicateConstraints()` | 从 SAT model 选各 key frontier，执行真实 `QueryPlan.evaluate()`；不匹配则加入所选组合的 no-good clause并重新 solve。GMWR monotone case可只取新增 input keys 作 witness。 |
+| JOIN | `encodeExplicitMultiRelationPredicate()` | 求解前枚举 contributing bindings、固定记录来源、排除额外 binding，并生成 context 守卫的 PR_WR/PR_RW。 |
 
 ## 9. MonoSAT 接口与图理论回传
 
@@ -216,7 +214,7 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | `util/Profiler.java` | per-thread tag 的毫秒累计、count 累计；后台每 100 ms 采样 JVM used heap 的最大值。 |
 | `SERVerifier.audit()` | `SER_VERIFY_INT`、`SER_GEN_PREC_GRAPH`、`SER_GEN_CONSTRAINTS`、`WW_REACHABILITY_PRUNE_MS`、`SER_AR_ENCODE`、`SER_AR_SOLVE`、`ONESHOT_*`。 |
 | `SERSolverAR` constructor | 分阶段 `SER_AR_ENCODE_SETUP/KNOWN_EDGES/WW/RW/PREDICATE/DEPENDENCIES/TOTAL_ORDER`。 |
-| `SERSolverAR.solve()` | `SER_MONOSAT_SOLVE`、`SER_AR_PREDICATE_REFINEMENT`、`SER_AR_CONFLICT_EXTRACTION`。 |
+| `SERSolverAR.solve()` | `SER_MONOSAT_SOLVE`、`SER_AR_CONFLICT_EXTRACTION`；旧 refinement 计时已删除。 |
 | `Pruning` / `GmwrPropagationState` | `SER_PRUNE*`、`GMWR_BUILD_MS`、`GMWR_REDUCTION_MS`。 |
 | `publishResidualSatStats()` | residual WW choice 数、`solver.nVars()`、`solver.nClauses()`。 |
 | `PredicateEncodingMetrics.publish()` / `publishGmwrMetrics()` | source/scope/frontier/witness/physical edge/blocking clause/GMWR obligation 与各子阶段耗时。 |
@@ -258,4 +256,4 @@ SER_ACCEPTANCE_EXTENDED=true ./gradlew test --tests verifier.SERAcceptanceSuiteT
 4. `guard -> serializationEdge` 是单向绑定；physical edge literal 不反向等价于某个具体 relation guard。
 5. GMWR residual clause约束 serialization literals；typed PR_WR/PR_RW 元数据由独立 frontier 路径生成。
 6. 生产调用链只消费 reachability 与 GMWR 产生的确定事实。
-7. EAGER/GMWR row-local 的公式可逐项对应；general GMWR 的 monotone witness 缩小 clause 是否在全部 query shape 上等价，需要结合结构判定和差分测试边界说明。当前P0矩阵已把JOIN纳入完整visible-snapshot oracle，但有限小history差分不能替代全局证明。
+7. EAGER/GMWR row-local 公式与显式 JOIN 编码均由独立串行执行 oracle 做差分；旧 snapshot-only 包装、循环后备与 monotone witness 子集已删除。当前测试范围不包含 DISTINCT，有限小 history 差分不能替代全局证明。
