@@ -58,7 +58,7 @@ NO_GMWR --(GMWR + frontier)--> NO_PREPROP --(prepropagation)--> FULL
 - `logs/`：stdout、stderr 和 GNU `time -v` 日志。
 - `runtime/`、`environment.json`、`plan.json`、`worktree.diff`：冻结 classpath/native library 与复现信息。
 
-timeout、OOM、系统内存保护停止和 verdict mismatch 都作为删失结果，不参与运行时间比。只有双方均完成且 verdict 一致的 paired run 才计算 speedup。
+外部进程 timeout、OOM、系统内存保护停止和 verdict mismatch 都作为删失结果，不参与运行时间比。检测器内部不设置求解超时；只有双方均完成且 verdict 一致的 paired run 才计算 speedup。
 
 ## GMWR 与 NO_GMWR 耗时图
 

@@ -42,6 +42,15 @@ class SERSolverARSatEncodingTest {
             new StructuredQueryParser<>(
                     INTEGER_VALUES, RelationResolver.canonicalStringKeys());
 
+    @Test
+    void solveStatusContainsOnlySatAndUnsat() {
+        assertArrayEquals(
+                new SolveStatus[] { SolveStatus.SAT, SolveStatus.UNSAT },
+                SolveStatus.values());
+        assertFalse(java.util.Arrays.stream(SERVerifier.AuditResult.values())
+                .anyMatch(result -> result.name().equals("TIMEOUT")));
+    }
+
     private static History<String, Integer> makeHistory(
             Set<Long> sessions,
             Map<Long, List<Long>> sessionToTxns,
@@ -146,10 +155,10 @@ class SERSolverARSatEncodingTest {
             commitAll(history);
             var graph = new KnownGraph<>(history);
             var settings = SERVerifier.SolverSettings.forModes(mode, SERVerifier.PruningMode.NONE);
-            settings.satSolveBackend = (nativeSolver, remaining, assumptions) -> {
+            settings.satSolveBackend = (nativeSolver, assumptions) -> {
                 calls[0]++;
                 solveStarted[0] = true;
-                return java.util.Optional.of(nativeSolver.solve(assumptions));
+                return nativeSolver.solve(assumptions);
             };
             var solver = new SERSolverAR<>(history, graph,
                     generateConstraints(history, graph), true, true, settings);

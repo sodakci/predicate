@@ -66,7 +66,7 @@ class BlackBoxSERAuditTest {
         assertEquals(0, result.exitCode);
         assertTrue(help.contains("--[no-]gmwr"));
         assertTrue(help.contains("--[no-]gmwr-prepropagation"));
-        assertTrue(help.contains("--solver-timeout-seconds"));
+        assertFalse(help.contains("--solver-timeout-seconds"));
         assertTrue(help.contains("--solver-stats"));
         assertFalse(help.contains("--predicate-encoding"));
         assertFalse(help.contains("--predicate-mode"));

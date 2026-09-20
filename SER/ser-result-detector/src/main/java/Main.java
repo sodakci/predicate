@@ -30,9 +30,6 @@ public class Main implements Callable<Integer> {
 
 @Command(name = "audit", mixinStandardHelpOptions = true, description = "Verify a history")
 class Audit implements Callable<Integer> {
-    @Option(names = { "--solver-timeout-seconds" }, description = "SAT solver timeout in seconds measured from solve(); 0 disables backend timeout")
-    private int solverTimeoutSeconds = 600;
-
     @Option(names = { "--solver-stats" },
             description = "print SAT backend and detailed predicate encoding statistics")
     private final Boolean solverStats = false;
@@ -83,7 +80,6 @@ class Audit implements Callable<Integer> {
         settings.gmwrPrepropagation = gmwrEnabled && prepropagationEnabled;
         settings.predicateWitnessCoalescing = true;
         settings.graphEdgeInterning = true;
-        settings.solverTimeoutSeconds = solverTimeoutSeconds;
         settings.detailedPredicateMetrics = solverStats;
         settings.auditProgressListener = this::printCompletedSection;
         profiler.startTick("ENTIRE_EXPERIMENT");
@@ -112,8 +108,6 @@ class Audit implements Callable<Integer> {
                     settings.predicateWitnessCoalescing);
             System.err.printf("[solver-stats] graph-edge-interning=%s%n",
                     settings.graphEdgeInterning);
-            System.err.printf("[solver-stats] solver-timeout-seconds=%d%n",
-                    settings.solverTimeoutSeconds);
             System.err.printf("Max memory: %s%n",
                     Utils.formatMemory(profiler.getMaxMemory()));
             System.err.println(result.marker);

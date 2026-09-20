@@ -70,7 +70,7 @@ METRICS = [
     "SER_PROP_MONOSAT_CONFLICTS_COUNT",
     "SER_PRECEDENCE_RELATIONS_COUNT",
 ]
-TIMEOUTS = {"SOLVER_TIMEOUT", "PROCESS_TIMEOUT"}
+TIMEOUTS = {"PROCESS_TIMEOUT"}
 METRIC_RE = re.compile(r"^([A-Z][A-Z0-9_]*):\s+([0-9]+)(?:ms)?\s*$")
 MAX_MEMORY_RE = re.compile(r"^Max memory:\s+(.+?)\s*$")
 MAX_RSS_RE = re.compile(r"Maximum resident set size \(kbytes\):\s*(\d+)")
@@ -164,8 +164,7 @@ def select_histories(normal_root, percent_root, history_name):
     return result
 
 
-def build_command(config, *, java, heap, native_dir, classpath, history,
-                  solver_seconds):
+def build_command(config, *, java, heap, native_dir, classpath, history):
     gmwr, prepropagation = CONFIGS[config]
     return [
         java,
@@ -177,7 +176,6 @@ def build_command(config, *, java, heap, native_dir, classpath, history,
         ("--gmwr-prepropagation" if prepropagation
          else "--no-gmwr-prepropagation"),
         "--solver-stats",
-        "--solver-timeout-seconds", str(solver_seconds),
         str(history),
     ]
 
@@ -187,8 +185,6 @@ def parse_stderr(text):
         verdict = "ACCEPT"
     elif "SER audit result: REJECT" in text or "[[[[ REJECT ]]]]" in text:
         verdict = "REJECT"
-    elif "SER audit result: TIMEOUT" in text or "[[[[ TIMEOUT ]]]]" in text:
-        verdict = "TIMEOUT"
     elif "[[[[ INVALID_HISTORY ]]]]" in text:
         verdict = "INVALID_HISTORY"
     else:
@@ -215,8 +211,6 @@ def parse_result(stderr, returncode, reason):
         status = "JAVA_OOM"
     elif reason == "PROCESS_TIMEOUT":
         status = "PROCESS_TIMEOUT"
-    elif verdict == "TIMEOUT":
-        status = "SOLVER_TIMEOUT"
     elif verdict in ("ACCEPT", "REJECT"):
         status = "COMPLETE"
     elif verdict == "INVALID_HISTORY":
@@ -585,7 +579,6 @@ def parse_args(argv=None):
     )
     parser.add_argument("--heap", default="3g")
     parser.add_argument("--java", default="java")
-    parser.add_argument("--solver-timeout-seconds", type=int, default=90)
     parser.add_argument("--process-timeout-seconds", type=float, default=240)
     parser.add_argument("--min-available-memory-mb", type=float, default=1536)
     parser.add_argument("--plan-only", action="store_true")
@@ -596,8 +589,8 @@ def parse_args(argv=None):
 def validate_args(args):
     if args.repeats < 1:
         raise ValueError("--repeats must be at least 1")
-    if args.process_timeout_seconds <= 0 or args.solver_timeout_seconds <= 0:
-        raise ValueError("timeouts must be positive")
+    if args.process_timeout_seconds <= 0:
+        raise ValueError("--process-timeout-seconds must be positive")
     if len(set(args.configs)) != len(args.configs):
         raise ValueError("--configs must not contain duplicates")
 
@@ -674,7 +667,6 @@ def main(argv=None):
                     native_dir=runtime["native_dir"],
                     classpath=runtime["runtime_classpath"],
                     history=case["history"],
-                    solver_seconds=args.solver_timeout_seconds,
                 )
                 result = run_process(
                     command,

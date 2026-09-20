@@ -91,7 +91,6 @@ class SERCycleStructureAuditTest {
         eagerRaw.predicateWitnessCoalescing = false;
         eagerRaw.graphEdgeInterning = false;
         eagerRaw.gmwrPrepropagation = false;
-        eagerRaw.solverTimeoutSeconds = 30;
 
         var eagerCompressed = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.EAGER,
@@ -99,7 +98,6 @@ class SERCycleStructureAuditTest {
         eagerCompressed.predicateWitnessCoalescing = true;
         eagerCompressed.graphEdgeInterning = true;
         eagerCompressed.gmwrPrepropagation = false;
-        eagerCompressed.solverTimeoutSeconds = 30;
 
         var gmwrRaw = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.GMWR,
@@ -107,7 +105,6 @@ class SERCycleStructureAuditTest {
         gmwrRaw.predicateWitnessCoalescing = false;
         gmwrRaw.graphEdgeInterning = false;
         gmwrRaw.gmwrPrepropagation = false;
-        gmwrRaw.solverTimeoutSeconds = 30;
 
         var gmwrOptimized = SERVerifier.SolverSettings.forModes(
                 SERVerifier.PredicateSolvingMode.GMWR,
@@ -115,7 +112,6 @@ class SERCycleStructureAuditTest {
         gmwrOptimized.predicateWitnessCoalescing = true;
         gmwrOptimized.graphEdgeInterning = true;
         gmwrOptimized.gmwrPrepropagation = true;
-        gmwrOptimized.solverTimeoutSeconds = 30;
         return List.of(eagerRaw, eagerCompressed, gmwrRaw, gmwrOptimized);
     }
 

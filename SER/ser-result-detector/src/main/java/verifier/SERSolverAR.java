@@ -59,8 +59,6 @@ class SERSolverAR<KeyType, ValueType> {
     private final PrecedenceOracle<Transaction<KeyType, ValueType>> precedence;
     private final LatestVisibleChecker<KeyType, ValueType> latestVisibleChecker =
             new LatestVisibleChecker<>();
-    private boolean solverTimedOut;
-
     private final List<Transaction<KeyType, ValueType>> txns;
     private final Map<Transaction<KeyType, ValueType>, Integer> txnIndex;
     private KnownOrder knownOrder;
@@ -292,19 +290,15 @@ class SERSolverAR<KeyType, ValueType> {
     /**
      * Solves the typed dependency encoding under registered assumptions. On
      * UNSAT, MonoSAT's conflict clause is mapped directly to logical reasons.
-     * Timeout is a distinct status and never reported as UNSAT.
      */
     SolveStatus solve() {
         var profiler = Profiler.getInstance();
-        var sat = profileBooleanOptional(profiler, "SER_MONOSAT_SOLVE", this::solveOnce);
-        solverTimedOut = sat == null;
+        var sat = profileBoolean(profiler, "SER_MONOSAT_SOLVE", this::solveOnce);
         conflictEdges = Collections.emptyList();
         conflictConstraints = Collections.emptyList();
         conflictReasons = Collections.emptyList();
         final SolveStatus status;
-        if (solverTimedOut) {
-            status = SolveStatus.TIMEOUT;
-        } else if (sat) {
+        if (sat) {
             status = SolveStatus.SAT;
         } else {
             if (collectConflicts) {
@@ -316,30 +310,19 @@ class SERSolverAR<KeyType, ValueType> {
         return status;
     }
 
-    boolean timedOut() {
-        return solverTimedOut;
-    }
-
-    private Boolean solveOnce() {
-        int timeoutSeconds = Math.max(0, settings.solverTimeoutSeconds);
+    private boolean solveOnce() {
         var backend = settings.satSolveBackend;
         if (backend != null) {
-            return backend.solve(
-                    solver, timeoutSeconds, assumptionLiterals).orElse(null);
-        }
-        if (timeoutSeconds > 0) {
-            solver.setTimeLimit(timeoutSeconds);
-            var result = solver.solveLimited(assumptionLiterals);
-            return result.isPresent() ? result.get() : null;
+            return backend.solve(solver, assumptionLiterals);
         }
         return solver.solve(assumptionLiterals);
     }
 
-    private static Boolean profileBooleanOptional(
-            Profiler profiler, String tag, java.util.function.Supplier<Boolean> action) {
+    private static boolean profileBoolean(
+            Profiler profiler, String tag, java.util.function.BooleanSupplier action) {
         profiler.startTick(tag);
         try {
-            return action.get();
+            return action.getAsBoolean();
         } finally {
             profiler.endTick(tag);
         }

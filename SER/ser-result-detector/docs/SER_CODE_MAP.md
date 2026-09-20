@@ -12,7 +12,7 @@
 | precedence primitive | `SER/ser-result-detector/src/main/java/verifier/PrecedenceOracle.java` | `before/successor/predecessor/wouldCycle` | 唯一 Java precedence engine；统一维护增量传递闭包和批量 branch 成环预判。 |
 | 求解入口 | `SER/ser-result-detector/src/main/java/verifier/SERSolverAR.java` | 构造函数；`solve()`；`solveOnce()` | 构造 logical dependency layer + 唯一 MonoSAT serialization graph；构造前验证查询范围；完整编码后仅调用一次 MonoSAT。 |
 | latest-visible primitive | `SER/ser-result-detector/src/main/java/verifier/LatestVisibleChecker.java` | `check(reader,key,candidateWriters,serializationOrder)` | 为未确定的来源返回 visible literal 与 latest-writer validity；固定来源和 row-local 确定可见单候选绕过通用 checker。 |
-| verdict | `SERVerifier.AuditResult` | `ACCEPT/REJECT/TIMEOUT/INVALID_HISTORY` | `SAT -> ACCEPT(0)`；`UNSAT` 或 checker 提前冲突 -> `REJECT(-1)`；超时 -> `TIMEOUT(124)`。`INVALID_HISTORY(2)` 在当前 `audit()` 路径中没有显式转换点。 |
+| verdict | `SERVerifier.AuditResult` | `ACCEPT/REJECT/INVALID_HISTORY` | `SAT -> ACCEPT(0)`；`UNSAT` 或 checker 提前冲突 -> `REJECT(-1)`。`INVALID_HISTORY(2)` 在当前 `audit()` 路径中没有显式转换点。 |
 
 主调用链：
 
@@ -165,7 +165,7 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | `encodeDependencyEdge()` | 先记录 logical metadata，再逐 support 提交 `not(term1) OR ... OR serialization(from,to)`；空条件列表表示确定边，不创建 implication 辅助变量。 |
 | `ensureComparable()` / `directSerializationEdge()` | 对实际被请求比较的 pair assert 两方向 serialization edge XOR；不是预先创建全体 pair。 |
 | `encodeSerializationAcyclicity()` | 断言唯一 `serializationGraph` 的 directed acyclicity literal 为 true。 |
-| `solve()` / `solveOnce()` | 将全部assumption literals传给`Solver.solveLimited(assumptions)`或`solve(assumptions)`；每次 `solve()` 只调用一次后端，直接返回 SAT/UNSAT/TIMEOUT，无追加子句或重解。 |
+| `solve()` / `solveOnce()` | 将全部 assumption literals 传给 `Solver.solve(assumptions)`；每次 `solve()` 只调用一次后端，直接返回 SAT/UNSAT，无追加子句、内部超时或重解。 |
 | `extractConflicts()` / `getConflictReasons()` | 直接读取MonoSAT conflict clause，对literal取反后映射到`A<n>`及`WW_CHOICE/PREDICATE_OBLIGATION/GMWR_RULE`原因；旧`getConflicts()`只保留WW/known-edge legacy输出兼容，不再重建solver缩核。 |
 
 ## 8. Predicate / SER 扩展编码索引
@@ -202,10 +202,9 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | --- | --- | --- |
 | `--[no-]gmwr` | 开 | 同时控制 GMWR formulation 与普通/absent-key frontier 剪枝；关闭时使用 EAGER。 |
 | `--[no-]gmwr-prepropagation` | 开 | 控制 GMWR SAT 编码前传播；仅在 GMWR 开启时有效。 |
-| `--solver-timeout-seconds` | 600 | `SERSolverAR.solveOnce()`。 |
 | `--solver-stats` | false | detailed predicate counts和配置输出。 |
 
-生产 CLI 不再解析 `--predicate-encoding`、`--ww-pruning`、witness coalescing 或 graph-edge interning 开关。WW reachability、predicate witness coalescing 和 graph-edge interning 固定开启；内部 `SolverSettings` 只为嵌入和差分测试保留细粒度字段。
+生产 CLI 不再解析 `--predicate-encoding`、`--ww-pruning`、`--solver-timeout-seconds`、witness coalescing 或 graph-edge interning 开关。WW reachability、predicate witness coalescing 和 graph-edge interning 固定开启；检测器内部不设置求解超时，实验时限由外部 runner 控制。内部 `SolverSettings` 只为嵌入和差分测试保留细粒度字段。
 
 ## 11. Statistics / timing / debug 索引
 

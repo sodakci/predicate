@@ -13,7 +13,7 @@ PRHIST
   -> 可选 GMWR prepropagation
   -> residual Boolean clauses + 唯一 serializationGraph
   -> MonoSAT acyclicity（单次求解）
-  -> ACCEPT / REJECT / TIMEOUT
+  -> ACCEPT / REJECT
 ```
 
 必须区分三层对象：
@@ -44,7 +44,7 @@ history 中的读写事实
 | `--[no-]gmwr` | 开 | 同时控制 GMWR formulation 与 frontier pruning；关闭时走 EAGER。 |
 | `--[no-]gmwr-prepropagation` | 开 | 控制 GMWR obligation 在 SAT 编码前的确定性传播；关闭 GMWR 时不生效。 |
 
-solver timeout 和 stats 是运维参数，不属于算法消融。
+检测器内部不设置求解超时；实验时间上限由外部 runner 的进程超时控制。stats 是运维参数，不属于算法消融。
 
 生产 CLI 不再解析 WW pruning、predicate encoding、witness coalescing、edge interning、bundle 或 propagation mode 的旧参数。对应的细粒度 Java 字段仅保留给内部差分测试和嵌入调用。
 
@@ -181,7 +181,7 @@ row-local PR_RW 仍要求来源成立、对应 WW 成立且写入改变谓词结
 
 声明 `isRowLocal()` 的谓词统一进入 EAGER/GMWR 完整编码，包括程序构造的逐行谓词。非 row-local 的单调 `QueryPlan`（当前受支持 JOIN）在求解前枚举产生结果的 binding，固定 recorded sources、排除额外 binding 并生成 PR_WR/PR_RW；所有约束保留 observation assumption。
 
-`solve()` 仅调用一次 MonoSAT：SAT 返回 ACCEPT，UNSAT 提取 conflict reasons 并返回 REJECT，backend 超时返回 TIMEOUT。solver timeout 直接传给这一次后端调用，不再维护跨轮 deadline。旧快照组合记录、model refinement、no-good 追加和 monotone witness 后备分支已删除。
+`solve()` 仅调用一次 MonoSAT：SAT 返回 ACCEPT，UNSAT 提取 conflict reasons 并返回 REJECT。检测器不设置 backend timeout，也不维护 deadline；需要限制实验时长时，由 runner 在进程外终止运行。旧快照组合记录、model refinement、no-good 追加和 monotone witness 后备分支已删除。
 
 ## 11. 性能归因
 

@@ -39,7 +39,7 @@ class GmwrPlotTest(unittest.TestCase):
 
         # These rows must not influence controlled, paired medians.
         add("20_100_15_5000_0.20_uniform", "FULL", 999999,
-            repeat=2, status="SOLVER_TIMEOUT")
+            repeat=2, status="PROCESS_TIMEOUT")
         add("20_100_15_5000_0.20_uniform", "FULL", 999999,
             repeat=3, family="test-ser%")
         add("20_50_10_5000_0.20_uniform", "FULL", 10)
@@ -104,7 +104,7 @@ class GmwrPlotTest(unittest.TestCase):
                     "family": "test-ser",
                     "dataset": "20_100_15_5000_0.20_uniform",
                     "config": "FULL",
-                    "status": "SOLVER_TIMEOUT",
+                    "status": "PROCESS_TIMEOUT",
                     "ENTIRE_EXPERIMENT": "90000",
                 })
 

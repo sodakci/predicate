@@ -65,7 +65,6 @@ class AccelerationRunnerTest(unittest.TestCase):
             native_dir=Path("/native"),
             classpath="/classes:/lib/a.jar",
             history=Path("/history"),
-            solver_seconds=90,
         )
         full = self.runner.build_command("FULL", **args)
         no_preprop = self.runner.build_command("NO_PREPROP", **args)
@@ -80,6 +79,7 @@ class AccelerationRunnerTest(unittest.TestCase):
             [("--gmwr", "--no-gmwr")],
         )
         for command in (full, no_preprop, no_gmwr):
+            self.assertNotIn("--solver-timeout-seconds", command)
             self.assertNotIn("--predicate-encoding", command)
             self.assertNotIn("--ww-pruning", command)
 
@@ -100,7 +100,7 @@ class AccelerationRunnerTest(unittest.TestCase):
         rows = [
             self.row("FULL", case="timeout"),
             self.row("NO_PREPROP", case="timeout"),
-            self.row("NO_GMWR", case="timeout", status="SOLVER_TIMEOUT"),
+            self.row("NO_GMWR", case="timeout", status="PROCESS_TIMEOUT"),
             self.row("FULL", case="memory"),
             self.row("NO_PREPROP", case="memory"),
             self.row("NO_GMWR", case="memory", status="RESOURCE_STOP"),

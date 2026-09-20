@@ -10,6 +10,22 @@
 
 单表与多表谓词读的共同可见性、结果比较及单表加速边界见 [PREDICATE_SEMANTICS.md](PREDICATE_SEMANTICS.md)。
 
+## 核心流程（维护基线）
+
+```text
+CheckSER(H)
+   ├─ VerifyInternalConsistency(H)
+   ├─ G ← CreateKnownGraph(H)
+   ├─ P ← CreatePrecedenceOracle(H)
+   ├─ C ← GenerateConstraintsSER(H, G)
+   ├─ PruneWWByReachability(G, C, P)
+   ├─ R ← PredicatePruning(H, G, P)
+   ├─ SAT-Encode(H, G, C, P, R)
+   └─ MonoSAT-Solve() × 1
+```
+
+该流程作为项目报告和后续维护的核心基线：流程阶段、输入输出或求解次数发生变化时，必须同步更新本节。当前独立谓词剪枝改造尚未实施完成，`R` 的构造与传播仍位于 `SERSolverAR` 构造阶段；实施计划见仓库根目录 `docs/superpowers/plans/2026-09-20-ser-independent-predicate-pruning.md`。检测器核心只返回 SAT/UNSAT，实验时间限制由外部 runner 的进程超时负责。
+
 ## 1. 先给出结论
 
 当前实现有三层对象，必须分开理解：
@@ -57,7 +73,6 @@ SER detector 读取一段 PRHIST 事务历史，判断是否存在一个能够�
 ```text
 SER audit result: ACCEPT
 SER audit result: REJECT
-SER audit result: TIMEOUT
 ```
 
 普通 `audit` 按阶段流式输出精简的 History、WW、可选 GMWR、Predicate、SAT 和 Timing 摘要，隐藏逐轮 pruning、progress bar、bridge epoch 与原始 counter。EAGER 省略 GMWR section 和 WW 第三项。`--solver-stats` 在摘要后输出完整 profiler metrics/counters、求解配置及兼容旧 runner 的 `[[[[ ... ]]]]` 标记；`SER audit result: ...` 始终是最后一行。
@@ -197,7 +212,7 @@ PRHIST
        DEPENDENCIES
        TOTAL_ORDER
   -> 单次 solve
-  -> ACCEPT、REJECT 或 TIMEOUT
+  -> ACCEPT 或 REJECT
 ```
 
 ### 5.1 `KnownGraph`：收集确定事实
@@ -664,7 +679,6 @@ GMWR prepropagation            true
 predicate witness coalescing   true
 graph-edge interning           true
 solver                         monosat
-solver timeout                 600 seconds
 detailed solver stats          false
 ```
 
@@ -697,10 +711,9 @@ NO_GMWR --(GMWR + frontier)--> NO_PREPROP --(prepropagation)--> FULL
 
 | CLI | 默认 | 作用 |
 | --- | --- | --- |
-| `--solver-timeout-seconds=600` | 600 秒 | 从 `solve()` 开始限制 MonoSAT 时间；`0` 表示不设 backend timeout。 |
 | `--solver-stats` | 关 | 输出 SAT、GMWR、frontier、物理边与内存统计，不改变公式。 |
 
-生产 CLI 已删除 predicate encoding、WW pruning、witness coalescing、edge interning、bundle 和 propagation mode 的旧参数。完整消融由 `tools/run_ser_acceleration_ablation.py` 统一执行。
+生产 CLI 已删除 predicate encoding、WW pruning、solver timeout、witness coalescing、edge interning、bundle 和 propagation mode 的旧参数。检测器内部不设置求解时限；完整消融及外部进程超时由 `tools/run_ser_acceleration_ablation.py` 统一执行。
 
 ## 11. 完整例子
 
@@ -762,7 +775,7 @@ g3 -> E(B,A)
 
 任何有限无环偏序都可以拓扑扩展成严格全序，因此这样的模型对应一个合法串行解释。
 
-`REJECT` 表示内部一致性直接矛盾、pruning 已证明冲突，或者不存在同时满足上述条件的模型。`TIMEOUT` 与 `REJECT` 分开返回，不会把求解超时误报为不可串行化。
+`REJECT` 表示内部一致性直接矛盾、pruning 已证明冲突，或者不存在同时满足上述条件的模型。检测器只返回 SAT/UNSAT 对应的 ACCEPT/REJECT；实验超时属于外部 runner 状态，不属于检测器 verdict。
 
 ## 13. 关键实现位置
 

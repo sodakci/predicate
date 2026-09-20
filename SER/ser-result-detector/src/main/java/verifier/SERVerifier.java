@@ -33,7 +33,6 @@ public class SERVerifier<KeyType, ValueType> {
     public enum AuditResult {
         ACCEPT(0, "[[[[ ACCEPT ]]]]"),
         REJECT(-1, "[[[[ REJECT ]]]]"),
-        TIMEOUT(124, "[[[[ TIMEOUT ]]]]"),
         INVALID_HISTORY(2, "[[[[ INVALID_HISTORY ]]]]");
 
         public final int exitCode;
@@ -53,20 +52,16 @@ public class SERVerifier<KeyType, ValueType> {
     }
 
     /**
-     * Injectable SAT backend used by {@link SERSolverAR}. Tests supply a mock
-     * that returns empty to simulate timeout without calling MonoSAT.
+     * Injectable SAT backend used by {@link SERSolverAR}.
      */
     @FunctionalInterface
     public interface SatSolveBackend {
         /**
-         * @param remainingSeconds {@code <= 0} means unlimited
          * @param assumptions logical obligations enabled for this solve
-         * @return {@code Optional.of(true)} SAT, {@code Optional.of(false)} UNSAT,
-         *         empty TIMEOUT
+         * @return {@code true} for SAT, {@code false} for UNSAT
          */
-        java.util.Optional<Boolean> solve(
+        boolean solve(
                 monosat.Solver solver,
-                int remainingSeconds,
                 Collection<monosat.Lit> assumptions);
     }
 
@@ -77,7 +72,6 @@ public class SERVerifier<KeyType, ValueType> {
         public boolean gmwrPrepropagation = true;
         public boolean predicateWitnessCoalescing = true;
         public boolean graphEdgeInterning = true;
-        public int solverTimeoutSeconds;
         public boolean detailedPredicateMetrics;
         public SatSolveBackend satSolveBackend;
         public Consumer<AuditStage> auditProgressListener = ignored -> { };
@@ -245,9 +239,6 @@ public class SERVerifier<KeyType, ValueType> {
         }
         profiler.endTick("ONESHOT_SOLVE");
 
-        if (status == SolveStatus.TIMEOUT) {
-            return AuditResult.TIMEOUT;
-        }
         if (status == SolveStatus.UNSAT) {
             emitRejectDiagnostics(
                     graph, constraints, solver.getConflicts(),

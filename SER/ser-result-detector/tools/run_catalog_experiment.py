@@ -38,8 +38,6 @@ def parse_stderr(text: str):
         verdict = "ACCEPT"
     elif "SER audit result: REJECT" in text or "[[[[ REJECT ]]]]" in text:
         verdict = "REJECT"
-    elif "SER audit result: TIMEOUT" in text or "[[[[ TIMEOUT ]]]]" in text:
-        verdict = "TIMEOUT"
     elif "[[[[ INVALID_HISTORY ]]]]" in text:
         verdict = "INVALID_HISTORY"
     else:
@@ -231,8 +229,6 @@ def run_case(case: Dict[str, Any], args: argparse.Namespace, output_root: pathli
         "-jar",
         str(args.jar),
         "audit",
-        "--solver-timeout-seconds",
-        str(args.solver_timeout_seconds),
         "--gmwr" if args.gmwr else "--no-gmwr",
     ]
     if args.solver_stats:
@@ -340,8 +336,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Extra JVM option; repeat for multiple options")
     parser.add_argument("--monosat-native-dir", type=pathlib.Path, default=DEFAULT_MONOSAT_NATIVE_DIR,
                         help="Directory containing MonoSAT native library, e.g. libmonosat.so")
-    parser.add_argument("--solver-timeout-seconds", type=int, default=1800,
-                        help="Timeout passed to the solver backend")
     parser.add_argument("--timeout-seconds", type=int, default=2100,
                         help="Wall-clock timeout per case enforced by this runner")
     parser.add_argument("--gmwr", action=argparse.BooleanOptionalAction, default=True,
@@ -390,7 +384,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         "heap": args.heap,
         "stack": args.stack,
         "jvm_opt": args.jvm_opt,
-        "solver_timeout_seconds": args.solver_timeout_seconds,
         "runner_timeout_seconds": args.timeout_seconds,
         "gmwr": args.gmwr,
         "solver_stats": args.solver_stats,

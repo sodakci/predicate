@@ -1,10 +1,7 @@
 package verifier;
 
-/**
- * Three-state SAT outcome. Timeout is never represented as UNSAT.
- */
+/** Binary SAT outcome returned by the detector's single MonoSAT call. */
 public enum SolveStatus {
     SAT,
-    UNSAT,
-    TIMEOUT
+    UNSAT
 }
