@@ -49,14 +49,6 @@ public final class QueryAst {
             return result;
         }
 
-        public String relation() {
-            return relation;
-        }
-
-        public String alias() {
-            return alias;
-        }
-
         @Override
         public String toString() {
             return "SCAN(" + relation + " AS " + alias + ")";
@@ -369,12 +361,6 @@ public final class QueryAst {
             return expressions.get(0);
         }
         return new AndExpression<>(expressions);
-    }
-
-    static Set<String> aliases(String... aliases) {
-        var result = new LinkedHashSet<String>();
-        Collections.addAll(result, aliases);
-        return result;
     }
 
     static boolean isRowLocal(RelationalNode<?, ?> node) {

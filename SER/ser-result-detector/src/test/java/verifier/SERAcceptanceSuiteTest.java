@@ -247,7 +247,7 @@ class SERAcceptanceSuiteTest {
                     history.getTransactions());
             var reachability = new Pruning<String, Integer>(oracle);
             var propagation = new GmwrPropagationState<>(history, graph, oracle);
-            var solver = new SERSolverAR<>(history, graph, List.of(), true, false,
+            var solver = PredicateSolverTestSupport.preparedSolver(history, graph, List.of(), true, false,
                     settings(SERVerifier.PredicateSolvingMode.GMWR,
                             SERVerifier.PruningMode.REACHABILITY), oracle);
 
@@ -620,9 +620,8 @@ class SERAcceptanceSuiteTest {
             History<String, Integer> history,
             SERVerifier.SolverSettings solverSettings) {
         var graph = new KnownGraph<>(history);
-        return new SERSolverAR<>(history, graph,
-                SERVerifier.generateConstraintsSER(history, graph),
-                true, false, solverSettings).solve();
+        return PredicateSolverTestSupport.solve(history, graph,
+                SERVerifier.generateConstraintsSER(history, graph), solverSettings);
     }
 
     private static SERVerifier.SolverSettings settings(

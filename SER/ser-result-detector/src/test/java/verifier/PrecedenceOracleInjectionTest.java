@@ -20,12 +20,17 @@ class PrecedenceOracleInjectionTest {
         var oracle = new PrecedenceOracle<Transaction<String, Integer>>(
                 history.getTransactions());
         var reachability = new Pruning<String, Integer>(oracle);
+        var settings = SERVerifier.SolverSettings.forModes(
+                SERVerifier.PredicateSolvingMode.GMWR, SERVerifier.PruningMode.NONE);
+        var predicateResult = new PredicatePruning<>(history, graph, oracle, settings,
+                new PredicateAnalysis<>(graph, oracle)).prune();
         var propagation = new GmwrPropagationState<>(history, graph, oracle);
         var solver = new SERSolverAR<>(history, graph, List.of(), true, false,
-                eagerSettings(), oracle);
+                settings, oracle, predicateResult);
 
         assertSame(oracle, reachability.precedenceOracle());
         assertSame(oracle, propagation.precedenceOracle());
+        assertSame(oracle, predicateResult.precedenceOracle());
         assertSame(oracle, solver.precedenceOracle());
 
         var first = history.getTransaction(1L);
@@ -49,7 +54,7 @@ class PrecedenceOracleInjectionTest {
                 List.of(new SEREdge<>(second, first, EdgeType.WW, "k")),
                 first, second, 0);
 
-        new SERSolverAR<>(history, graph, List.of(constraint), true, false,
+        PredicateSolverTestSupport.preparedSolver(history, graph, List.of(constraint), true, false,
                 eagerSettings(), oracle);
 
         assertFalse(oracle.before(first, second));

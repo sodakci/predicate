@@ -24,7 +24,7 @@ CheckSER(H)
    └─ MonoSAT-Solve() × 1
 ```
 
-该流程作为项目报告和后续维护的核心基线：流程阶段、输入输出或求解次数发生变化时，必须同步更新本节。当前独立谓词剪枝改造尚未实施完成，`R` 的构造与传播仍位于 `SERSolverAR` 构造阶段；实施计划见仓库根目录 `docs/superpowers/plans/2026-09-20-ser-independent-predicate-pruning.md`。检测器核心只返回 SAT/UNSAT，实验时间限制由外部 runner 的进程超时负责。
+该流程作为项目报告和后续维护的核心基线：流程阶段、输入输出或求解次数发生变化时，必须同步更新本节。`SERVerifier.audit()` 已按此顺序编排：WW 剪枝由 `Pruning.java` 负责，谓词剪枝由独立文件 `PredicatePruning.java` 负责；`R` 是 `PredicatePruning.Result`，携带共享分析、已准备的 observation/逐 key 来源候选域、确定事实、残余 item 快照及冲突原因，显式传入 `SERSolverAR`。确定性剪枝冲突直接 REJECT，不构造 MonoSAT；图中的一次求解指通过剪枝后进入 SAT 的路径。检测器核心只返回 SAT/UNSAT，实验时间限制由外部 runner 的进程超时负责。
 
 ## 1. 先给出结论
 
@@ -75,7 +75,7 @@ SER audit result: ACCEPT
 SER audit result: REJECT
 ```
 
-普通 `audit` 按阶段流式输出精简的 History、WW、可选 GMWR、Predicate、SAT 和 Timing 摘要，隐藏逐轮 pruning、progress bar、bridge epoch 与原始 counter。EAGER 省略 GMWR section 和 WW 第三项。`--solver-stats` 在摘要后输出完整 profiler metrics/counters、求解配置及兼容旧 runner 的 `[[[[ ... ]]]]` 标记；`SER audit result: ...` 始终是最后一行。
+普通 `audit` 按阶段流式输出精简的 History、WW、可选 GMWR、SAT 和 Timing 摘要，隐藏逐轮 pruning、progress bar、bridge epoch 与原始 counter。EAGER 省略 GMWR section 和 WW 第三项。`--solver-stats` 额外显示 Predicate 统计段，并在摘要后输出完整 profiler metrics/counters、求解配置及兼容旧 runner 的 `[[[[ ... ]]]]` 标记；`SER audit result: ...` 始终是最后一行。
 
 当前实现使用定理 33 对应的 Adya 风格依赖关系：
 
@@ -201,16 +201,18 @@ PRHIST
   -> History
   -> verifyInternalConsistency
   -> KnownGraph
+  -> CreatePrecedenceOracle（共享 P）
   -> generateConstraintsSER
-  -> WW reachability（默认；实验可设 NONE）
-  -> SERSolverAR
+  -> WW reachability（Pruning.java；内部测试可设 NONE）
+  -> PredicateAnalysis（共享写索引、谓词语义）
+  -> PredicatePruning.prune（逐 key 分析、GMWR 传播、来源/区间剪枝、残余整理；冲突提前 REJECT）
+  -> SERSolverAR（接收 P 和 R）
        SETUP
        KNOWN_EDGES
-       WW
-       RW
+       WW（同时编码分支内 RW）
        PREDICATE
        DEPENDENCIES
-       TOTAL_ORDER
+       ACYCLIC
   -> 单次 solve
   -> ACCEPT 或 REJECT
 ```
@@ -252,7 +254,7 @@ pruning 只提前物化已经被已知可达性唯一决定的分支；未决分
 
 | 阶段 | 方法 | 作用 |
 | --- | --- | --- |
-| SETUP | 构造函数前半段 | 建唯一 `serializationGraph`、写索引、传播状态和已知闭包 |
+| SETUP | 构造函数前半段 | 接收已准备的 `PredicatePruning.Result`，复用写索引、已准备的来源候选域和残余 item，创建唯一 `serializationGraph` 并计算已知顺序约简 |
 | KNOWN_EDGES | `encodeKnownEdges` | 保留已知 typed metadata，并将已知顺序的传递约简加入 serialization graph |
 | WW/RW | `encodeRemainingWwChoices` | 每个残余 `SERConstraint` 建一个正反 WW decision literal，选中分支同时激活其 `WW` 和 `RW` |
 | PREDICATE | `encodePredicateConstraints` | 建 frontier、结果约束以及 guarded `PR_WR/PR_RW` |
@@ -261,11 +263,11 @@ pruning 只提前物化已经被已知可达性唯一决定的分支；未决分
 
 `encodeKnownTypedEdges` 会把 `SO/WR/WW/RW/PR_WR/PR_RW` 保留为 logical dependency metadata，它们的端点方向与已知顺序的传递约简共同进入 `serializationGraph`。
 
-Java checker侧的确定性precedence查询统一由 `PrecedenceOracle`提供：`before(a,b)`、`successor(a)`、`predecessor(b)`、`wouldCycle(a,b)`。`SERVerifier`为每次audit创建唯一实例，先将它交给WW reachability完成确定性WW/RW剪枝，再通过constructor injection交给solver和GMWR propagation；后续阶段消费baseline发布的确定事实，但GMWR不再反向固定残余WW choice。MonoSAT的residual WW、frontier和order decision variables不进入oracle。
+Java checker侧的确定性precedence查询统一由 `PrecedenceOracle`提供：`before(a,b)`、`successor(a)`、`predecessor(b)`、`wouldCycle(a,b)`。`SERVerifier`为每次audit创建唯一实例，先将它交给WW reachability完成确定性WW/RW剪枝，再交给独立 `PredicatePruning` 完成 GMWR 预处理，最后将共享 oracle 与结果注入 `SERSolverAR`；后续阶段消费baseline发布的确定事实，但GMWR不再反向固定残余WW choice。MonoSAT的residual WW、frontier和order decision variables不进入oracle。
 
 ### 5.4 谓词边如何产生
 
-对谓词读事务 `R` 和 external key `k`，统一 primitive `LatestVisibleChecker` 接收 `(reader, key, candidate writers, serialization order)`，返回每个候选 writer 的 visible literal 和 latest-writer validity。EAGER 直接传完整候选集；GMWR 先按已有 source/reachability/PR_RW-cycle/known interval 规则减少候选，再调用同一个 checker。
+对谓词读事务 `R` 和 external key `k`，统一 primitive `LatestVisibleChecker` 接收 `(reader, key, candidate writers, serialization order)`，返回每个候选 writer 的 visible literal 和 latest-writer validity。EAGER 消费独立阶段准备的完整候选集；GMWR 消费该阶段按 source/reachability/PR_RW-cycle/known interval 规则缩减的候选集。两者共用 `encodeRowLocalPredicate()` 和同一个 checker，编码器不再重新分析 absent key 或裁剪来源候选域。
 
 候选 source `S` 的选择条件可以概括为：
 
@@ -305,6 +307,10 @@ selected(S,R,k) AND beforeWrite(S,U)
 row-local 查询逐 key 完整编码；受支持的非 row-local 单调 `QueryPlan`（包括 JOIN）在求解前枚举 contributing bindings，固定记录来源、排除额外 binding 并建立带 context 的 PR_WR/PR_RW。随后只调用一次 MonoSAT，不再进行 model refinement。当前 `(key,value)` 唯一模型不支持 DISTINCT 或自定义全快照 evaluator；这类谓词在 native solver 分配前明确报错。
 
 ## 6. 核心算法一：GMWR obligation 预传播
+
+该阶段由 `PredicatePruning.prune()` 在 WW 剪枝之后显式执行：`prepareObservations()` 准备来源、scope、逐 key 贡献；`collectGmwrLogicalConstraints()` 构造显式 items；可选 `propagate()` 归约；`finalizeSourceDomains()` 完成 PR_WR 可达性、PR_RW 环及区间候选剪枝；`prepareResidualItems()` 去除已满足项和不可能 repair，最后生成只读交接结果。`PredicateAnalysis` 只提供共享写索引、缓存和语义计算，`GmwrPropagationState` 的活动工作队列不传给编码器。
+
+EAGER 同样准备逐 key 数据，保留完整来源域且不建立 GMWR 状态；关闭预传播仍将未消解 items 交给 SAT。确定性冲突的端点、key 与规则直接用于诊断，不依赖 SAT assumption。候选域剪枝在此阶段完成；编码器仍执行 literal 常量化简和 `skipPredicateWitness()` 的已知不可激活依赖边过滤，这些操作不修改交接候选域。
 
 ### 6.1 它比普通 WW 剪枝多知道什么
 
@@ -787,7 +793,9 @@ g3 -> E(B,A)
 | `src/main/java/verifier/SERConstraint.java` | 表示 writer 事务对的两个 WW/RW 分支 |
 | `src/main/java/verifier/PrecedenceOracle.java` | 每次audit唯一的deterministic precedence state，提供before/successor/predecessor/wouldCycle并由各模块共享 |
 | `src/main/java/verifier/LatestVisibleChecker.java` | 统一计算 candidate writer 的 latest-visible validity |
-| `src/main/java/verifier/SERVerifier.java` | 内部一致性、约束生成、pruning、求解入口 |
+| `src/main/java/verifier/SERVerifier.java` | 按核心流程编排一致性、WW 剪枝、谓词剪枝、编码和单次求解 |
+| `src/main/java/verifier/PredicatePruning.java` | 独立谓词剪枝及 `Result` 交接；确定性冲突提前拒绝 |
+| `src/main/java/verifier/PredicateAnalysis.java` | 剪枝与编码共用的写索引、scope、行贡献缓存和谓词语义计算 |
 | `src/main/java/verifier/SERSolverAR.java` | logical dependency metadata、唯一 serialization graph、edge guard、frontier、coalescing、interning 和判环 |
 
 阅读 `SERSolverAR.java` 时，最直接的调用链是：

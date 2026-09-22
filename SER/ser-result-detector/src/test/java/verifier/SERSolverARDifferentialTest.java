@@ -596,9 +596,8 @@ class SERSolverARDifferentialTest {
             History<String, ValueType> history,
             SERVerifier.SolverSettings settings) {
         var graph = new KnownGraph<>(history);
-        return new SERSolverAR<>(history, graph,
-                SERVerifier.generateConstraintsSER(history, graph),
-                true, false, settings).solve() == SolveStatus.SAT;
+        return PredicateSolverTestSupport.solve(history, graph,
+                SERVerifier.generateConstraintsSER(history, graph), settings) == SolveStatus.SAT;
     }
 
     private static <ValueType> void assertVerifierMatchesOracle(

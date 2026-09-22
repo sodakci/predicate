@@ -61,14 +61,6 @@ public final class QueryValue {
         return value.isBoolean();
     }
 
-    public boolean isObject() {
-        return value.isObject();
-    }
-
-    public boolean isNull() {
-        return value.isNull();
-    }
-
     public long asLong() {
         if (!isIntegralNumber()) {
             throw new QueryException("expected an integer value, got " + value);

@@ -93,7 +93,9 @@ class SERSolverARSatEncodingTest {
 
     private static boolean solveSer(History<String, Integer> history) {
         var graph = new KnownGraph<>(history);
-        return new SERSolverAR<>(history, graph, generateConstraints(history, graph)).solve() == SolveStatus.SAT;
+        return PredicateSolverTestSupport.solve(history, graph, generateConstraints(history, graph),
+                SERVerifier.SolverSettings.forModes(SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.NONE)) == SolveStatus.SAT;
     }
 
     private static History<String, Integer> singleTxnHistory() {
@@ -160,7 +162,7 @@ class SERSolverARSatEncodingTest {
                 solveStarted[0] = true;
                 return nativeSolver.solve(assumptions);
             };
-            var solver = new SERSolverAR<>(history, graph,
+            var solver = PredicateSolverTestSupport.preparedSolver(history, graph,
                     generateConstraints(history, graph), true, true, settings);
             assertEquals(SolveStatus.SAT, solver.solve());
             assertEquals(1, calls[0]);
@@ -181,7 +183,7 @@ class SERSolverARSatEncodingTest {
         history.addPredicateReadEvent(history.getTransaction(1L), predicate, List.of());
         var graph = new KnownGraph<>(history);
         var error = assertThrows(QueryException.class,
-                () -> new SERSolverAR<>(history, graph, List.of()));
+                () -> PredicateSolverTestSupport.preparedSolver(history, graph, List.of()));
         assertTrue(error.getMessage().contains("whole-snapshot"));
     }
 
@@ -201,7 +203,7 @@ class SERSolverARSatEncodingTest {
             var graph = new KnownGraph<>(history);
             var profiler = Profiler.getInstance();
             profiler.clear();
-            var solver = new SERSolverAR<>(history, graph,
+            var solver = PredicateSolverTestSupport.preparedSolver(history, graph,
                     generateConstraints(history, graph), true, true, mode);
             long comparisons = profiler.getCount("SER_PRED_BEFORE_WRITE_CALLS_COUNT");
             assertEquals(SolveStatus.SAT, solver.solve());
@@ -226,10 +228,11 @@ class SERSolverARSatEncodingTest {
                     history.addPredicateReadEvent(reader, kvPlan("value > 5"), List.of());
                     commitAll(history);
                     var graph = new KnownGraph<>(history);
-                    var solver = new SERSolverAR<>(history, graph,
-                            generateConstraints(history, graph), true, true, mode);
+                    var status = PredicateSolverTestSupport.solve(history, graph,
+                            generateConstraints(history, graph),
+                            SERVerifier.SolverSettings.forModes(mode, SERVerifier.PruningMode.NONE));
                     assertEquals(knownVisible && value > 5 ? SolveStatus.UNSAT : SolveStatus.SAT,
-                            solver.solve(), mode + " visible=" + knownVisible + " value=" + value);
+                            status, mode + " visible=" + knownVisible + " value=" + value);
                 }
             }
         }
@@ -247,7 +250,7 @@ class SERSolverARSatEncodingTest {
         history.addEvent(competitor, WRITE, "kv:x", 1);
         commitAll(history);
         var graph = new KnownGraph<>(history);
-        var encoder = new SERSolverAR<>(history, graph,
+        var encoder = PredicateSolverTestSupport.preparedSolver(history, graph,
                 List.of(), true, true,
                 SERVerifier.PredicateSolvingMode.EAGER);
         var solverField = SERSolverAR.class.getDeclaredField("solver");
@@ -313,7 +316,7 @@ class SERSolverARSatEncodingTest {
         var graph = new KnownGraph<>(history);
         var profiler = Profiler.getInstance();
         profiler.clear();
-        var solver = new SERSolverAR<>(history, graph,
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph,
                 generateConstraints(history, graph), true, true,
                 SERVerifier.PredicateSolvingMode.EAGER);
         long variables = profiler.getCount("SER_PROP_RESIDUAL_SAT_VARIABLES_COUNT");
@@ -355,7 +358,7 @@ class SERSolverARSatEncodingTest {
                 var precedence = SERVerifier.createPrecedenceOracle(history);
                 assertFalse(new Pruning<String, Integer>(precedence, false)
                         .pruneConstraints(graph, constraints));
-                var solver = new SERSolverAR<>(history, graph, constraints, true, true,
+                var solver = PredicateSolverTestSupport.preparedSolver(history, graph, constraints, true, true,
                         SERVerifier.SolverSettings.forModes(
                                 mode, SERVerifier.PruningMode.REACHABILITY), precedence);
                 assertEquals(SolveStatus.SAT, solver.solve());
@@ -380,7 +383,7 @@ class SERSolverARSatEncodingTest {
         var reader = history.addTransaction(history.addSession(1L), 1L);
         var later = history.addTransaction(history.addSession(2L), 2L);
         var graph = new KnownGraph<>(history);
-        var encoder = new SERSolverAR<>(history, graph, List.of(), true, true,
+        var encoder = PredicateSolverTestSupport.preparedSolver(history, graph, List.of(), true, true,
                 SERVerifier.PredicateSolvingMode.EAGER);
         var solverField = SERSolverAR.class.getDeclaredField("solver");
         solverField.setAccessible(true);
@@ -437,7 +440,7 @@ class SERSolverARSatEncodingTest {
                 Map.of(),
                 Map.of());
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(history, graph, List.of());
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, List.of());
 
         assertEquals(6, solver.getArVariableCount());
         assertEquals(SolveStatus.SAT, solver.solve());
@@ -454,7 +457,7 @@ class SERSolverARSatEncodingTest {
                 Map.of());
         var graph = new KnownGraph<>(history);
 
-        var solver = new SERSolverAR<>(history, graph, List.of());
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, List.of());
         assertEquals(SolveStatus.SAT, solver.solve());
 
         assertEquals(1, profiler.getCounter("SER_AR_ENCODE_SETUP"));
@@ -480,7 +483,7 @@ class SERSolverARSatEncodingTest {
                         List.of(new Event.PredResult<>("x", 10)))));
         var graph = new KnownGraph<>(history);
 
-        var solver = new SERSolverAR<>(
+        var solver = PredicateSolverTestSupport.preparedSolver(
                 history, graph, generateConstraints(history, graph), true, true);
 
         assertEquals(1, profiler.getCount("SER_PRED_OBSERVATIONS_COUNT"));
@@ -507,7 +510,7 @@ class SERSolverARSatEncodingTest {
         commitAll(history);
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(
+        var solver = PredicateSolverTestSupport.preparedSolver(
                 history, graph, generateConstraints(history, graph), true, true,
                 SERVerifier.PredicateSolvingMode.EAGER);
 
@@ -534,7 +537,7 @@ class SERSolverARSatEncodingTest {
         commitAll(history);
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(
+        var solver = PredicateSolverTestSupport.preparedSolver(
                 history, graph, generateConstraints(history, graph), true, true,
                 SERVerifier.PredicateSolvingMode.EAGER);
 
@@ -560,7 +563,7 @@ class SERSolverARSatEncodingTest {
         commitAll(history);
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(
+        var solver = PredicateSolverTestSupport.preparedSolver(
                 history, graph, generateConstraints(history, graph), true, true,
                 SERVerifier.PredicateSolvingMode.GMWR);
 
@@ -596,7 +599,7 @@ class SERSolverARSatEncodingTest {
     }
 
     @Test
-    void gmwrPrunesReachablePrWrSourceAndForcesTheLastAlternative() {
+    void gmwrPrunesReachablePrWrSourceButRetainsImplicitBottomAlternative() {
         var profiler = Profiler.getInstance();
         profiler.clear();
         var history = new History<String, Integer>();
@@ -611,16 +614,26 @@ class SERSolverARSatEncodingTest {
 
         var graph = new KnownGraph<>(history);
         graph.putEdge(reader, blockedWriter, new Edge<>(EdgeType.WR, "dep"));
-        var solver = new SERSolverAR<>(
-                history, graph, generateConstraints(history, graph), true, true,
-                SERVerifier.PredicateSolvingMode.GMWR);
+        var oracle = SERVerifier.createPrecedenceOracle(history);
+        var settings = SERVerifier.SolverSettings.forModes(
+                SERVerifier.PredicateSolvingMode.GMWR, SERVerifier.PruningMode.NONE);
+        var result = new PredicatePruning<>(history, graph, oracle, settings,
+                new PredicateAnalysis<>(graph, oracle)).prune();
 
         assertEquals(1L, profiler.getCount(
                 "SER_PRED_PR_WR_REACHABILITY_PRUNED_COUNT"));
-        assertEquals(0L, profiler.getCount(
-                "SER_PRED_PR_WR_REACHABILITY_FORCED_COUNT"));
+        assertEquals(1L, profiler.getCount(
+                "SER_PRED_PR_WR_INITIAL_CONSTRAINTS_COUNT"));
+        assertEquals(1L, profiler.getCount(
+                "SER_PRED_PR_WR_RESIDUAL_CONSTRAINTS_COUNT"));
+        assertEquals(0L, profiler.getCount("SER_PRED_PR_WR_FORCED_CONSTRAINTS_COUNT"));
+        assertEquals(3L, profiler.getCount("SER_PRED_PR_WR_INITIAL_CANDIDATES_COUNT"));
+        assertEquals(2L, profiler.getCount("SER_PRED_PR_WR_RESIDUAL_CANDIDATES_COUNT"));
+        assertEquals(1L, profiler.getCount("SER_PRED_PR_WR_PRUNED_CANDIDATES_COUNT"));
         assertFalse(graph.getKnownGraphA().edgeValue(remainingWriter, reader)
                 .orElse(List.of()).contains(new Edge<>(EdgeType.PR_WR, "kv:x")));
+        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph),
+                true, true, settings, oracle, result);
         assertEquals(SolveStatus.SAT, solver.solve());
     }
 
@@ -643,9 +656,11 @@ class SERSolverARSatEncodingTest {
 
         var graph = new KnownGraph<>(history);
         graph.putEdge(source, badWriter, new Edge<>(EdgeType.WW, "kv:x"));
-        var solver = new SERSolverAR<>(
-                history, graph, generateConstraints(history, graph), true, true,
-                SERVerifier.PredicateSolvingMode.GMWR);
+        var oracle = SERVerifier.createPrecedenceOracle(history);
+        var settings = SERVerifier.SolverSettings.forModes(
+                SERVerifier.PredicateSolvingMode.GMWR, SERVerifier.PruningMode.NONE);
+        var result = new PredicatePruning<>(history, graph, oracle, settings,
+                new PredicateAnalysis<>(graph, oracle)).prune();
 
         assertEquals(0L, profiler.getCount(
                 "SER_PRED_PR_WR_REACHABILITY_PRUNED_COUNT"));
@@ -653,6 +668,8 @@ class SERSolverARSatEncodingTest {
                 "SER_PRED_PR_WR_PR_RW_CYCLE_PRUNED_COUNT"));
         assertFalse(graph.getKnownGraphA().edgeValue(source, reader)
                 .orElse(List.of()).contains(new Edge<>(EdgeType.PR_WR, "kv:x")));
+        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph),
+                true, true, settings, oracle, result);
         assertEquals(SolveStatus.SAT, solver.solve());
     }
 
@@ -683,7 +700,7 @@ class SERSolverARSatEncodingTest {
         assertTrue(graph.getKnownGraphA().edgeValue(source, badWriter)
                         .orElse(List.of()).contains(new Edge<>(EdgeType.WW, "kv:x")),
                 "baseline WW pruning must force the only acyclic WW direction");
-        new SERSolverAR<>(
+        PredicateSolverTestSupport.preparedSolver(
                 history, graph, constraints, true, true,
                 SERVerifier.SolverSettings.forModes(
                         SERVerifier.PredicateSolvingMode.GMWR,
@@ -708,17 +725,17 @@ class SERSolverARSatEncodingTest {
         commitAll(history);
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(
-                history, graph, generateConstraints(history, graph), true, true,
-                SERVerifier.PredicateSolvingMode.GMWR);
+        var oracle = SERVerifier.createPrecedenceOracle(history);
+        var result = new PredicatePruning<>(history, graph, oracle,
+                SERVerifier.SolverSettings.forModes(SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.NONE),
+                new PredicateAnalysis<>(graph, oracle)).prune();
 
-        assertEquals(SolveStatus.UNSAT, solver.solve());
-        assertTrue(solver.getConflictReasons().stream().anyMatch(reason ->
-                        reason.getKind() == SERSolverAR.AssumptionKind.GMWR_RULE),
-                "GMWR propagation conflicts must retain an assumption reason");
+        assertTrue(result.hasConflict());
+        assertTrue(result.conflictReasons().stream().anyMatch(reason ->
+                reason.from() == writer && reason.to() == reader && reason.key().equals("kv:x")));
+        assertThrows(UnsupportedOperationException.class, () -> result.conflictReasons().clear());
         assertEquals(1L, profiler.getCount("SER_GMWR_ITEM_OBLIGATIONS_COUNT"));
-        assertEquals(0L, profiler.getCount("SER_PRED_EXTERNAL_SOURCED_KEYS_COUNT"));
-        assertEquals(1L, profiler.getCount("SER_PRED_EXTERNAL_SOURCELESS_KEYS_COUNT"));
         assertEquals(0L, profiler.getCount("SER_GMWR_RESIDUAL_CLAUSES_COUNT"));
         assertEquals(0L, profiler.getCount("SER_GMWR_FORCED_ORDERS_COUNT"));
     }
@@ -740,7 +757,7 @@ class SERSolverARSatEncodingTest {
         commitAll(history);
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(
+        var solver = PredicateSolverTestSupport.preparedSolver(
                 history, graph, generateConstraints(history, graph), true, true,
                 SERVerifier.PredicateSolvingMode.GMWR);
 
@@ -771,7 +788,7 @@ class SERSolverARSatEncodingTest {
         commitAll(history);
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(
+        var solver = PredicateSolverTestSupport.preparedSolver(
                 history, graph, generateConstraints(history, graph), true, true,
                 SERVerifier.PredicateSolvingMode.GMWR);
 
@@ -803,7 +820,7 @@ class SERSolverARSatEncodingTest {
         var eagerConstraints = generateConstraints(history, eagerGraph);
         var profiler = Profiler.getInstance();
         profiler.clear();
-        var eager = new SERSolverAR<>(
+        var eager = PredicateSolverTestSupport.preparedSolver(
                 history, eagerGraph, eagerConstraints, true, true,
                 SERVerifier.PredicateSolvingMode.EAGER);
         long eagerQueued = profiler.getCount("SER_PRED_DEPENDENCY_QUEUED_COUNT");
@@ -812,7 +829,7 @@ class SERSolverARSatEncodingTest {
         var gmwrGraph = new KnownGraph<>(history);
         var gmwrConstraints = generateConstraints(history, gmwrGraph);
         profiler.clear();
-        var gmwr = new SERSolverAR<>(
+        var gmwr = PredicateSolverTestSupport.preparedSolver(
                 history, gmwrGraph, gmwrConstraints, true, true,
                 SERVerifier.PredicateSolvingMode.GMWR);
         long gmwrQueued = profiler.getCount("SER_PRED_DEPENDENCY_QUEUED_COUNT");
@@ -839,7 +856,7 @@ class SERSolverARSatEncodingTest {
                 new Edge<>(EdgeType.WW, "kv:x"));
         var profiler = Profiler.getInstance();
         profiler.clear();
-        var solver = new SERSolverAR<>(
+        var solver = PredicateSolverTestSupport.preparedSolver(
                 history, graph, List.of(), true, true,
                 SERVerifier.PredicateSolvingMode.GMWR);
 
@@ -879,7 +896,7 @@ class SERSolverARSatEncodingTest {
                         2L, List.of(Triple.of(WRITE, "y", 1))),
                 Map.of());
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(history, graph, List.of());
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, List.of());
 
         assertEquals(2, solver.getArVariableCount());
         assertEquals(SolveStatus.SAT, solver.solve());
@@ -896,7 +913,7 @@ class SERSolverARSatEncodingTest {
                         2L, List.of(Triple.of(WRITE, "x", 1))),
                 Map.of());
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, generateConstraints(history, graph));
 
         assertEquals(SolveStatus.UNSAT, solver.solve(), "bottom < writer fixes the WW choice and derives reader RW writer");
     }
@@ -915,7 +932,7 @@ class SERSolverARSatEncodingTest {
         var graph = new KnownGraph<>(history);
         assertFalse(graph.getKnownGraphB().hasEdgeConnecting(history.getTransaction(2L), history.getTransaction(3L)));
 
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, generateConstraints(history, graph));
         var logicalTypes = solver.getLogicalDependencies().stream()
                 .map(SEREdge::getType)
                 .collect(java.util.stream.Collectors.toSet());
@@ -942,7 +959,7 @@ class SERSolverARSatEncodingTest {
                 List.of(new SEREdge<>(laterWriter, source, EdgeType.WW, "x")),
                 source, laterWriter, 0);
 
-        var solver = new SERSolverAR<>(history, graph, List.of(constraint));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, List.of(constraint));
 
         assertEquals(SolveStatus.SAT, solver.solve(),
                 "ordinary RW must come from the selected WW branch, not a second reconstruction pass");
@@ -960,9 +977,11 @@ class SERSolverARSatEncodingTest {
                 Map.of());
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var status = PredicateSolverTestSupport.solve(history, graph, generateConstraints(history, graph),
+                SERVerifier.SolverSettings.forModes(SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.NONE));
 
-        assertEquals(SolveStatus.UNSAT, solver.solve());
+        assertEquals(SolveStatus.UNSAT, status);
     }
 
     @Test
@@ -982,7 +1001,7 @@ class SERSolverARSatEncodingTest {
         assertEquals(0L, countEdgesOfType(graph.getKnownGraphA(), EdgeType.PR_WR));
         assertEquals(0L, countEdgesOfType(graph.getKnownGraphB(), EdgeType.PR_RW));
 
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, generateConstraints(history, graph));
         assertEquals(SolveStatus.UNSAT, solver.solve());
     }
 
@@ -999,9 +1018,11 @@ class SERSolverARSatEncodingTest {
         var graph = new KnownGraph<>(history);
         assertEquals(KnownGraph.PredicateReadType.EXTERNAL,
                 graph.getPredicateObservations().get(0).getPredicateReadType("x"));
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var status = PredicateSolverTestSupport.solve(history, graph, generateConstraints(history, graph),
+                SERVerifier.SolverSettings.forModes(SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.NONE));
 
-        assertEquals(SolveStatus.UNSAT, solver.solve(), "predicate result source must be visible before the predicate read");
+        assertEquals(SolveStatus.UNSAT, status, "predicate result source must be visible before the predicate read");
     }
 
     @Test
@@ -1017,7 +1038,7 @@ class SERSolverARSatEncodingTest {
                         List.of(new Event.PredResult<>("x", 10)))));
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, generateConstraints(history, graph));
 
         assertEquals(SolveStatus.UNSAT, solver.solve(), "predicate result source must be the latest visible write under AR");
     }
@@ -1038,7 +1059,7 @@ class SERSolverARSatEncodingTest {
         var profiler = Profiler.getInstance();
         profiler.clear();
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(
+        var solver = PredicateSolverTestSupport.preparedSolver(
                 history, graph, generateConstraints(history, graph), true, true);
 
         assertEquals(1, profiler.getCount("SER_PRED_FRONTIERS_COUNT"));
@@ -1076,7 +1097,7 @@ class SERSolverARSatEncodingTest {
         var graph = new KnownGraph<>(history);
         assertEquals(KnownGraph.PredicateReadType.INTERNAL,
                 graph.getPredicateObservations().get(0).getPredicateReadType("x"));
-        assertEquals(SolveStatus.SAT, new SERSolverAR<>(
+        assertEquals(SolveStatus.SAT, PredicateSolverTestSupport.preparedSolver(
                 history, graph, generateConstraints(history, graph)).solve(),
                 "the later self-write must not replace the write visible at the predicate event");
     }
@@ -1116,7 +1137,7 @@ class SERSolverARSatEncodingTest {
         assertEquals(0L, countEdgesOfType(graph.getKnownGraphA(), EdgeType.PR_WR));
         assertEquals(0L, countEdgesOfType(graph.getKnownGraphB(), EdgeType.PR_RW));
 
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, generateConstraints(history, graph));
         assertEquals(SolveStatus.UNSAT, solver.solve());
     }
 
@@ -1135,9 +1156,11 @@ class SERSolverARSatEncodingTest {
                         List.of())));
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var status = PredicateSolverTestSupport.solve(history, graph, generateConstraints(history, graph),
+                SERVerifier.SolverSettings.forModes(SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.NONE));
 
-        assertEquals(SolveStatus.UNSAT, solver.solve(), "later writer U makes absent key satisfy the predicate, so S must precede U");
+        assertEquals(SolveStatus.UNSAT, status, "later writer U makes absent key satisfy the predicate, so S must precede U");
     }
 
     @Test
@@ -1151,9 +1174,11 @@ class SERSolverARSatEncodingTest {
                         List.of())));
 
         var graph = new KnownGraph<>(history);
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var status = PredicateSolverTestSupport.solve(history, graph, generateConstraints(history, graph),
+                SERVerifier.SolverSettings.forModes(SERVerifier.PredicateSolvingMode.GMWR,
+                        SERVerifier.PruningMode.NONE));
 
-        assertEquals(SolveStatus.UNSAT, solver.solve(), "empty predicate result is invalid when the latest visible x satisfies P");
+        assertEquals(SolveStatus.UNSAT, status, "empty predicate result is invalid when the latest visible x satisfies P");
     }
 
     @Test
@@ -1168,7 +1193,7 @@ class SERSolverARSatEncodingTest {
         assertEquals(KnownGraph.PredicateReadType.EXTERNAL,
                 graph.getPredicateObservations().get(0).getPredicateReadType("x"));
 
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, generateConstraints(history, graph));
         assertEquals(SolveStatus.SAT, solver.solve(),
                 "a key without an initial version is absent before its later insert");
     }
@@ -1191,7 +1216,7 @@ class SERSolverARSatEncodingTest {
         assertEquals(KnownGraph.PredicateReadType.INTERNAL,
                 graph.getPredicateObservations().get(1).getPredicateReadType("y"));
 
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, generateConstraints(history, graph));
         assertEquals(SolveStatus.SAT, solver.solve(), "self-written predicate keys must not enter the external predicate path");
     }
 
@@ -1215,7 +1240,7 @@ class SERSolverARSatEncodingTest {
         assertEquals(KnownGraph.PredicateReadType.INTERNAL,
                 graph.getPredicateObservations().get(1).getPredicateReadType("y"));
 
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, generateConstraints(history, graph));
         assertEquals(SolveStatus.SAT, solver.solve(), "the repeated same-predicate key must not select a new external frontier");
     }
 
@@ -1231,7 +1256,7 @@ class SERSolverARSatEncodingTest {
         assertEquals(KnownGraph.PredicateReadType.INTERNAL,
                 graph.getPredicateObservations().get(0).getPredicateReadType("y"));
 
-        var solver = new SERSolverAR<>(history, graph, generateConstraints(history, graph));
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, generateConstraints(history, graph));
         assertEquals(SolveStatus.UNSAT, solver.solve(),
                 "an internal key whose local write matches the predicate cannot have an empty result");
     }
@@ -1298,7 +1323,8 @@ class SERSolverARSatEncodingTest {
         graph.putEdge(history.getTransaction(1L), history.getTransaction(2L), new Edge<>(EdgeType.WW, "x"));
         graph.putEdge(history.getTransaction(2L), history.getTransaction(1L), new Edge<>(EdgeType.RW, "y"));
 
-        var solver = new SERSolverAR<>(history, graph, List.of());
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, List.of(), true, false,
+                SERVerifier.PredicateSolvingMode.EAGER);
 
         assertEquals(SolveStatus.UNSAT, solver.solve());
         var conflicts = solver.getConflicts();
@@ -1319,7 +1345,8 @@ class SERSolverARSatEncodingTest {
         graph.putEdge(history.getTransaction(1L), history.getTransaction(2L), new Edge<>(EdgeType.PR_WR, "x"));
         graph.putEdge(history.getTransaction(2L), history.getTransaction(1L), new Edge<>(EdgeType.PR_RW, "x"));
 
-        var solver = new SERSolverAR<>(history, graph, List.of());
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, List.of(), true, false,
+                SERVerifier.PredicateSolvingMode.EAGER);
 
         assertEquals(Set.of(EdgeType.PR_WR, EdgeType.PR_RW),
                 solver.getLogicalDependencies().stream()
@@ -1352,7 +1379,7 @@ class SERSolverARSatEncodingTest {
                 history.getTransaction(3L),
                 0);
         var constraints = List.of(constraint);
-        var solver = new SERSolverAR<>(history, graph, constraints);
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, constraints);
 
         assertEquals(SolveStatus.UNSAT, solver.solve());
         var conflicts = solver.getConflicts();

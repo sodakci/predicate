@@ -68,10 +68,6 @@ public final class MapVisibleState<KeyType, ValueType>
         return new MapVisibleState<>(replacement, relationResolver);
     }
 
-    public Map<KeyType, ValueType> asMap() {
-        return values;
-    }
-
     private static String requireRelation(String relation, Object key) {
         if (relation == null || relation.isBlank()) {
             throw new QueryException("no relation for key " + key);

@@ -42,15 +42,18 @@ class BlackBoxSERAuditTest {
                 "History\nTransactions: 2 | Events: 2 | Predicates: 0"),
                 () -> "stderr was:\n" + result.stderr);
         assertTrue(result.stderr.contains("WW\n1 -> 1"));
-        assertTrue(result.stderr.contains("Predicate\nGenerated PR_WR/PR_RW:"));
-        assertTrue(result.stderr.contains(" attempts -> "));
-        assertTrue(result.stderr.contains(" remaining\nFixed PR_WR/PR_RW:"));
-        assertTrue(result.stderr.contains("\nAll logical PR edges:"));
-        assertTrue(result.stderr.contains(" physical edges\nSkipped:"));
+        assertFalse(result.stderr.contains("\nPredicate\n"));
+        assertFalse(result.stderr.contains("Generated PR_WR/PR_RW:"));
+        assertFalse(result.stderr.contains("Fixed PR_WR/PR_RW:"));
+        assertFalse(result.stderr.contains("All logical PR edges:"));
+        assertFalse(result.stderr.contains("Skipped:"));
         assertTrue(result.stderr.contains("SAT\nVariables:"));
         assertTrue(result.stderr.contains("Timing\nWW:"));
         assertTrue(result.stderr.contains("Peak memory:"));
         assertTrue(result.stderr.contains("\nGMWR\n"));
+        assertTrue(result.stderr.contains("PR_WR constraints: 0 -> 0"));
+        assertTrue(result.stderr.contains("Forced PR_WR constraints: 0 (0.0%)"));
+        assertTrue(result.stderr.contains("PR_WR candidates: 0 -> 0 remaining (0 pruned, 0 fixed)"));
         assertFalse(result.stderr.contains("GMWR-WW reduced:"));
         assertFalse(result.stderr.contains("ENTIRE_EXPERIMENT:"));
         assertFalse(result.stderr.contains("Pruning round"));
@@ -135,8 +138,8 @@ class BlackBoxSERAuditTest {
         var result = runAuditCommand("audit", historyDir.toString());
 
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stderr.contains("[SER] Conflict clause:"),
-                () -> "expected direct MonoSAT assumption conflict, stderr was:\n" + result.stderr);
+        assertTrue(result.stderr.contains("Predicate pruning conflict:"),
+                () -> "expected deterministic predicate pruning conflict, stderr was:\n" + result.stderr);
         assertTrue(result.stderr.contains("[PREDICATE_OBLIGATION]")
                         || result.stderr.contains("[GMWR_RULE]"),
                 () -> "expected predicate/GMWR assumption reason, stderr was:\n"
@@ -169,12 +172,47 @@ class BlackBoxSERAuditTest {
         assertTrue(enabled.stderr.contains("gmwr=true"));
         assertTrue(enabled.stderr.contains("predicate-encoding=gmwr"));
         assertTrue(enabled.stderr.contains("gmwr-prepropagation=false"));
-        assertTrue(enabled.stderr.contains("\nGMWR\n"));
+        assertTrue(enabled.stderr.contains("\nGMWR\nPR_WR constraints:"));
+        assertTrue(enabled.stderr.contains("Forced PR_WR constraints:"));
+        assertTrue(enabled.stderr.contains("PR_WR candidates:"));
+        assertFalse(disabled.stderr.contains("PR_WR constraints:"));
+        assertFalse(enabled.stderr.contains("potential attempts"));
+        assertFalse(enabled.stderr.contains("Items:"));
+        assertTrue(enabled.stderr.contains("SER_PRED_PR_WR_INITIAL_CONSTRAINTS_COUNT:"));
+        assertTrue(enabled.stderr.contains("SER_PRED_PR_WR_RESIDUAL_CONSTRAINTS_COUNT:"));
+        assertTrue(enabled.stderr.contains("SER_PRED_PR_WR_FORCED_CONSTRAINTS_COUNT:"));
         assertFalse(enabled.stderr.contains("GMWR-WW reduced:"));
         assertTrue(enabled.stderr.indexOf("Timing\n")
                         < enabled.stderr.indexOf("ENTIRE_EXPERIMENT:"));
         assertTrue(enabled.stderr.stripTrailing().endsWith(
                 "SER audit result: " + (enabled.exitCode == 0 ? "ACCEPT" : "REJECT")));
+        for (var result : List.of(disabled, enabled)) {
+            for (var stage : List.of("WW_REACHABILITY_PRUNE_MS", "SER_AR_ENCODE_PREDICATE",
+                    "SER_AR_ENCODE_DEPENDENCIES", "SER_MONOSAT_SOLVE", "ENTIRE_EXPERIMENT")) {
+                assertTrue(result.stderr.contains(stage + ":"),
+                        () -> "应保留阶段计时：" + stage + "\n" + result.stderr);
+            }
+            for (var removed : List.of("SER_PRED_SOURCE_INDEX", "SER_PRED_SCOPE_LOOKUP",
+                    "SER_PRED_SNAPSHOT_VALIDATE", "SER_PRED_ROW_LOCAL_KEY_SCAN",
+                    "SER_PRED_EXTERNAL_SOURCED_ENCODE", "SER_PRED_EXTERNAL_SOURCELESS_ENCODE",
+                    "SER_PRED_PHYSICAL_SOURCED_MATERIALIZE", "SER_PRED_PHYSICAL_SOURCELESS_MATERIALIZE",
+                    "SER_PRED_PHYSICAL_MIXED_MATERIALIZE", "SER_PRED_PHYSICAL_KNOWN_INTERNAL_MATERIALIZE",
+                    "SER_GMWR_BUILD")) {
+                assertFalse(result.stderr.contains(removed + ":"),
+                        () -> "不应再输出循环内累计计时：" + removed + "\n" + result.stderr);
+            }
+            assertTrue(result.stderr.contains("SER_PRED_EXTERNAL_SOURCELESS_KEYS_COUNT: 2"));
+            assertTrue(result.stderr.contains("SER_PRED_DEPENDENCY_PHYSICAL_EDGES_COUNT:"));
+        }
+        assertTrue(enabled.stderr.contains("GMWR_BUILD_MS:"));
+        assertTrue(enabled.stderr.contains("GMWR_PRUNING_MS:"));
+        assertTrue(enabled.stderr.contains("GMWR_REDUCTION_MS:"));
+        assertTrue(enabled.stderr.contains("GMWR build:"));
+        assertTrue(enabled.stderr.contains("Predicate pruning:"));
+        assertTrue(enabled.stderr.contains("Prepropagation: 0.000s"));
+        assertFalse(enabled.stderr.contains("| GMWR:"));
+        assertTrue(disabled.stderr.contains("GMWR_PRUNING_MS: 0ms"));
+        assertTrue(enabled.stderr.contains("SER_GMWR_RESOLUTION:"));
     }
 
     @Test
@@ -205,6 +243,11 @@ class BlackBoxSERAuditTest {
 
         assertEquals(0, result.exitCode);
         assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"));
+        assertTrue(result.stderr.contains("Predicate\nGenerated PR_WR/PR_RW:"));
+        assertTrue(result.stderr.contains(" attempts -> "));
+        assertTrue(result.stderr.contains(" remaining\nFixed PR_WR/PR_RW:"));
+        assertTrue(result.stderr.contains("\nAll logical PR edges:"));
+        assertTrue(result.stderr.contains(" physical edges\nSkipped:"));
         assertTrue(result.stderr.contains("backend=monosat"), () -> "stderr was:\n" + result.stderr);
         assertTrue(result.stderr.contains("gmwr=true"));
         assertTrue(result.stderr.contains("predicate-encoding=gmwr"));

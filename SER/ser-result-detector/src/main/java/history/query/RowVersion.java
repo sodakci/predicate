@@ -18,23 +18,11 @@ public final class RowVersion<KeyType, ValueType> {
         return key;
     }
 
-    public KeyType getKey() {
-        return key;
-    }
-
     public String relation() {
         return relation;
     }
 
-    public String getRelation() {
-        return relation;
-    }
-
     public ValueType value() {
-        return value;
-    }
-
-    public ValueType getValue() {
         return value;
     }
 

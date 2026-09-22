@@ -23,11 +23,6 @@ public final class StructuredQueryParser<KeyType, ValueType> {
         this.relationResolver = Objects.requireNonNull(relationResolver, "relationResolver");
     }
 
-    public static <ValueType> StructuredQueryParser<String, ValueType> forCanonicalStringKeys(
-            ValueAdapter<ValueType> valueAdapter) {
-        return new StructuredQueryParser<>(valueAdapter, RelationResolver.canonicalStringKeys());
-    }
-
     public QueryPlan<KeyType, ValueType> parse(JsonNode query) {
         requireObject(query, "query");
         var aliases = new LinkedHashSet<String>();

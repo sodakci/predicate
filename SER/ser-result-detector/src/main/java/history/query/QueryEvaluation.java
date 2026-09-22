@@ -29,15 +29,7 @@ public final class QueryEvaluation<KeyType, ValueType> {
         return values;
     }
 
-    public List<QueryValue> getValues() {
-        return values;
-    }
-
     public Map<KeyType, ValueType> inputs() {
-        return inputs;
-    }
-
-    public Map<KeyType, ValueType> getInputs() {
         return inputs;
     }
 

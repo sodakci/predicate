@@ -187,7 +187,7 @@ java -Djava.library.path=build/monosat -Xmx8g \
   audit /absolute/path/to/hist-00000
 ```
 
-普通 `audit` 按 History、WW、可选 GMWR、Predicate、SAT、Timing 的完成顺序流式打印精简摘要；数量带千位分隔符，时间统一为秒并保留三位小数。Predicate 摘要分别展示编码阶段生成的 `PR_WR/PR_RW` 尝试及剩余 logical candidate、编码前已确定的 fixed PR candidate，并展示两者合计后按 `(from,to,type)` 合并得到的 physical edge 数。History 中的 Events 仅统计客户端事务事件，不包含内部初始版本写。稳定 verdict 始终是最后一行：
+普通 `audit` 按 History、WW、可选 GMWR、SAT、Timing 的完成顺序流式打印精简摘要；数量带千位分隔符，时间统一为秒并保留三位小数。GMWR 模式的 Timing 分别显示 `GMWR build`（准备与构建）、`Predicate pruning`（普通谓词候选剪枝及残余项整理）、`Prepropagation`（工作队列预传播）；关闭预传播仍显示普通剪枝耗时，三项不重叠。GMWR 摘要并列显示两种 PR_WR 口径：`PR_WR constraints: 初始未解决数 -> 剩余未解决数` 按 row-local、非 internal、未固定来源的 observation/key 计一条，`Forced PR_WR constraints` 是已强制解决的来源选择数，满足初始−剩余＝强制解决；`PR_WR candidates: 初始候选数 -> 剩余待选数 remaining (排除数 pruned, 固定数 fixed)` 则逐个合法来源计数，满足初始＝剩余待选＋排除＋固定。初始值在普通剪枝和预传播前记录，已有确定 PR_WR、固定 recorded source、internal 和 JOIN 不计入。初始候选为完整外部末次写域中使该 key 不贡献谓词结果的写；无初始版本时额外计一个“尚无可见版本”的隐式 bottom 选择。只有一个合法来源时解决该约束，真实来源直接登记 `PR_WR(source,reader,key)` 并强制 `source<reader`，无需原先已有该顺序；顺序更新后继续收缩其他来源域。唯一显式或隐式 bottom 同样算解决，但不生成真实事务间的 PR_WR 边；空域报告冲突，不算强制解决。不同 external observation 的约束分别计数，即使其确定边相同，图边仍按 `(source,reader,type,key)` 去重；同谓词重复读取若已归类 internal 则不计。候选从多个缩至一个时，排除其余候选、固定一个、剩余待选为零，不能把所有减少的候选都叫强制边。这些指标不是 GMWR item、SAT 子句或物理边数；关闭预传播仍执行普通来源剪枝与唯一来源强制，EAGER 各项为零。仅启用 `--solver-stats` 时输出 Predicate 摘要，分别展示编码阶段生成的 `PR_WR/PR_RW` 尝试及剩余 logical candidate、编码前已确定的 fixed PR candidate，并展示两者合计后按 `(from,to,type)` 合并得到的 physical edge 数。History 中的 Events 仅统计客户端事务事件，不包含内部初始版本写。稳定 verdict 始终是最后一行：
 
 ```text
 SER audit result: ACCEPT
@@ -212,9 +212,6 @@ SER audit result: REJECT
 ```text
 --predicate-encoding EAGER|GMWR
     谓词编码，默认 GMWR。EAGER 对应论文 E2 baseline。
-
---solver-timeout-seconds N
-    SAT 求解超时秒数，默认 600；0 表示禁用。计时从 `solve()` 调用开始，不包含编码。超时摘要输出 `SER audit result: TIMEOUT`，退出码 124，并分别打印 encode/solve 时间。全检查器超时由 runner 进程超时负责，从 `audit()` 开始计算墙钟。
 
 --solver-stats
     在精简摘要后打印完整 profiler metrics/counters、SAT 后端和求解配置；verdict 仍为最后一行。
@@ -244,7 +241,7 @@ java -Djava.library.path=build/monosat -Xmx8g \
 
 E2 仍使用 WW reachability、EAGER predicate encoding 与 graph-edge interning，但不构造或传播 GMWR。E1/G1 所需的 `--ser-propagation-mode`、`--[no-]gmwr-prepropagation`、`--[no-]predicate-witness-coalescing`、`--[no-]graph-edge-interning` 和 `--ww-pruning` 仅作为隐藏实验参数保留；旧 `--predicate-mode` 已删除。
 
-精简摘要以 `SER audit result: ACCEPT`、`SER audit result: REJECT`、`SER audit result: TIMEOUT` 或 `SER audit result: ERROR` 收尾，并展示 History、WW、可选 GMWR、Predicate、SAT、关键计时和峰值内存；超时退出码为 124。EAGER 不打印 GMWR section，也不在 WW 转换中打印第三项。启用 `--solver-stats` 后，摘要之后仍会输出完整 profiler 标签、配置、runner 使用的 `Max memory` 行和兼容旧 runner 的 `[[[[ ... ]]]]` 标记，最终 verdict 仍是最后一行。
+精简摘要以 `SER audit result: ACCEPT`、`SER audit result: REJECT` 或 `SER audit result: ERROR` 收尾，并展示 History、WW、可选 GMWR、SAT、关键计时和峰值内存。检测器内部不设置求解超时；实验时间上限由 runner 的外部进程超时参数控制。EAGER 不打印 GMWR section，也不在 WW 转换中打印第三项。启用 `--solver-stats` 后，额外显示 Predicate 统计段，摘要之后仍会输出完整 profiler 标签、配置、runner 使用的 `Max memory` 行和兼容旧 runner 的 `[[[[ ... ]]]]` 标记，最终 verdict 仍是最后一行。
 
 当前实现会自动使用以下等价编码，无需额外命令行开关：
 

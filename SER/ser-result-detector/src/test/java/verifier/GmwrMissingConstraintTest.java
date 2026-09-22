@@ -114,9 +114,8 @@ class GmwrMissingConstraintTest {
     private static SolveStatus solve(History<String, Integer> history,
                                      SERVerifier.SolverSettings settings) {
         var graph = new KnownGraph<>(history);
-        return new SERSolverAR<>(history, graph,
-                SERVerifier.generateConstraintsSER(history, graph),
-                true, false, settings).solve();
+        return PredicateSolverTestSupport.solve(history, graph,
+                SERVerifier.generateConstraintsSER(history, graph), settings);
     }
 
     private static String describe(SERVerifier.SolverSettings settings) {

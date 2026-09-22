@@ -19,6 +19,74 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GmwrPropagationTest {
     @Test
+    void transitiveOrderChangesWakeItemsWithoutDirectEdgeEndpoints() {
+        var history = new History<String, Integer>();
+        var bad = history.addTransaction(history.addSession(1L), 1L);
+        var reader = history.addTransaction(history.addSession(2L), 2L);
+        var from = history.addTransaction(history.addSession(3L), 3L);
+        var to = history.addTransaction(history.addSession(4L), 4L);
+        var removedRepair = history.addTransaction(history.addSession(5L), 5L);
+        var keptRepair = history.addTransaction(history.addSession(6L), 6L);
+        commitAll(history);
+        var graph = new KnownGraph<String, Integer>(history);
+        graph.putEdge(bad, reader, new Edge<>(EdgeType.SO, null));
+        graph.putEdge(reader, from, new Edge<>(EdgeType.SO, null));
+        graph.putEdge(to, removedRepair, new Edge<>(EdgeType.SO, null));
+        var state = gmwrState(history, graph);
+        state.seedKnownDependencies();
+        state.addGmwrItem(reader, bad, List.of(removedRepair, keptRepair), "x");
+        state.addGmwrItem(from, to, List.of(), "y");
+
+        assertFalse(state.propagate());
+        assertTrue(state.precedenceOracle().before(from, to));
+        assertTrue(state.precedenceOracle().before(reader, removedRepair));
+        assertTrue(state.precedenceOracle().before(bad, keptRepair));
+        assertTrue(state.precedenceOracle().before(keptRepair, reader));
+        assertTrue(state.gmwrObligations().stream().allMatch(item -> item.resolved));
+    }
+
+    @Test
+    void seededOrdersStillRejectCycles() {
+        var history = new History<String, Integer>();
+        var a = history.addTransaction(history.addSession(1L), 1L);
+        var b = history.addTransaction(history.addSession(2L), 2L);
+        var c = history.addTransaction(history.addSession(3L), 3L);
+        commitAll(history);
+        var graph = new KnownGraph<String, Integer>(history);
+        graph.putEdge(a, b, new Edge<>(EdgeType.SO, null));
+        graph.putEdge(b, c, new Edge<>(EdgeType.SO, null));
+        graph.putEdge(c, a, new Edge<>(EdgeType.SO, null));
+        var state = gmwrState(history, graph);
+
+        state.seedKnownDependencies();
+
+        assertTrue(state.isConflict());
+        assertFalse(state.propagationConflicts().isEmpty());
+    }
+
+    @Test
+    void propagationAfterSeedingRevisitsItemsAffectedByNewOrders() {
+        var history = new History<String, Integer>();
+        var bad = history.addTransaction(history.addSession(1L), 1L);
+        var repair = history.addTransaction(history.addSession(2L), 2L);
+        var reader = history.addTransaction(history.addSession(3L), 3L);
+        var otherRepair = history.addTransaction(history.addSession(4L), 4L);
+        commitAll(history);
+        var graph = new KnownGraph<String, Integer>(history);
+        graph.putEdge(bad, reader, new Edge<>(EdgeType.SO, null));
+        var state = gmwrState(history, graph);
+        state.seedKnownDependencies();
+        state.addGmwrItem(reader, bad, List.of(repair, otherRepair), "x");
+        state.addGmwrItem(reader, repair, List.of(), "y");
+
+        assertFalse(state.propagate());
+        assertTrue(state.precedenceOracle().before(reader, repair));
+        assertTrue(state.precedenceOracle().before(bad, otherRepair));
+        assertTrue(state.precedenceOracle().before(otherRepair, reader));
+        assertTrue(state.gmwrObligations().stream().allMatch(item -> item.resolved));
+    }
+
+    @Test
     void eagerDoesNotBuildOrRunGmwrPropagation() {
         var profiler = Profiler.getInstance();
         profiler.clear();
@@ -27,7 +95,7 @@ class GmwrPropagationTest {
                 .setStatus(Transaction.TransactionStatus.COMMIT);
         var graph = new KnownGraph<String, Integer>(history);
 
-        var solver = new SERSolverAR<>(history, graph, List.of(), true, false,
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, List.of(), true, false,
                 SERVerifier.PredicateSolvingMode.EAGER);
 
         assertEquals(SolveStatus.SAT, solver.solve());
@@ -48,7 +116,7 @@ class GmwrPropagationTest {
                 SERVerifier.PruningMode.REACHABILITY);
         settings.gmwrPrepropagation = false;
 
-        var solver = new SERSolverAR<>(history, graph, List.of(), true, false, settings);
+        var solver = PredicateSolverTestSupport.preparedSolver(history, graph, List.of(), true, false, settings);
 
         assertEquals(SolveStatus.SAT, solver.solve());
         assertEquals(0L, profiler.getTime("GMWR_REDUCTION_MS"));
@@ -137,6 +205,11 @@ class GmwrPropagationTest {
 
         assertTrue(state.propagate());
         assertTrue(state.isConflict());
+        var reason = state.propagationConflicts().iterator().next();
+        assertEquals(bad, reason.from());
+        assertEquals(reader, reason.to());
+        assertEquals("k1", reason.key());
+        assertEquals("CYCLE", reason.rule());
     }
 
     @Test

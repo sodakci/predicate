@@ -57,6 +57,18 @@ final class GmwrPropagationState<KeyType, ValueType> {
     private final Set<GmwrObligation<KeyType, ValueType>> queuedGmwr = new HashSet<>();
     private boolean suppressDirtyNotifications;
     private boolean conflict;
+    private final List<PredicatePruning.ConflictReason<KeyType, ValueType>>
+            propagationConflicts = new ArrayList<>();
+
+    Collection<PredicatePruning.ConflictReason<KeyType, ValueType>> propagationConflicts() {
+        return Collections.unmodifiableList(propagationConflicts);
+    }
+
+    private void recordConflict(Transaction<KeyType, ValueType> from,
+                                Transaction<KeyType, ValueType> to, KeyType key, String rule) {
+        conflict = true;
+        propagationConflicts.add(new PredicatePruning.ConflictReason<>(from, to, key, rule));
+    }
 
     final PropagationStats stats = new PropagationStats();
 
@@ -102,7 +114,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
                 queuedGmwr.remove(gmwr);
                 reduceGmwr(gmwr);
             }
-            stats.residualConstraints = residualGmwrCount();
             return conflict;
         } finally {
             profiler.endTick("GMWR_REDUCTION_MS");
@@ -133,9 +144,8 @@ final class GmwrPropagationState<KeyType, ValueType> {
                      Transaction<KeyType, ValueType> badWriter,
                      Collection<Transaction<KeyType, ValueType>> repairs,
                      KeyType key) {
-        stats.initialConstraints++;
         if (reader.equals(badWriter)) {
-            conflict = true;
+            recordConflict(badWriter, reader, key, "GMWR_SELF_ITEM");
             stats.conflicts++;
             return;
         }
@@ -190,13 +200,14 @@ final class GmwrPropagationState<KeyType, ValueType> {
     private boolean addFact(DependencyFact<KeyType, ValueType> fact,
                             boolean gmwrDerived) {
         if (fact.from.equals(fact.to)) {
-            conflict = true;
+            recordConflict(fact.from, fact.to, fact.key, fact.rule);
             return false;
         }
         if (!knownFacts.add(FactKey.of(fact))) {
             return false;
         }
         if (!addPrecedence(fact.from, fact.to)) {
+            recordConflict(fact.from, fact.to, fact.key, fact.rule);
             return false;
         }
         if (gmwrDerived) {
@@ -247,7 +258,8 @@ final class GmwrPropagationState<KeyType, ValueType> {
             gmwr.resolved = true;
             gmwr.lastReason = ReductionReason.CYCLE;
             stats.conflicts++;
-            conflict = true;
+            recordConflict(gmwr.badWriter, gmwr.reader,
+                    gmwr.keys.isEmpty() ? null : gmwr.keys.iterator().next(), gmwr.lastReason.name());
             return;
         }
 
@@ -260,7 +272,8 @@ final class GmwrPropagationState<KeyType, ValueType> {
             gmwr.resolved = true;
             gmwr.lastReason = ReductionReason.CYCLE;
             stats.conflicts++;
-            conflict = true;
+            recordConflict(gmwr.badWriter, gmwr.reader,
+                    gmwr.keys.isEmpty() ? null : gmwr.keys.iterator().next(), gmwr.lastReason.name());
             return;
         }
 
@@ -309,18 +322,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
         return !gmwr.items.isEmpty();
     }
 
-    private void dirtyGmwrAffectedBy(Transaction<KeyType, ValueType> from,
-                                     Transaction<KeyType, ValueType> to) {
-        dirtyGmwrTouching(from);
-        dirtyGmwrTouching(to);
-    }
-
-    private void dirtyGmwrTouching(Transaction<KeyType, ValueType> txn) {
-        for (var gmwr : gmwrByTxn.getOrDefault(txn, Collections.emptySet())) {
-            enqueueGmwr(gmwr);
-        }
-    }
-
     private void indexGmwr(Transaction<KeyType, ValueType> txn,
                            GmwrObligation<KeyType, ValueType> gmwr) {
         gmwrByTxn.computeIfAbsent(txn, ignored -> new HashSet<>()).add(gmwr);
@@ -338,41 +339,24 @@ final class GmwrPropagationState<KeyType, ValueType> {
         queuedGmwr.clear();
     }
 
-    void releaseEncodedState() {
-        knownFacts.clear();
-        definiteFacts.clear();
-        gmwrByPair.clear();
-    }
-
     private boolean addPrecedence(Transaction<KeyType, ValueType> from,
                                   Transaction<KeyType, ValueType> to) {
         if (precedence.before(from, to)) {
             return true;
         }
         if (precedence.wouldCycle(from, to)) {
-            conflict = true;
             return false;
         }
-        var predecessors = new LinkedHashSet<>(precedence.predecessor(from));
-        predecessors.add(from);
-        var successors = new LinkedHashSet<>(precedence.successor(to));
-        successors.add(to);
-        var newlyReachable = new ArrayList<PrecedenceOracle.Relation<
-                Transaction<KeyType, ValueType>>>();
-        for (var predecessor : predecessors) {
-            for (var successor : successors) {
-                if (!precedence.before(predecessor, successor)) {
-                    newlyReachable.add(new PrecedenceOracle.Relation<>(
-                            predecessor, successor));
-                }
-            }
+        if (suppressDirtyNotifications) {
+            // 初始化只更新闭包；传播开始时会将所有 obligation 入队。
+            return precedence.add(from, to);
         }
-        precedence.add(from, to);
-        if (!suppressDirtyNotifications) {
-            for (var pair : newlyReachable) {
-                dirtyGmwrAffectedBy(pair.from, pair.to);
-            }
+        var affected = new LinkedHashSet<GmwrObligation<KeyType, ValueType>>();
+        if (!precedence.add(from, to, txn ->
+                affected.addAll(gmwrByTxn.getOrDefault(txn, Collections.emptySet())))) {
+            return false;
         }
+        affected.forEach(this::enqueueGmwr);
         return true;
     }
 
@@ -405,11 +389,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
         }
     }
 
-    private long residualGmwrCount() {
-        return gmwrObligations().stream()
-                .filter(gmwr -> !gmwr.resolved && !gmwr.satisfied).count();
-    }
-
     static boolean isBottomTxn(Transaction<?, ?> txn) {
         return txn.getId() == -1L && txn.getSession() != null
                 && txn.getSession().getId() == -1L;
@@ -422,8 +401,6 @@ final class GmwrPropagationState<KeyType, ValueType> {
 
     static final class PropagationStats {
         long reductionSteps;
-        long initialConstraints;
-        long residualConstraints;
         long removedCandidates;
         long forcedFacts;
         long forcedRepairs;

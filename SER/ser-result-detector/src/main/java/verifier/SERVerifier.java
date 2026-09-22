@@ -212,20 +212,27 @@ public class SERVerifier<KeyType, ValueType> {
                     graph, constraints, conflicts, Collections.emptyList());
             return AuditResult.REJECT;
         }
+        var predicateAnalysis = new PredicateAnalysis<>(graph, precedence);
+        var predicateResult = new PredicatePruning<>(
+                history, graph, precedence, solverSettings, predicateAnalysis).prune();
+        if (predicateSolvingMode == PredicateSolvingMode.GMWR) {
+            notifyStage(AuditStage.WW);
+            notifyStage(AuditStage.GMWR);
+        }
         profiler.endTick("ONESHOT_CONS");
+        if (predicateResult.hasConflict()) {
+            emitPredicatePruningDiagnostics(graph, constraints, predicateResult.conflictReasons());
+            return AuditResult.REJECT;
+        }
 
         profiler.startTick("ONESHOT_SOLVE");
         SERSolverAR<KeyType, ValueType> solver;
         profiler.startTick("SER_AR_ENCODE");
         try {
             solver = new SERSolverAR<>(history, graph, constraints,
-                    true, detailedPredicateMetrics, solverSettings, precedence);
+                    true, detailedPredicateMetrics, solverSettings, precedence, predicateResult);
         } finally {
             profiler.endTick("SER_AR_ENCODE");
-        }
-        if (predicateSolvingMode == PredicateSolvingMode.GMWR) {
-            notifyStage(AuditStage.WW);
-            notifyStage(AuditStage.GMWR);
         }
         notifyStage(AuditStage.PREDICATE);
         notifyStage(AuditStage.SAT);
@@ -255,6 +262,17 @@ public class SERVerifier<KeyType, ValueType> {
     static <KeyType, ValueType> PrecedenceOracle<Transaction<KeyType, ValueType>>
             createPrecedenceOracle(History<KeyType, ValueType> history) {
         return new PrecedenceOracle<>(history.getTransactions());
+    }
+
+    private void emitPredicatePruningDiagnostics(
+            KnownGraph<KeyType, ValueType> graph,
+            Collection<SERConstraint<KeyType, ValueType>> constraints,
+            Collection<PredicatePruning.ConflictReason<KeyType, ValueType>> reasons) {
+        emitRejectDiagnostics(graph, constraints,
+                Pair.of(Collections.emptyList(), Collections.emptyList()), Collections.emptyList());
+        for (var reason : reasons) {
+            System.err.printf("[SER] [GMWR_RULE] Predicate pruning conflict: %s%n", reason.describe());
+        }
     }
 
     private void emitRejectDiagnostics(

@@ -204,7 +204,7 @@ class RelationalPredicateSatTest {
         for (var mode : SERVerifier.PredicateSolvingMode.values()) {
             var history = new PredicateHistoryLoader(path).loadHistory();
             var graph = new KnownGraph<>(history);
-            var error = assertThrows(QueryException.class, () -> new SERSolverAR<>(
+            var error = assertThrows(QueryException.class, () -> PredicateSolverTestSupport.preparedSolver(
                     history, graph, SERVerifier.generateConstraintsSER(history, graph), true, true, mode));
             assertTrue(error.getMessage().contains("DISTINCT"));
         }

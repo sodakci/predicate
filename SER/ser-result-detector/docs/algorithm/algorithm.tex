@@ -1,0 +1,609 @@
+% 核对基线：sodakci/predicate，HEAD b8a611e97f651728cb2dc7c284ad100d9fc294f6，
+% 以及 2026-09-21 当前工作区中已经落地的独立谓词剪枝和候选域交接实现。
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=13mm]{geometry}
+% Compile with pdflatex, twice. Only standard TeX Live packages are used.
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{newtxtext,newtxmath}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\captionsetup[algorithm]{labelfont=bf,labelsep=space,font=small}
+\algrenewcommand\alglinenumber[1]{\fontsize{7.3}{8}\selectfont #1:}
+\algrenewcommand\algorithmicindent{1.05em}
+\algrenewcommand\algorithmiccomment[1]{\hfill$\triangleright$\ \textit{#1}}
+\newcommand{\True}{\textbf{true}}
+\newcommand{\False}{\textbf{false}}
+\newcommand{\Continue}{\textbf{continue}}
+\newcommand{\SO}{\mathsf{SO}}
+\newcommand{\WR}{\mathsf{WR}}
+\newcommand{\WW}{\mathsf{WW}}
+\newcommand{\RW}{\mathsf{RW}}
+\newcommand{\PRWR}{\mathsf{PR\_WR}}
+\newcommand{\PRRW}{\mathsf{PR\_RW}}
+\newcommand{\TC}{\operatorname{TC}}
+\newcommand{\tx}{\operatorname{tx}}
+\newcommand{\Endpoints}{\operatorname{ends}}
+\newcommand{\vars}{\operatorname{vars}}
+\newcommand{\dom}{\operatorname{dom}}
+\newcommand{\precedes}{\prec_P}
+\newcommand{\res}{\mathcal R}
+\newcommand{\Obs}{\mathcal O}
+\newcommand{\Items}{\mathcal I}
+\newcommand{\Bools}{\mathit{BV}}
+\newcommand{\Clauses}{\mathit{CL}}
+\newcommand{\edgelit}[2]{e_{#1,#2}}
+\newcommand{\ord}[2]{b_{#1,#2}}
+\newcommand{\AlgFont}{\fontsize{9}{10.65}\selectfont}
+\newcommand{\ProcGap}{\Statex\vspace{2pt}}
+% 本文使用默认 GMWR + REACHABILITY + 预传播配置；未展示 EAGER 或关闭预传播的分支。
+% 数学过程与 Java 接口对应如下，不依赖外部符号说明文件：
+% CheckSER = SERVerifier.audit；CreatePredicateAnalysis = new PredicateAnalysis(G,P)，
+% 构造时执行 validateSupportedPredicates：拒绝 DISTINCT；非 row-local 必须是单调 QueryPlan。
+% PredicatePruning(H,G,P,A) = new PredicatePruning(history,graph,precedence,settings,analysis).prune()。
+% R 是 PredicatePruning.Result：A=analysis()，P=precedenceOracle()，D=definiteFacts()，
+% O[rho]=observation(rho)，J=residualItems()；HasConflict(R)=R.hasConflict()。
+% R_bot 表示带 conflictReasons() 的 Result，不是交给 SAT 的假公式。
+% SAT-Encode = SERSolverAR 构造器；要求 R.P 与注入的 P 为同一对象，且 R 无冲突。
+% T_H 仅含真实事务；T_0 为初始事务，只参与确定顺序推理，不分配 MonoSAT 节点。
+% PrepareObservations = PredicatePruning.prepareObservations/analyzeRowKey，返回 O：
+% o.Src=sources，o.valid=valid，o.K=rowKeys；通用查询另保留 scopedEntries。
+% RowKey k：x=index.key，a=recordedSource，W=externalWrites，Good=emptyContributions，
+% U=sourceWrites；internal/valid 对应同名字段。W 每个外部事务仅保留该 key 的最终写。
+% 准备阶段由 RecordedInputsValid 校验来源与结果；对 row-local key 计算 ReadType、
+% LatestSelfBefore、CheckInternal、W、Good 和 k.valid；SAT 不重新进行这些语义计算。
+% ReadType = KnownGraph.PredicateObservation.getPredicateReadType：此前有 self write，
+% 或同事务同一 row-local 谓词已覆盖该 key 时为 INTERNAL；JOIN 不复用此前查询覆盖。
+% CheckInternal = analyzeRowKey 的内部路径：a 取此前最新 self write，无则取记录来源；
+% 有记录来源时要求与 a 为同一写；无记录来源时要求 a 不存在或其贡献为空。
+% 重复谓词读的结果继承与 self write 一致性已由 Utils.verifyInternalConsistency 校验。
+% RecordedInputsValid = PredicateAnalysis.recordedPredicateInputsValid：校验来源 key 集、
+% scope、值以及记录的输入能否重现结果多重集和来源信息；SourceWrite 按唯一 (key,value) 解析。
+% ScopedKeys = PredicateAnalysis.scopedWrites；LatestExt = KeyWriteIndex.latestExternalWrites，
+% LatestSelfBefore = KeyWriteIndex.latestSelfBefore；构造 Result 时省略展示诊断计数与耗时字段。
+% Contribution/Changed = hasEmptyPredicateContribution/writeChangesPredicateResult；
+% KnownWW = knownWwBefore，仅用已经固定的同 key WW 事实（含初始写与事务内顺序）。
+% RecordedExternalSourceEdges = GmwrPropagationState.seedRecordedPredicateSources；
+% OrderFact 为 DERIVED_ORDER，不伪造 WW/PR_WR/PR_RW；Typed(D) 仅投影其中的 TYPED_DEPENDENCY。
+% GetOrCreate 对新 (T,B) 初始化 items 为空、resolved=false、outside=true；items 不合并 repair 集。
+% BuildGMWR = PredicatePruning.collectGmwrLogicalConstraints；Frontier = pruneInterval。
+% FinalizeSourceDomains/PrepareResidualItems 对应 PredicatePruning 中的同名方法。
+% J 的每项 (T,B,outside,I) 对应 ResidualItem(reader,badWriter,outsidePossible,repairs)，
+% 另保留 keys 供诊断；所有集合以只读快照交给 SAT，不暴露传播队列。
+% BuildKnownOrder = SERSolverAR.buildKnownOrder，返回已知图的传递约简或冲突。
+% AddVersions 保留用于 JOIN 的外部版本池，并仅为 L 中的版本赋予可选 guard；
+% ContributingBindings = QueryPlan.candidateInputBindings，只枚举产生结果的绑定。
+% CoalescePredicateDeps 按 (from,to,type) 共享边、汇集 keys，每个 support 分别蕴含该边。
+% SAT 仍进行常量化简和不可激活依赖 witness 过滤，但不再剪枝来源候选域或扫描 repair 可行性。
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\textfloatsep}{8pt}
+\begin{document}
+% Algorithm 1: the public orchestration. Default GMWR mode.
+\begin{algorithm}[H]
+\caption{Predicate-aware serializability checking (overview)}
+\label{alg:ser-overview}
+\AlgFont
+\begin{algorithmic}[1]
+\Procedure{CheckSER}{$H$}
+  \If{$\neg\Call{VerifyInternalConsistency}{H}$}
+    \State \Return \False
+  \EndIf
+  \State $G\gets\Call{CreateKnownGraph}{H}$
+  \State $P\gets\Call{CreatePrecedenceOracle}{H}$
+  \State $C\gets\Call{GenerateConstraintsSER}{H,G}$
+  \If{$\neg\Call{PruneWWByReachability}{G,C,P}$}
+    \State \Return \False
+  \EndIf
+  \State $A\gets\Call{CreatePredicateAnalysis}{G,P}$
+  \State $\res\gets\Call{PredicatePruning}{H,G,P,A}$
+  \If{$\Call{HasConflict}{\res}$} \State \Return \False \EndIf
+  \State $\mathcal F\gets\Call{SAT-Encode}{H,G,C,P,\res}$
+  \State \Return $\Call{MonoSAT-Solve}{\mathcal F}$
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+% 补齐当前分析入口以及剪枝阶段的候选域、残余项交接过程。
+\begin{algorithm}[H]
+\caption{\texttt{PredicateAnalysis} / \texttt{PredicatePruning.Result}}
+\AlgFont
+\begin{algorithmic}[1]
+\Procedure{CreatePredicateAnalysis}{$G,P$}
+  \ForAll{$\rho=(T,p,i)\in\Obs$}
+    \If{$(p\in\mathit{QueryPlan}\land p.distinct)\lor
+      (\neg\Call{RowLocal}{p}\land(p\notin\mathit{QueryPlan}\lor\neg p.monotone))$}
+      \State \textbf{raise} $\mathit{QueryException}$
+    \EndIf
+  \EndFor
+  \State \Return $A=(G,P,\Call{BuildWriteIndexes}{G})$
+\EndProcedure
+\ProcGap
+\Procedure{FinalizeSourceDomains}{$O,P$}
+  \ForAll{$\rho\in\dom(O)$, $k\in O[\rho].K$}
+    \If{$k.internal\lor k.a\neq\bot$} \State \Continue \EndIf
+    \State $k.U\gets\Call{PruneSourceCandidates}{\rho,k.W,k.Good,P}$
+    \State $k.badWrites\gets k.U\setminus k.Good$
+  \EndFor
+  \State \Return $O$
+\EndProcedure
+\ProcGap
+\Procedure{PrepareResidualItems}{$\mathcal Q,P$}
+  \State $J\gets\varnothing$
+  \ForAll{$q=(T,B,\Items)\in\mathcal Q$ with $\neg q.resolved\land\neg(T\precedes B)$}
+    \ForAll{$I\in\Items$}
+      \If{$\exists g\in I:\ B\precedes g\land g\precedes T$} \State \Continue \EndIf
+      \State $I'\gets\{g\in I\setminus\{T,B\}\mid\neg(g\precedes B\lor T\precedes g)\}$
+      \State $outside\gets q.outside\land\neg(B\precedes T)$
+      \State $\Call{Append}{J,(T,B,outside,I')}$
+    \EndFor
+  \EndFor
+  \State \Return $J$
+\EndProcedure
+\ProcGap
+\Procedure{BeforeWrite}{$a,z$}
+  \If{$\tx(a)=\tx(z)$}
+    \State \Return $(a.index<z.index)$
+  \EndIf
+  \If{$\ell_{\tx(a),\tx(z),a.key}$ is registered}
+    \State \Return $\ell_{\tx(a),\tx(z),a.key}$
+  \EndIf
+  \State \Return $\Call{Order}{\tx(a),\tx(z)}$
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\clearpage
+% 完整主流程；Ends(E) 将带类型的事实投影为事务端点。
+\begin{algorithm}[H]
+\caption{Predicate-aware serializability checking (full version)}
+\label{alg:ser-full}
+\AlgFont
+\begin{minipage}[t]{0.487\textwidth}
+\begin{algorithmic}[1]
+\Procedure{CheckSER}{$H$}
+  \If{$\neg\Call{VerifyInternalConsistency}{H}$}
+    \State \Return \False
+  \EndIf
+  \State $G\gets\Call{CreateKnownGraph}{H}$
+  \State $P\gets\Call{CreatePrecedenceOracle}{H}$
+  \State $C\gets\Call{GenerateConstraintsSER}{H,G}$
+  \If{$\neg\Call{PruneWWByReachability}{G,C,P}$}
+    \State \Return \False
+  \EndIf
+  \State $A\gets\Call{CreatePredicateAnalysis}{G,P}$
+  \State $\res\gets\Call{PredicatePruning}{H,G,P,A}$
+  \If{$\Call{HasConflict}{\res}$} \State \Return \False \EndIf
+  \State $\mathcal F\gets\Call{SAT-Encode}{H,G,C,P,\res}$
+  \State \Return $\Call{MonoSAT-Solve}{\mathcal F}$
+\EndProcedure
+\ProcGap
+\Procedure{CreateKnownGraph}{$H$}
+  \State $H\gets\Call{EnsureInitialVersions}{H}$
+  \State $V_G\gets\mathcal T_H\cup\{T_0\}$; $E_G\gets\varnothing$
+  \ForAll{$(U,V)\in SO_H$}
+    \State $E_G\gets E_G\cup\{(U,V,\SO,\ast)\}$
+  \EndFor
+  \ForAll{external point reads $r(x,v)$ in $T$}
+    \State $a\gets\Call{SourceWrite}{r}$
+    \State $E_G\gets E_G\cup\{(\tx(a),T,\WR,x)\}$
+  \EndFor
+  \State $\Obs\gets\Call{PredicateObservations}{H}$
+  \State \Return $(V_G,E_G,\Obs)$
+\EndProcedure
+\ProcGap
+\Procedure{CreatePrecedenceOracle}{$H$}
+  \State $P\gets\Call{PrecedenceOracle}{\mathcal T_H\cup\{T_0\}}$
+  \State \Return $P$ \Comment{one shared, initially empty closure}
+\EndProcedure
+\ProcGap
+\Procedure{GenerateConstraintsSER}{$H,G$}
+  \State $C\gets\varnothing$
+  \ForAll{unordered writer pairs $\{A,B\}$}
+    \State $X\gets\{x\mid A,B\in\mathit{WriteTx}_x\}$
+    \If{$X=\varnothing$} \State \Continue \EndIf
+    \State $either\gets\varnothing$; $or\gets\varnothing$
+    \ForAll{$x\in X$}
+      \State $either\gets either\cup\{(A,B,\WW,x)\}$
+      \State $or\gets or\cup\{(B,A,\WW,x)\}$
+      \ForAll{$A\xrightarrow{\WR(x)}U$ with $U\neq B$}
+        \State $either\gets either\cup\{(U,B,\RW,x)\}$
+      \EndFor
+      \ForAll{$B\xrightarrow{\WR(x)}U$ with $U\neq A$}
+        \State $or\gets or\cup\{(U,A,\RW,x)\}$
+      \EndFor
+    \EndFor
+    \State $C\gets C\cup\{\langle either,or\rangle\}$
+  \EndFor
+  \State \Return $C$ \Comment{one choice per writer pair}
+\EndProcedure
+\ProcGap
+\Procedure{PredicatePruning}{$H,G,P,A$}
+  \State $D\gets\Call{RecordedExternalSourceEdges}{G}$
+  \State $E_0\gets\{(T_0,T)\mid T\in\mathcal T_H\}$
+  \State $P\gets\TC(P\cup\Endpoints(E_G\cup D)\cup E_0)$
+  \If{$\Call{Cycle}{P}$} \State \Return $\res_\bot$ \EndIf
+  \State $O\gets\Call{PrepareObservations}{H,G,A}$
+  \If{$\exists\rho\in\dom(O):\neg O[\rho].valid$} \State \Return $\res_\bot$ \EndIf
+  \State $\mathcal Q\gets\Call{BuildGMWR}{O,P}$
+  \If{$\mathcal Q=\bot$} \State \Return $\res_\bot$ \EndIf
+  \If{$\neg\Call{PrePropagateGMWR}{\mathcal Q,P,D}$}
+    \State \Return $\res_\bot$
+  \EndIf
+  \State $O\gets\Call{FinalizeSourceDomains}{O,P}$
+  \State $J\gets\Call{PrepareResidualItems}{\mathcal Q,P}$
+  \State \Return $\res=(A,P,D,O,J)$
+\EndProcedure
+\ProcGap
+\algstore{serFullLeft}
+\end{algorithmic}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.487\textwidth}
+\begin{algorithmic}[1]
+\algrestore{serFullLeft}
+\Procedure{PruneWWByReachability}{$G,C,P$}
+  \If{$C=\varnothing$} \State \Return \True \EndIf
+  \State $E_N\gets\{e\in E_G\mid$
+  \Statex\hspace{2.1em}$\mathit{type}(e)\in\{\SO,\WR,\WW,\RW\}\}$
+  \State $P\gets\TC(P\cup\Endpoints(E_N))$
+  \Repeat
+    \State $M\gets\varnothing$ \Comment{choices solved in this round}
+    \ForAll{$c=\langle either,or\rangle\in C$}
+      \State $c_e\gets\Call{WouldCycle}{P,either}$
+      \State $c_o\gets\Call{WouldCycle}{P,or}$
+      \If{$c_e\land c_o$} \State \Return \False \EndIf
+      \If{$c_e$}
+        \State $E_G\gets E_G\cup or$
+        \State $P\gets\TC(P\cup\Endpoints(or))$; $M\gets M\cup\{c\}$
+      \ElsIf{$c_o$}
+        \State $E_G\gets E_G\cup either$
+        \State $P\gets\TC(P\cup\Endpoints(either))$; $M\gets M\cup\{c\}$
+      \EndIf
+    \EndFor
+    \State $C\gets C\setminus M$
+  \Until{$C=\varnothing\lor |M|\leq\tau\max(1,|C|)$}
+  \State \Return \True \Comment{$\tau=0.01$ in the audited code}
+\EndProcedure
+\ProcGap
+\Procedure{WouldCycle}{$P,B$}
+  \State $B'\gets\{(u,v)\mid(u,v,t,x)\in B,\ t\in\{\WW,\RW\}\}$
+  \State \Return $\Call{Cycle}{P\cup B'}$ \Comment{whole branch; no mutation}
+\EndProcedure
+\ProcGap
+\Procedure{SAT-Encode}{$H,G,C,P,\res$}
+  \Require $\res.P\equiv P\land\neg\Call{HasConflict}{\res}$
+  \State $S\gets(\mathcal T_H,\varnothing)$; $\Bools,\Clauses,E_D\gets\varnothing$
+  \State $E_K\gets\Call{BuildKnownOrder}{G,P}$
+  \If{$E_K=\bot$}
+    \State \Return $(S,\Bools,\{\bot\})$
+  \EndIf
+  \ForAll{$(u,v)\in E_K\cup\Endpoints(\res.D)$ with $u,v\in\mathcal T_H$}
+    \State $\Clauses\gets\Clauses\cup\{\Call{Edge}{S,u,v}\}$
+  \EndFor
+  \State $E_D\gets\{(\top,e)\mid e\in E_G\cup\mathit{Typed}(\res.D)\}$
+  \ForAll{$c=\langle either,or\rangle\in C$}
+    \State $b_c\gets\Call{FreshBoolean}{}$; $\Bools\gets\Bools\cup\{b_c\}$
+    \ForAll{$e\in either$} \State $E_D\gets E_D\cup\{(b_c,e)\}$ \EndFor
+    \ForAll{$e\in or$} \State $E_D\gets E_D\cup\{(\neg b_c,e)\}$ \EndFor
+  \EndFor
+  \ForAll{$(u,v,x)$ represented by a $\WW$ entry in $E_D$}
+    \State $\ell_{u,v,x}\gets\bigvee\{\gamma\mid(\gamma,(u,v,\WW,x))\in E_D\}$
+  \EndFor
+  \State $(\Clauses_P,E_P)\gets\Call{EncodePredicates}{H,G,P,S,\res}$
+  \State $\Clauses\gets\Clauses\cup\Clauses_P$; $E_D\gets E_D\cup E_P$
+  \ForAll{$(\gamma,(u,v,t,x))\in E_D$}
+    \State $l\gets\Call{Order}{u,v}$
+    \State $\Clauses\gets\Clauses\cup\{\gamma\Rightarrow l\}$
+  \EndFor
+  \State $\Clauses\gets\Clauses\cup\{\Call{Acyclic}{S}\}$
+  \State \Return $\mathcal F=(S,\Bools,\Clauses)$
+\EndProcedure
+\ProcGap
+\Procedure{Order}{$u,v$}
+  \If{$u=v\lor v\precedes u$} \State \Return $\bot$ \EndIf
+  \If{$u\precedes v$} \State \Return $\top$ \EndIf
+  \If{$\{u,v\}$ has no order literals}
+    \State $e_{uv}\gets\Call{Edge}{S,u,v}$; $e_{vu}\gets\Call{Edge}{S,v,u}$
+    \State $\Clauses\gets\Clauses\cup\{e_{uv}\lor e_{vu},\ \neg e_{uv}\lor\neg e_{vu}\}$
+  \EndIf
+  \State \Return $e_{uv}$ \Comment{$b_{uv}$ abbreviates this call}
+\EndProcedure
+\ProcGap
+\Procedure{MonoSAT-Solve}{$\mathcal F$}
+  \State $solver\gets\Call{MonoSATSolver}{\mathcal F}$
+  % 只有进入 SAT 阶段才调用一次；内部一致性、WW 或谓词剪枝提前拒绝时不调用。
+  \State \Return $\Call{Solve}{solver}$
+\EndProcedure
+\end{algorithmic}
+\end{minipage}
+\end{algorithm}
+
+\clearpage
+% 谓词细节分为两页，保持既有字号。
+\begin{algorithm}[H]
+\caption{Predicate pruning, prepropagation, and complete encoding}
+\label{alg:predicate-details}
+\AlgFont
+\begin{minipage}[t]{0.487\textwidth}
+\begin{algorithmic}[1]
+\Procedure{BuildGMWR}{$O,P$}
+  \State $\mathcal Q\gets\varnothing$ \Comment{map keyed by $(T,B)$}
+  \ForAll{$\rho=(T,p,i)\in\dom(O)$ with $\Call{RowLocal}{p}$}
+    \ForAll{$k\in O[\rho].K$}
+      \If{$k.internal$} \State \Continue \EndIf
+      \If{$\neg k.valid$} \State \Return $\bot$ \EndIf
+      \If{$k.a\neq\bot$} \State \Continue \EndIf
+      \State $F\gets\Call{Frontier}{P,k.W,T}$
+      \ForAll{$b\in F\setminus k.Good$}
+        \State $B\gets\tx(b)$; $I\gets\{\tx(w)\mid w\in k.Good\}\setminus\{T,B\}$
+        \State $q\gets\Call{GetOrCreate}{\mathcal Q,(T,B)}$
+        \State $\Call{Append}{q.items,I}$ \Comment{do not union repair sets}
+      \EndFor
+    \EndFor
+  \EndFor
+  \State \Return $\mathcal Q$
+\EndProcedure
+\ProcGap
+\Procedure{PrePropagateGMWR}{$\mathcal Q,P,D$}
+  \State $Q\gets\Call{WorkQueue}{\mathcal Q}$; $J\gets\Call{IndexByTxn}{\mathcal Q}$
+  \While{$Q\neq\varnothing$}
+    \State $q=(T,B,\Items)\gets\Call{Pop}{Q}$
+    \If{$q.resolved$} \State \Continue \EndIf
+    \If{$T\precedes B$}
+      \State $q.resolved\gets\True$; \Continue
+    \EndIf
+    \If{$\forall I\in\Items,\ \exists g\in I:\ B\precedes g\land g\precedes T$}
+      \State $q.resolved\gets\True$; \Continue
+    \EndIf
+    \If{$B\precedes T$} \State $q.outside\gets\False$ \EndIf
+    \ForAll{$I\in\Items$}
+      \State $I\gets I\setminus\{g\mid g\precedes B\lor T\precedes g\}$
+    \EndFor
+    \If{$\exists I\in\Items:I=\varnothing$}
+      \If{$\neg q.outside$} \State \Return \False \EndIf
+      \If{$\neg\Call{PublishOrder}{P,T,B,D,Q,J}$}
+        \State \Return \False
+      \EndIf
+      \State \Continue
+    \EndIf
+    \If{$\neg q.outside$}
+      \ForAll{$I\in\Items$ with $I=\{g\}$}
+        \If{$\neg\Call{PublishOrder}{P,B,g,D,Q,J}$}
+          \State \Return \False
+        \EndIf
+        \If{$\neg\Call{PublishOrder}{P,g,T,D,Q,J}$}
+          \State \Return \False
+        \EndIf
+      \EndFor
+    \EndIf
+  \EndWhile
+  \State \Return \True
+\EndProcedure
+\algstore{predicateLeftA}
+\end{algorithmic}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.487\textwidth}
+\begin{algorithmic}[1]
+\algrestore{predicateLeftA}
+\Procedure{PublishOrder}{$P,u,v,D,Q,J$}
+  \If{$u=v\lor v\precedes u$} \State \Return \False \EndIf
+  \State $D\gets D\cup\{\Call{OrderFact}{u,v}\}$
+  \If{$u\precedes v$} \State \Return \True \EndIf
+  \State $A\gets\{u\}\cup\{a\mid a\precedes u\}$
+  \State $B\gets\{v\}\cup\{b\mid v\precedes b\}$
+  \State $\Delta\gets(A\times B)\setminus P$
+  \State $P\gets\TC(P\cup\{(u,v)\})$ \Comment{incremental implementation}
+  \State $U\gets\{a,b\mid(a,b)\in\Delta\}$
+  \ForAll{$q\in\bigcup_{t\in U}J(t)$ with $\neg q.resolved$}
+    \State $\Call{EnqueueIfAbsent}{Q,q}$
+  \EndFor
+  \State \Return \True
+\EndProcedure
+\ProcGap
+\Procedure{Frontier}{$P,W,T$}
+  \State $F\gets W$
+  \ForAll{$w\in W$}
+    \If{$T\precedes\tx(w)$}
+      \State $F\gets F\setminus\{w\}$
+    \ElsIf{$\exists z\in W:\ \tx(w)\precedes\tx(z)\precedes T$}
+      \State $F\gets F\setminus\{w\}$
+    \EndIf
+  \EndFor
+  \State \Return $F$ \Comment{retain incomparable writers}
+\EndProcedure
+\ProcGap
+\Procedure{PruneSourceCandidates}{$\rho,W,Good,P$}
+  \State $U\gets W$; $T\gets\rho.txn$
+  \ForAll{$a\in W\cap Good$}
+    \If{$T\precedes\tx(a)$}
+      \State $U\gets U\setminus\{a\}$
+    \Else
+      \ForAll{$z\in W$ with $\Call{KnownWW}{a,z}$}
+        \If{$\Call{Changed}{\rho.p,a,z}\land\tx(z)\precedes T$}
+          \State $U\gets U\setminus\{a\}$; \textbf{break}
+        \EndIf
+      \EndFor
+    \EndIf
+  \EndFor
+  \State \Return $\Call{Frontier}{P,U,T}$
+\EndProcedure
+\ProcGap
+\Procedure{LatestGuards}{$T,W$}
+  \ForAll{$w\in W$}
+    \State $v_w\gets b_{\tx(w),T}$
+  \EndFor
+  \ForAll{$w\in W$}
+    \State $\lambda_w\gets v_w\land$
+    \Statex\hspace{2.1em}$\displaystyle\bigwedge_{z\in W\setminus\{w\}}
+         \neg\bigl(\Call{BeforeWrite}{w,z}\land v_z\bigr)$
+  \EndFor
+  \State \Return $\{(w,\lambda_w)\mid w\in W\}$
+\EndProcedure
+\ProcGap
+\Procedure{RowDependencies}{$\rho,x,a,\lambda_a,W,U$}
+  \State $T\gets\rho.txn$; $E\gets\{(\lambda_a,(\tx(a),T,\PRWR,x))\}$
+  \ForAll{$z\in W\setminus\{a\}$}
+    \If{$\tx(z)\precedes T\land z\notin U$} \State \Continue \EndIf
+    \If{$\Call{Changed}{\rho.p,a,z}$}
+      \State $\gamma\gets\lambda_a\land\Call{BeforeWrite}{a,z}$
+      \State $E\gets E\cup\{(\gamma,(T,\tx(z),\PRRW,x))\}$
+    \EndIf
+  \EndFor
+  \State \Return $E$
+\EndProcedure
+\algstore{predicatePageA}
+\end{algorithmic}
+\end{minipage}
+\end{algorithm}
+\clearpage
+\begin{algorithm}[H]
+\ContinuedFloat
+\caption{Predicate pruning, prepropagation, and complete encoding (continued)}
+\AlgFont
+\begin{minipage}[t]{0.487\textwidth}
+\begin{algorithmic}[1]
+\algrestore{predicatePageA}
+\Procedure{EncodePredicates}{$H,G,P,S,\res$}
+  \State $\Clauses_P,E_P\gets\varnothing$
+  \ForAll{$\rho=(T,p,i)\in\Obs$}
+    \State $o\gets\res.O[\rho]$; $Src\gets o.Src$
+    \If{$\neg o.valid$}
+      \State $\Clauses_P\gets\Clauses_P\cup\{\bot\}$; \Continue
+    \EndIf
+    \If{$\neg\Call{RowLocal}{p}$}
+      \State $(C',E')\gets\Call{EncodeQueryPlan}{\rho,Src}$
+      \State $\Clauses_P\gets\Clauses_P\cup C'$; $E_P\gets E_P\cup E'$
+      \State \Continue
+    \EndIf
+    \ForAll{$k\in o.K$}
+      \If{$\neg k.valid$}
+        \State $\Clauses_P\gets\Clauses_P\cup\{\bot\}$; \Continue
+      \EndIf
+      \If{$k.internal$} \State \Continue \EndIf
+      \If{$k.a\neq\bot$}
+        \State $(C',E')\gets\Call{EncodeFixedSource}{\rho,k.x,k.a,k.W}$
+      \Else
+        \State $(C',E')\gets\Call{EncodeAbsentKey}{\rho,k}$
+      \EndIf
+      \State $\Clauses_P\gets\Clauses_P\cup C'$; $E_P\gets E_P\cup E'$
+    \EndFor
+  \EndFor
+  \State $\Clauses_P\gets\Clauses_P\cup\Call{EncodeResidualGMWR}{\res.J}$
+  \State $E_P\gets\Call{CoalescePredicateDeps}{E_P}$
+  \State \Return $(\Clauses_P,E_P)$
+\EndProcedure
+\ProcGap
+\Procedure{FixedLatestClauses}{$T,a,W$}
+  \If{$a\notin W$} \State \Return $\{\bot\}$ \EndIf
+  \State $C\gets\{b_{\tx(a),T}\}$
+  \ForAll{$z\in W\setminus\{a\}$}
+    \State $C\gets C\cup\{\neg\Call{BeforeWrite}{a,z}\lor\neg b_{\tx(z),T}\}$
+  \EndFor
+  \State \Return $C$
+\EndProcedure
+\ProcGap
+\Procedure{EncodeFixedSource}{$\rho,x,a,W$}
+  \State $C\gets\Call{FixedLatestClauses}{\rho.txn,a,W}$
+  \If{$C=\{\bot\}$} \State \Return $(C,\varnothing)$ \EndIf
+  \State $E\gets\Call{RowDependencies}{\rho,x,a,\top,W,W}$
+  \State \Return $(C,E)$
+\EndProcedure
+\ProcGap
+\Procedure{EncodeAbsentKey}{$\rho,k$}
+  \State $T\gets\rho.txn$; $C,E\gets\varnothing$
+  \State $(x,W,Good,U)\gets(k.x,k.W,k.Good,k.U)$
+  \If{$U=\{a\}\land\tx(a)\precedes T$}
+    \If{$a\notin Good$} \State \Return $(\{\bot\},\varnothing)$ \EndIf
+    \State $L\gets\{(a,\top)\}$
+  \Else
+    \State $L\gets\Call{LatestGuards}{T,U}$
+  \EndIf
+  \ForAll{$(a,\lambda_a)\in L$ with $a\in Good$}
+    \State $E\gets E\cup\Call{RowDependencies}{\rho,x,a,\lambda_a,W,U}$
+  \EndFor
+  \State \Return $(C,E)$ \Comment{result validity comes from GMWR}
+\EndProcedure
+\algstore{predicateLeftB}
+\end{algorithmic}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.487\textwidth}
+\begin{algorithmic}[1]
+\algrestore{predicateLeftB}
+\Procedure{EncodeResidualGMWR}{$J$}
+  \State $C\gets\varnothing$
+  \ForAll{$(T,B,outside,I)\in J$}
+    \State $L\gets\varnothing$
+    \If{$outside$} \State $L\gets L\cup\{b_{T,B}\}$ \EndIf
+    \ForAll{$g\in I$}
+      \State $L\gets L\cup\{b_{B,g}\land b_{g,T}\}$
+    \EndFor
+    \If{$\top\notin L$} \State $C\gets C\cup\{\bigvee(L\setminus\{\bot\})\}$ \EndIf
+  \EndFor
+  \State \Return $C$ \Comment{$\bigvee\varnothing=\bot$; items are conjunctive}
+\EndProcedure
+\ProcGap
+\Procedure{EncodeQueryPlan}{$\rho,Src$}
+  \State $T\gets\rho.txn$; $C,E,V\gets\varnothing$
+  \ForAll{$x\in\Call{ScopedKeys}{\rho.p}$}
+    \State $W_x\gets\Call{LatestExt}{x,T}$
+    \State $a\gets\Call{LatestSelfBefore}{x,T,\rho.index}$
+    \If{$a\neq\bot$}
+      \If{$Src(x)\neq\bot\land Src(x)\neq a$}
+        \State \Return $(\{\bot\},\varnothing)$
+      \EndIf
+      \State $L_x\gets\{(a,\top)\}$
+      \State $\Call{AddVersions}{V,\{a\},L_x}$
+    \ElsIf{$Src(x)=a\neq\bot$}
+      \State $C_a\gets\Call{FixedLatestClauses}{T,a,W_x}$
+      \State $C\gets C\cup C_a$; $L_x\gets\{(a,\top)\}$
+      \State $\Call{AddVersions}{V,W_x,L_x}$
+    \Else
+      \State $L_x\gets\Call{LatestGuards}{T,W_x}$
+      \State $\Call{AddVersions}{V,W_x,L_x}$
+    \EndIf
+    \ForAll{$(a,\lambda_a)\in L_x$ with $\tx(a)\neq T$}
+      \State $E\gets E\cup\{(\lambda_a,(\tx(a),T,\PRWR,x))\}$
+    \EndFor
+  \EndFor
+  \State $\mathcal B\gets\Call{ContributingBindings}{\rho.p,V}$
+  \State $\kappa\gets(w\mapsto\bot)$ \Comment{default context for every write}
+  \ForAll{$\beta\in\mathcal B$}
+    \If{$\beta\not\subseteq Src$ and every $w\in\beta$ is selectable}
+      \State $C\gets C\cup\{\displaystyle\bigvee_{w\in\beta}\neg\lambda_w\}$
+    \EndIf
+    \ForAll{$w\in\beta$}
+      \If{every $z\in\beta\setminus\{w\}$ is selectable}
+        \State $\kappa_w\gets\kappa_w\lor\displaystyle\bigwedge_{z\in\beta\setminus\{w\}}\lambda_z$
+      \EndIf
+    \EndFor
+  \EndFor
+  \ForAll{external frontiers $L_x$}
+    \ForAll{$(a,\lambda_a)\in L_x$, $z\in W_x\setminus\{a\}$}
+      \State $\gamma\gets\lambda_a\land\Call{BeforeWrite}{a,z}\land(\kappa_a\lor\kappa_z)$
+      \State $E\gets E\cup\{(\gamma,(T,\tx(z),\PRRW,x))\}$
+    \EndFor
+  \EndFor
+  \State \Return $(C,E)$ \Comment{complete before solving}
+\EndProcedure
+\ProcGap
+\Procedure{CoalescePredicateDeps}{$E$}
+  \State $M,E'\gets\varnothing$
+  \ForAll{$(\gamma,(u,v,t,x))\in E$}
+    \If{$(u,v,t)\notin\dom(M)$}
+      \State $M[u,v,t]\gets(u,v,t,\varnothing)$
+    \EndIf
+    \State $e\gets M[u,v,t]$; $e.keys\gets e.keys\cup\{x\}$
+    \State $E'\gets E'\cup\{(\gamma,e)\}$
+  \EndFor
+  \State \Return $E'$ \Comment{each support still implies its edge}
+\EndProcedure
+\end{algorithmic}
+\end{minipage}
+\end{algorithm}
+
+\end{document}

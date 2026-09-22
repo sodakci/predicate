@@ -7,7 +7,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 
 /** Alias-to-version bindings carried between relational AST nodes. */
 public final class BindingRow<KeyType, ValueType> {
@@ -33,14 +32,6 @@ public final class BindingRow<KeyType, ValueType> {
             }
         });
         return new BindingRow<>(merged);
-    }
-
-    public RowVersion<KeyType, ValueType> get(String alias) {
-        return bindings.get(alias);
-    }
-
-    public Set<String> aliases() {
-        return bindings.keySet();
     }
 
     public Collection<RowVersion<KeyType, ValueType>> sources() {

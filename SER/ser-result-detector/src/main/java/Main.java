@@ -135,7 +135,9 @@ class Audit implements Callable<Integer> {
             printGmwrSummary();
             break;
         case PREDICATE:
-            printPredicateSummary();
+            if (solverStats) {
+                printPredicateSummary();
+            }
             break;
         case SAT:
             printSatSummary();
@@ -160,24 +162,20 @@ class Audit implements Callable<Integer> {
     }
 
     private void printGmwrSummary() {
-        long wwInitial = profiler.getCount("WW_INITIAL_CHOICES");
-        long wwAfterReachability = profiler.getCount("WW_AFTER_REACHABILITY");
-        long gmwrInitial = profiler.getCount("GMWR_INITIAL_CONSTRAINTS");
-        long gmwrResidual = profiler.getCount("GMWR_RESIDUAL_CONSTRAINTS");
-        long gmwrMs = profiler.getTime("GMWR_BUILD_MS")
-                + profiler.getTime("GMWR_REDUCTION_MS");
         System.err.println("GMWR");
-        printSummaryTransition("Constraints:", gmwrInitial, gmwrResidual);
+        long initial = profiler.getCount("SER_PRED_PR_WR_INITIAL_CONSTRAINTS_COUNT");
+        long residual = profiler.getCount("SER_PRED_PR_WR_RESIDUAL_CONSTRAINTS_COUNT");
+        long forced = profiler.getCount("SER_PRED_PR_WR_FORCED_CONSTRAINTS_COUNT");
+        System.err.printf(Locale.ROOT, "PR_WR constraints: %s -> %s%n",
+                grouped(initial), grouped(residual));
+        System.err.printf(Locale.ROOT, "Forced PR_WR constraints: %s (%.1f%%)%n",
+                grouped(forced), percentage(forced, initial));
         System.err.printf(Locale.ROOT,
-                "PRUNING_COMPARISON_STATS ww_original=%d ww_residual=%d ww_reduced=%d "
-                        + "ww_time_ms=%d gmwr_obligations_original=%d "
-                        + "gmwr_obligations_residual=%d gmwr_obligations_reduced=%d "
-                        + "gmwr_time_ms=%d%n",
-                wwInitial, wwAfterReachability,
-                Math.max(0L, wwInitial - wwAfterReachability),
-                profiler.getTime("WW_REACHABILITY_PRUNE_MS"),
-                gmwrInitial, gmwrResidual, Math.max(0L, gmwrInitial - gmwrResidual),
-                gmwrMs);
+                "PR_WR candidates: %s -> %s remaining (%s pruned, %s fixed)%n",
+                grouped(profiler.getCount("SER_PRED_PR_WR_INITIAL_CANDIDATES_COUNT")),
+                grouped(profiler.getCount("SER_PRED_PR_WR_RESIDUAL_CANDIDATES_COUNT")),
+                grouped(profiler.getCount("SER_PRED_PR_WR_PRUNED_CANDIDATES_COUNT")),
+                grouped(profiler.getCount("SER_PRED_PR_WR_FIXED_CANDIDATES_COUNT")));
         System.err.println();
     }
 
@@ -209,13 +207,13 @@ class Audit implements Callable<Integer> {
     }
 
     private void printTimingSummary() {
-        long gmwrMs = profiler.getTime("GMWR_BUILD_MS")
-                + profiler.getTime("GMWR_REDUCTION_MS");
         System.err.println("Timing");
         if (selectedPredicateEncoding == SERVerifier.PredicateSolvingMode.GMWR) {
             System.err.printf(Locale.ROOT,
-                    "WW: %.3fs | GMWR: %.3fs | Predicate: %.3fs%n",
-                    seconds("WW_REACHABILITY_PRUNE_MS"), gmwrMs / 1000.0,
+                    "WW: %.3fs | GMWR build: %.3fs | Predicate pruning: %.3fs | Prepropagation: %.3fs%n",
+                    seconds("WW_REACHABILITY_PRUNE_MS"), seconds("GMWR_BUILD_MS"),
+                    seconds("GMWR_PRUNING_MS"), seconds("GMWR_REDUCTION_MS"));
+            System.err.printf(Locale.ROOT, "Predicate: %.3fs%n",
                     seconds("SER_AR_ENCODE_PREDICATE"));
         } else {
             System.err.printf(Locale.ROOT, "WW: %.3fs | Predicate: %.3fs%n",
@@ -227,12 +225,6 @@ class Audit implements Callable<Integer> {
                 seconds("SER_MONOSAT_SOLVE"), seconds("SER_VERIFY_INT"),
                 seconds("ENTIRE_EXPERIMENT"));
         System.err.flush();
-    }
-
-    private static void printSummaryTransition(
-            String label, long initial, long residual) {
-        System.err.printf(Locale.ROOT, "%-12s %9s -> %s%n",
-                label, grouped(initial), grouped(residual));
     }
 
     private double seconds(String metric) {

@@ -92,10 +92,6 @@ public final class QueryPlan<KeyType, ValueType>
         return distinct;
     }
 
-    public List<QueryAst.ProjectedColumn<KeyType, ValueType>> columns() {
-        return columns;
-    }
-
     /** Allocation-light single-row membership evaluator compiled from the AST. */
     public Optional<BiPredicate<KeyType, ValueType>> compiledRowMatcher() {
         return compiledRowMatcher;

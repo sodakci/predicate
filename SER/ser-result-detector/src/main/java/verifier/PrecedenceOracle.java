@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * Audit-scoped incremental transitive closure shared by SER modules.
@@ -72,10 +73,6 @@ final class PrecedenceOracle<NodeType> {
         return nodesIn(successors[indexOf(from)]);
     }
 
-    Set<NodeType> predecessor(NodeType to) {
-        return nodesIn(predecessors[indexOf(to)]);
-    }
-
     boolean wouldCycle(NodeType from, NodeType to) {
         cycleChecks++;
         int fromIndex = indexOf(from);
@@ -124,6 +121,11 @@ final class PrecedenceOracle<NodeType> {
 
     /** Adds one precedence relation; returns false only when it would create a cycle. */
     boolean add(NodeType from, NodeType to) {
+        return add(from, to, null);
+    }
+
+    /** 闭包完整更新后，对新增可达关系涉及的每个端点通知一次。 */
+    boolean add(NodeType from, NodeType to, Consumer<NodeType> onAffected) {
         addAttempts++;
         int fromIndex = indexOf(from);
         int toIndex = indexOf(to);
@@ -140,15 +142,32 @@ final class PrecedenceOracle<NodeType> {
         affectedPredecessors.set(fromIndex);
         var affectedSuccessors = (BitSet) successors[toIndex].clone();
         affectedSuccessors.set(toIndex);
+        var changedNodes = onAffected == null ? null : new BitSet(nodes.size());
+        var newSuccessors = onAffected == null ? null : new BitSet(nodes.size());
         for (int predecessor = affectedPredecessors.nextSetBit(0);
                 predecessor >= 0;
                 predecessor = affectedPredecessors.nextSetBit(predecessor + 1)) {
+            if (onAffected != null) {
+                newSuccessors.clear();
+                newSuccessors.or(affectedSuccessors);
+                newSuccessors.andNot(successors[predecessor]);
+                if (!newSuccessors.isEmpty()) {
+                    changedNodes.set(predecessor);
+                    changedNodes.or(newSuccessors);
+                }
+            }
             successors[predecessor].or(affectedSuccessors);
         }
         for (int successor = affectedSuccessors.nextSetBit(0);
                 successor >= 0;
                 successor = affectedSuccessors.nextSetBit(successor + 1)) {
             predecessors[successor].or(affectedPredecessors);
+        }
+        if (onAffected != null) {
+            for (int node = changedNodes.nextSetBit(0); node >= 0;
+                    node = changedNodes.nextSetBit(node + 1)) {
+                onAffected.accept(nodes.get(node));
+            }
         }
         return true;
     }

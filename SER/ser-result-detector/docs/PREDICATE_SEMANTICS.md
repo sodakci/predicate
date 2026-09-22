@@ -30,9 +30,11 @@
 ## 4. 求解器组织
 
 ```text
-PredicateObservation
-    -> 公共来源、scope、结果输入自洽检查
-    -> 可证明 row-local：现有 EAGER / GMWR 加速
+WW reachability
+    -> PredicateAnalysis：公共写索引、scope、结果输入及行贡献语义
+    -> PredicatePruning：逐 key 数据、GMWR 义务及可选预传播、来源/区间剪枝、残余整理；冲突提前 REJECT
+    -> SERSolverAR：消费剪枝结果
+       可证明 row-local：现有 EAGER / GMWR 编码
        受支持非 row-local 单调 QueryPlan：完整 JOIN binding 编码
        DISTINCT / 自定义全快照 evaluator：明确报不支持
     -> 同一 serializationGraph，单次 solve
@@ -42,7 +44,7 @@ PredicateObservation
 
 `encodeExplicitMultiRelationPredicate()` 枚举产生结果的物理版本 binding，约束 recorded sources 为 latest、排除额外 binding，并生成上下文守卫的 PR_WR/PR_RW。查询前自写仍作为本事务可见版本处理；所有约束在单次 SAT 求解前生成。
 
-保留单表 GMWR obligation、预传播、紧凑结果表示与行贡献缓存。每个 item obligation 仍显式保留；删除循环后备路径及专用快照记录、模型读取和 no-good 追加方法，不保留求解后补约束。
+单表逐 key 分析、GMWR obligation/预传播、PR_WR 可达性和 PR_RW 环过滤、区间候选剪枝及残余整理均由独立 `PredicatePruning` 阶段负责。共享 `PredicateAnalysis` 保留写索引、行贡献缓存和纯语义操作。`Result` 提供只读 observation、来源候选域、确定事实和 residual items，不暴露活动传播状态；SAT 编码器共用一套逐 key 遍历，消费结果而不重复分析 absent key。EAGER 准备完整候选域且不构造 GMWR 状态；关闭预传播仍把未消解 residual items 交给 SAT。每个 item obligation 仍显式保留；删除循环后备路径及专用快照记录、模型读取和 no-good 追加方法，不保留求解后补约束。
 
 ## 5. 回归与正常构建
 

@@ -8,8 +8,10 @@
 | --- | --- | --- | --- |
 | JAR/CLI 入口 | `SER/ser-result-detector/src/main/java/Main.java` | `Main.main(String[])` | 创建 Picocli `CommandLine`，只注册 `audit` 子命令，进程退出码取该命令返回值。 |
 | SER 命令入口 | 同上 | `Audit.call()` | 解析 SER 配置，构造 `PredicateHistoryLoader`、`SERVerifier.SolverSettings`，调用 `SERVerifier.audit()`，打印 timing/count、最大内存和 verdict marker。 |
-| checker 总控 | `SER/ser-result-detector/src/main/java/verifier/SERVerifier.java` | `SERVerifier.audit()` | 串联一致性检查、`KnownGraph`、WW/RW constraint、基线 pruning、`SERSolverAR` 编码和求解，并映射到 verdict。 |
-| precedence primitive | `SER/ser-result-detector/src/main/java/verifier/PrecedenceOracle.java` | `before/successor/predecessor/wouldCycle` | 唯一 Java precedence engine；统一维护增量传递闭包和批量 branch 成环预判。 |
+| checker 总控 | `SER/ser-result-detector/src/main/java/verifier/SERVerifier.java` | `SERVerifier.audit()` | 串联一致性检查、`KnownGraph`、WW/RW constraint、WW 剪枝、独立 `PredicatePruning`、`SERSolverAR` 编码和单次求解，并映射到 verdict。 |
+| 谓词剪枝 | `SER/ser-result-detector/src/main/java/verifier/PredicatePruning.java` | `prune()` / `Result` | 在 SAT 编码前构造 row-local GMWR 义务并可选传播；交接残余义务、确定事实和阶段冲突。 |
+| 共享谓词分析 | `SER/ser-result-detector/src/main/java/verifier/PredicateAnalysis.java` | 写索引、scope、行贡献及 absent-key 分析 | 剪枝与编码共享同一份无 MonoSAT 依赖的语义计算及缓存。 |
+| precedence primitive | `SER/ser-result-detector/src/main/java/verifier/PrecedenceOracle.java` | `before/successor/wouldCycle/add` | 唯一 Java precedence engine；统一维护增量传递闭包、变化端点通知和批量 branch 成环预判。 |
 | 求解入口 | `SER/ser-result-detector/src/main/java/verifier/SERSolverAR.java` | 构造函数；`solve()`；`solveOnce()` | 构造 logical dependency layer + 唯一 MonoSAT serialization graph；构造前验证查询范围；完整编码后仅调用一次 MonoSAT。 |
 | latest-visible primitive | `SER/ser-result-detector/src/main/java/verifier/LatestVisibleChecker.java` | `check(reader,key,candidateWriters,serializationOrder)` | 为未确定的来源返回 visible literal 与 latest-writer validity；固定来源和 row-local 确定可见单候选绕过通用 checker。 |
 | verdict | `SERVerifier.AuditResult` | `ACCEPT/REJECT/INVALID_HISTORY` | `SAT -> ACCEPT(0)`；`UNSAT` 或 checker 提前冲突 -> `REJECT(-1)`。`INVALID_HISTORY(2)` 在当前 `audit()` 路径中没有显式转换点。 |
@@ -27,8 +29,10 @@ Main.main
         -> new KnownGraph(history)
         -> SERVerifier.generateConstraintsSER
         -> Pruning.pruneConstraints / NONE
-        -> new SERSolverAR(history, graph, residualConstraints, ...)
-           -> propagateBeforeEncoding [GMWR only]
+        -> new PredicateAnalysis(history, graph, precedence)
+        -> PredicatePruning.prune [GMWR 义务与可选传播；EAGER 无 GMWR 状态]
+           -> 冲突：输出阶段原因并 REJECT，不构造 MonoSAT
+        -> new SERSolverAR(history, graph, residualConstraints, ..., precedence, predicateResult)
            -> buildKnownOrder
            -> encodeKnownEdges
            -> encodeRemainingWwChoices
@@ -36,7 +40,7 @@ Main.main
            -> encodeDependencyEdges
            -> encodeSerializationAcyclicity
         -> SERSolverAR.solve
-           -> solveOnce -> monosat.Solver.solve[Limited]
+           -> solveOnce -> monosat.Solver.solve
         -> AuditResult
      -> print marker / return exit code
 ```
@@ -56,10 +60,10 @@ Main.main
 | `src/main/java/history/Session.java` | `Session` | `id + 有序 transaction list`；该 list 的相邻元素产生 SO。 |
 | `src/main/java/history/Transaction.java` | `Transaction` | `(session,id) + 有序 Event list + ONGOING/COMMIT`。 |
 | `src/main/java/history/Event.java` | `Event` / `PredResult` | `READ/WRITE/PREDICATE_READ`；点操作持有 key/value，谓词读持有 evaluator、结果来源项和 recorded result。 |
-| `src/main/java/history/query/StructuredQueryParser.java` | `parse()` | 把结构化 query JSON 解析为 relational/expression AST 和 `QueryPlan`。 |
+| `src/main/java/history/query/StructuredQueryParser.java` | `parse()` | 构造时显式传入 `ValueAdapter` 和 `RelationResolver`；把结构化 query JSON 解析为 relational/expression AST 和 `QueryPlan`。 |
 | `src/main/java/history/query/QueryPlan.java` | `evaluate()` / `isRowLocal()` / `isMonotone()` | 执行 query；返回投影值和实际输入版本；决定 row-local EAGER/GMWR 与显式 JOIN 编码；检测器不支持 DISTINCT。 |
-| `src/main/java/history/query/QueryEvaluation.java` | `QueryEvaluation` | 保存 `values`、`inputs`、值多重集、canonical inputs。 |
-| `src/main/java/history/query/RecordedQueryResult.java` | `GeneralRecordedQueryResult` / `RowLocalRecordedQueryResult` | 保存或紧凑表示 history 中记录的 query 结果，并提供 canonical equality。 |
+| `src/main/java/history/query/QueryEvaluation.java` | `QueryEvaluation` | 保存投影值、实际输入、值多重集和 canonical inputs；通过 `values()` / `inputs()` 访问结果。 |
+| `src/main/java/history/query/RecordedQueryResult.java` | `GeneralRecordedQueryResult` / `RowLocalRecordedQueryResult` | 保存或紧凑表示 history 中记录的 query 结果，通过 `values()` / `inputs()` 访问，并提供 canonical equality。 |
 | `src/main/java/history/query/MapVisibleState.java` | `MapVisibleState` | checker 在具体候选 snapshot 上执行 query 时的 key/value 可见状态。 |
 
 当前代码没有名为 `Vset` 的 class/field。与“观察到的版本集合”对应的实际结构是 `result.inputs -> Event.PredResult / RecordedQueryResult.inputs()`，进入 checker 后再转换为 `KnownGraph.PredicateObservation.tupleSources`、solver 的 `KeyFrontier` 和具体 snapshot map。
@@ -95,7 +99,7 @@ Main.main
 | --- | --- | --- |
 | SO | `KnownGraph` constructor：每个 session 的相邻 transaction | 不产生候选 SO。 |
 | WR | `KnownGraph` constructor：point read 唯一 source writer -> reader，同时写入 `readFrom` 和 A | 不由 SAT 选择。 |
-| WW | `SERVerifier.generateConstraintsCoalesce` 产生两方向候选；pruning/GMWR feedback 可把被迫分支提交到 A | residual 分支由 `SERSolverAR.encodeRemainingWwChoices()` 以 Boolean guard 编码。 |
+| WW | `SERVerifier.generateConstraintsCoalesce` 产生两方向候选；WW pruning 可把被迫分支提交到 A | residual 分支由 `SERSolverAR.encodeRemainingWwChoices()` 以 Boolean guard 编码。 |
 | RW | 同一 WW decision 分支内由固定 WR + 另一 writer 产生；forced 分支提交到 B，residual 分支由同一 guard 激活 | 无独立 RW 重建路径。 |
 | Pred-WR (`PR_WR`) | 主路径初始 `KnownGraph` 不生成 | `SERSolverAR` 的 recorded source / selected frontier 产生 fixed 或 guarded PR_WR；GMWR preprop 可产生 definite typed PR_WR。 |
 | Pred-RW (`PR_RW`) | 主路径初始 `KnownGraph` 不生成 | `LatestVisibleChecker` 产出 source validity，`encodeRecordedSourceDependencies()`、`encodeSelectedSourceDependencies()` 根据 selected source、later write 和 result delta 产生 guarded PR_RW。 |
@@ -114,7 +118,7 @@ Main.main
 | --- | --- | --- |
 | `NONE`（仅内部测试） | `SERVerifier.audit()` switch | 不做 checker pruning；生产 CLI 不再暴露。 |
 | `REACHABILITY`（默认） | `new Pruning(precedence)::pruneConstraints()` | 用 A+B 中非 predicate edge填充 audit唯一的 `PrecedenceOracle`；由 oracle判定整个branch加入后是否成环；一侧非法则提交另一侧WW/RW到 `KnownGraph`并删除constraint；两侧非法直接冲突。 |
-| GMWR preprop | `GmwrPropagationState.propagate()` | solver 构造阶段的第二层 checker propagation；削减 GMWR repair/frontier domain，产生 definite order/typed facts或冲突。 |
+| 谓词剪枝 | `PredicatePruning.prune()` -> `GmwrPropagationState.propagate()` | WW 剪枝后的独立阶段；准备 row-local 数据、构造 items，可选传播，再完成来源/区间剪枝和残余整理，产生候选域、确定事实或冲突。关闭预传播仍保留所有未消解 items；EAGER 不创建 GMWR 状态。 |
 
 ### 6.1 REACHABILITY
 
@@ -122,9 +126,9 @@ Main.main
 
 ### 6.2 唯一 deterministic before relation
 
-`SERVerifier`创建一次 `PrecedenceOracle<Transaction>`，先交给 `Pruning` 完成 baseline WW/RW 剪枝，再经 constructor injection 传给 `SERSolverAR` 和 `GmwrPropagationState`。所有生产组件的 `before(a,b)`读取同一实例，solver known-order不再另建 closure。当前没有 GMWR-to-WW feedback。
+`SERVerifier`创建一次 `PrecedenceOracle<Transaction>`，先交给 `Pruning` 完成 baseline WW/RW 剪枝，再传给 `PredicatePruning` 及其 `GmwrPropagationState`，最后连同剪枝结果注入 `SERSolverAR`。所有生产组件的 `before(a,b)`读取同一实例，solver known-order不再另建 closure。当前没有 GMWR-to-WW feedback。
 
-oracle只保存history/known graph、pruning结论与GMWR forced facts等 deterministic order。residual WW guard、frontier selection和其他MonoSAT decision literal只存在于Boolean/theory encoding，绝不反写oracle。独立的conflict-extraction solve拥有自己的solve context，不与主solve共享可变oracle。
+oracle只保存history/known graph、pruning结论与GMWR forced facts等 deterministic order。residual WW guard、frontier selection和其他MonoSAT decision literal只存在于Boolean/theory encoding，绝不反写oracle。UNSAT 的 conflict clause 直接来自这一次求解，不为冲突提取重新求解。
 
 ## 7. SERSolverAR 编码索引
 
@@ -132,9 +136,9 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 
 构造期真实顺序：
 
-1. 创建 `monosat.Solver`、唯一 `serializationGraph` 及 real transaction nodes（bottom 不进 MonoSAT 图）。
-2. 建 write/key 索引。
-3. `propagateBeforeEncoding()`：GMWR obligation/frontier 构造及可选预传播。
+1. 校验已准备的 `PredicatePruning.Result` 与注入的 oracle 是同一实例，且结果没有冲突。
+2. 创建 `monosat.Solver`、唯一 `serializationGraph` 及 real transaction nodes（bottom 不进 MonoSAT 图）。
+3. 复用结果中的 `PredicateAnalysis` 写索引、observation、来源候选域及残余 item 快照，不在构造器执行传播或候选域剪枝。
 4. `buildKnownOrder()`：把 A+B 的已知 transaction precedence 送入 `PrecedenceOracle`，并生成 transitive reduction。
 5. `encodeKnownEdges()`。
 6. `encodeRemainingWwChoices()`：WW decision 同时排队分支内的 WW/RW。
@@ -172,16 +176,17 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 
 | 路径 | 函数 | 作用 |
 | --- | --- | --- |
-| 共享 | `encodePredicateConstraints()` | 每个有效observation先注册`PREDICATE_OBLIGATION` assumption；按 observation 建 result-source map 和 query-scope write index；row-local 分派 EAGER/GMWR，非 row-local 的受支持单调 QueryPlan 显式编码 JOIN bindings；全部约束在求解前生成并受 observation assumption 守卫。 |
-| GMWR | `encodeKnownEdges()` / `encodeResidualGmwr()` | propagation forced fact、propagation conflict及每条materialized residual rule注册`GMWR_RULE` assumption，并以该literal守卫对应order或clause。 |
+| 共享 | `encodePredicateConstraints()` | 每个有效observation先注册`PREDICATE_OBLIGATION` assumption；消费已准备的 result-source map 和 query-scope write index；row-local 共用 `encodeRowLocalPredicate()`，非 row-local 的受支持单调 QueryPlan 显式编码 JOIN bindings；全部约束在求解前生成并受 observation assumption 守卫。 |
+| GMWR | `encodeKnownEdges()` / `encodeResidualGmwr()` | 对结果中的确定事实和每条残余规则注册 `GMWR_RULE` assumption，守卫对应 order/clause；阶段冲突在创建求解器前处理。 |
 | 共享 | `LatestVisibleChecker.check()` | 输入 reader、key、candidate writers 和 serialization order，统一计算 `writer<reader AND` 不存在更晚可见 writer 的 validity。 |
 | 共享 | `createExternalKeyFrontier()` / `createExplicitQueryFrontier()` | 前者处理 row-local 未定来源；后者处理 JOIN frontiers。固定来源由 `assertFixedSourceLatest()` 对全部竞争写直接提交 O(m) latest 子句，JOIN 仅保留单候选 handle。 |
 | 共享 | `encodeSelectedPredicateDependencies()` | selected source guard 激活 PR_WR；`selected AND source<later AND delta` 激活 PR_RW。 |
-| EAGER | `encodeRowLocalPredicateEager()` | recorded source 调用 `encodeFixedPredicateSource()`，不构造 frontier；absent key 由 `encodeAbsentRowLocalKey()` 在唯一来源已确定可见时直接编码，否则调用 checker 并建立 bad-writer blocking disjunction。 |
-| GMWR | `collectGmwrLogicalConstraints()` | row-local absent key 产生 `(reader,badWriter)` GMWR item，repair 是产生空贡献的 good writers；item 显式保留。 |
-| GMWR | `GmwrPropagationState` | `PrecedenceOracle` + obligation/frontier worklist；去除不可能 repair，识别 satisfied/conflict，强制 outside/single repair/unique PR_WR。 |
-| GMWR | `encodeRowLocalPredicateGmwr()` | 固定来源直接编码；absent key 保留原 source/interval 缩减，确定可见单候选绕过容器与 checker，其他候选仍 source-aware；absent validity 由 GMWR obligations 表示。 |
-| GMWR | `resolveAndEncodeGmwrObligations()` / `encodeResidualGmwr()` | 未由 checker 决定的每个 item进入 SAT：`reader<bad OR OR(bad<repair AND repair<reader)`。这些是 order literals/Boolean clauses，不直接产生 typed graph edge。 |
+| EAGER | `encodeRowLocalPredicate()` | recorded source 调用 `encodeFixedPredicateSource()`，不构造 frontier；absent key 由 `encodeAbsentRowLocalKey()` 在唯一来源已确定可见时直接编码，否则调用 checker 并建立 bad-writer blocking disjunction。 |
+| GMWR 构建 | `PredicatePruning.pruneGmwrItemCandidates()` / `collectGmwrLogicalConstraints()` | 先单独完成整批区间剪枝，再由保留的 bad writer 为 row-local absent key 产生 `(reader,badWriter)` GMWR item，repair 是产生空贡献的 good writers；item 显式保留。 |
+| GMWR 剪枝 | `PredicatePruning.finalizeSourceDomains()` / `forceUniquePrWrSource()` / `prepareResidualItems()` | 完成 PR_WR 可达性、PR_RW 环及区间剪枝；唯一合法真实来源直接登记去重 typed PR_WR 并强制顺序，迭代收缩其他来源域；唯一 bottom 只解决来源选择；按来源约束和候选分别计数，移除已满足 item 与不可能 repair，交接只读候选域和残余列表。 |
+| GMWR | `GmwrPropagationState` | `PrecedenceOracle` + obligation worklist；去除不可能 repair，识别 satisfied/conflict，强制 outside/single repair。 |
+| GMWR | `encodeRowLocalPredicate()` | 固定来源直接编码；absent key 消费 `RowKey.sourceWrites`，确定可见单候选绕过容器与 checker，其他候选仍 source-aware；absent validity 由准备好的 GMWR residual items 表示。 |
+| GMWR | `resolveAndEncodeGmwrObligations()` / `encodeResidualGmwr()` | 消费 `Result.residualItems()`，每个残余 item 进入 SAT：`reader<bad OR OR(bad<repair AND repair<reader)`。这些是 order literals/Boolean clauses，不直接产生 typed graph edge。 |
 | JOIN | `encodeExplicitMultiRelationPredicate()` | 求解前枚举 contributing bindings、固定记录来源、排除额外 binding，并生成 context 守卫的 PR_WR/PR_RW。 |
 
 ## 9. MonoSAT 接口与图理论回传
@@ -212,11 +217,11 @@ oracle只保存history/known graph、pruning结论与GMWR forced facts等 determ
 | --- | --- |
 | `util/Profiler.java` | per-thread tag 的毫秒累计、count 累计；后台每 100 ms 采样 JVM used heap 的最大值。 |
 | `SERVerifier.audit()` | `SER_VERIFY_INT`、`SER_GEN_PREC_GRAPH`、`SER_GEN_CONSTRAINTS`、`WW_REACHABILITY_PRUNE_MS`、`SER_AR_ENCODE`、`SER_AR_SOLVE`、`ONESHOT_*`。 |
-| `SERSolverAR` constructor | 分阶段 `SER_AR_ENCODE_SETUP/KNOWN_EDGES/WW/RW/PREDICATE/DEPENDENCIES/TOTAL_ORDER`。 |
+| `SERSolverAR` constructor | 分阶段 `SER_AR_ENCODE_SETUP/KNOWN_EDGES/WW/PREDICATE/DEPENDENCIES/ACYCLIC`。 |
 | `SERSolverAR.solve()` | `SER_MONOSAT_SOLVE`、`SER_AR_CONFLICT_EXTRACTION`；旧 refinement 计时已删除。 |
-| `Pruning` / `GmwrPropagationState` | `SER_PRUNE*`、`GMWR_BUILD_MS`、`GMWR_REDUCTION_MS`。 |
+| `Pruning` / `PredicatePruning` / `GmwrPropagationState` | `SER_PRUNE*`；`GMWR_BUILD_MS` 仅计准备/构建，`GMWR_PRUNING_MS` 计初始区间过滤与最终候选/残余 item 整理，`GMWR_REDUCTION_MS` 仅计预传播。关闭预传播仍计普通剪枝，EAGER 三项均为零。剪枝阶段一次发布义务、残余、forced facts、来源与区间剪枝计数，以及 `SER_PRED_PR_WR_INITIAL_CONSTRAINTS_COUNT/RESIDUAL_CONSTRAINTS_COUNT/FORCED_CONSTRAINTS_COUNT`（处理前按未固定 row-local external absent observation/key 快照，初始−剩余＝强制解决），并发布 `SER_PRED_PR_WR_INITIAL_CANDIDATES_COUNT/RESIDUAL_CANDIDATES_COUNT/PRUNED_CANDIDATES_COUNT/FIXED_CANDIDATES_COUNT`（初始＝剩余待选＋排除＋固定）。唯一合法真实来源直接强制 PR_WR 及顺序，迭代收缩其他来源域；唯一显式/隐式 bottom 同样解决但无真实事务边；空域为冲突。约束计数独立于 typed 边去重，不是 GMWR item 或 SAT 子句数；编码阶段不再增加候选剪枝计数。 |
 | `publishResidualSatStats()` | residual WW choice 数、`solver.nVars()`、`solver.nClauses()`。 |
-| `PredicateEncodingMetrics.publish()` / `publishGmwrMetrics()` | source/scope/frontier/witness/physical edge/blocking clause/GMWR obligation 与各子阶段耗时。 |
+| `PredicateEncodingMetrics.publish()` / `publishGmwrMetrics()` | 保留 source/scope/frontier/witness/physical edge/blocking clause/GMWR obligation 数量统计，以及整批残余义务编码的 `SER_GMWR_RESOLUTION` 计时。计时仅覆盖完整阶段，不再逐 key、逐边或逐条谓词读取调用时钟；对应累计耗时字段及输出已移除，GMWR 准备/构建以 `GMWR_BUILD_MS` 为准，普通剪枝另计 `GMWR_PRUNING_MS`，按前后两个完整批次累计。 |
 | `Main.Audit.call()` | 遍历输出全部 duration/count、solver 配置、最大内存和最终 marker。 |
 | `SERVerifier.emitRejectDiagnostics()` | 输出 typed-dependency UNSAT 原因、`!A1 | !A2 -> reason` 映射或当前 conflict core 摘要。 |
 | `SERSolverARDifferentialTest.predicateWriterModeMatrixMatchesExhaustiveOracle()` | predicate × writer pattern × EAGER/GMWR 配置，逐项要求生产 SER verdict 等于穷举 AR oracle。 |

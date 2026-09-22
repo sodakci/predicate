@@ -84,10 +84,11 @@ SVG 的纵轴为完成运行中 `ENTIRE_EXPERIMENT` 的中位数（秒）。time
 
 至少关注：
 
-- 端到端与阶段时间：`ENTIRE_EXPERIMENT`、`GMWR_BUILD_MS`、`GMWR_REDUCTION_MS`、`SER_AR_ENCODE`、`SER_AR_ENCODE_PREDICATE`、`SER_MONOSAT_SOLVE`；
+- 端到端与阶段时间：`ENTIRE_EXPERIMENT`、`GMWR_BUILD_MS`（准备与构建）、`GMWR_PRUNING_MS`（普通候选剪枝与残余项整理）、`GMWR_REDUCTION_MS`（预传播）、`SER_AR_ENCODE`、`SER_AR_ENCODE_PREDICATE`、`SER_MONOSAT_SOLVE`；普通剪枝占比为 `GMWR_PRUNING_MS / ENTIRE_EXPERIMENT`，不含预传播。新版 build 不再包含普通剪枝，比较旧结果时应使用新版 build + pruning；
 - 搜索空间：`SER_PROP_RESIDUAL_SAT_VARIABLES_COUNT`、`SER_PROP_RESIDUAL_SAT_CONSTRAINTS_COUNT`、`SER_PROP_MONOSAT_GRAPH_EDGES_COUNT`；
 - solver 行为：`SER_PROP_MONOSAT_PROPAGATIONS_COUNT`、`SER_PROP_MONOSAT_CONFLICTS_COUNT`；
-- GMWR：`GMWR_INITIAL_CONSTRAINTS`、`GMWR_RESIDUAL_CONSTRAINTS`、`GMWR_REMOVED_CANDIDATES`、`GMWR_FORCED_FACTS`、residual clauses/literals；
+- GMWR：`GMWR_INITIAL_CONSTRAINTS` 是初始区间剪枝后实际构建的 item 数，`GMWR_RESIDUAL_CONSTRAINTS` 是独立剪枝阶段交给 SAT 的残余 item 数；同一 `(reader,badWriter)` 组内各项分别计数，已满足的项不计入。保留原指标名及 `PRUNING_COMPARISON_STATS` 字段名，便于 runner 解析；另记录 `GMWR_REMOVED_CANDIDATES`、`GMWR_FORCED_FACTS`、residual clauses/literals。旧结果中的残余数曾按事务对分组统计，不能与新 item 数直接混用。
+- PR_WR 双口径：`PR_WR constraints` 的初始与剩余对应 `SER_PRED_PR_WR_INITIAL_CONSTRAINTS_COUNT`、`SER_PRED_PR_WR_RESIDUAL_CONSTRAINTS_COUNT`；`Forced PR_WR constraints` 对应 `SER_PRED_PR_WR_FORCED_CONSTRAINTS_COUNT`，满足 initial−residual=forced。每个初始未固定的 row-local external absent observation/key 计一条，处理前取初始快照，唯一合法来源算解决，图边去重不影响约束数。`PR_WR candidates` 对应 `SER_PRED_PR_WR_INITIAL_CANDIDATES_COUNT`、`SER_PRED_PR_WR_RESIDUAL_CANDIDATES_COUNT`、`SER_PRED_PR_WR_PRUNED_CANDIDATES_COUNT`、`SER_PRED_PR_WR_FIXED_CANDIDATES_COUNT`，逐来源统计初始、剩余待选、排除及固定，满足 initial=residual+pruned+fixed；每个已解决约束固定一个候选。显式 bottom 和无初始版本时的隐式 bottom 参与来源选择，唯一 bottom 算解决但不生成真实 PR_WR 边；空域为冲突，不算解决。已有确定 PR_WR、固定 recorded source、internal 和 JOIN 排除，EAGER 各项为零。这些值不是 GMWR item、SAT 子句或物理边数；旧 `SER_PRED_PR_WR_FORCED_EDGES_COUNT` 已移除，旧结果不可与新口径直接比较。
 - frontier/latest：`SER_PRED_FRONTIER_CANDIDATES_COUNT`、`SER_PRED_LATEST_WRITER_INPUT_WRITES_COUNT`、`SER_PRED_LATEST_WRITER_RESULTS_COUNT`、`SER_GMWR_INTERVAL_CANDIDATES_PRUNED_COUNT`；
 - 资源：GNU `time -v` 的 peak RSS、timeout/OOM/rescue。
 
