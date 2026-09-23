@@ -44,7 +44,7 @@ class SISolverInducedParityTest {
         commitAll(history);
 
         var graph = new KnownGraph<>(history);
-        var solver = new SISolverInduced<>(history, graph,
+        var solver = SISolverTestSupport.create(history, graph,
                 SIVerifier.generateConstraintsSI(history, graph));
 
         assertEquals(1L, solver.getPredicateSourceConstraintCount());
@@ -52,7 +52,7 @@ class SISolverInducedParityTest {
     }
 
     @Test
-    void conflictExtractionReportsKnownInducedCycleWithoutChoiceConstraints() {
+    void preparationReportsKnownInducedCycleWithoutCreatingSolver() {
         var history = new History<String, Integer>();
         var first = addTransaction(history, 1L);
         var second = addTransaction(history, 2L);
@@ -61,11 +61,13 @@ class SISolverInducedParityTest {
         graph.putEdge(first, second, new Edge<>(EdgeType.WR, "a"));
         graph.putEdge(second, first, new Edge<>(EdgeType.RW, "b"));
 
-        var solver = new SISolverInduced<>(history, graph, List.of());
+        var oracle = new SIReachabilityOracle<>(graph);
+        var prepared = SISolverTestSupport.prepare(history, graph, oracle,
+                SIVerifier.SolverSettings.defaults());
 
-        assertFalse(solver.solve());
-        assertFalse(solver.getConflicts().getLeft().isEmpty());
-        assertTrue(solver.getConflicts().getRight().isEmpty());
+        assertTrue(prepared.hasConflict());
+        assertFalse(prepared.conflictReasons().isEmpty());
+        assertFalse(SIVerifier.InducedGraph.extractCycleEdges(graph).isEmpty());
     }
 
     @Test
@@ -89,7 +91,7 @@ class SISolverInducedParityTest {
                 List.of(new SIEdge<>(fourth, third, EdgeType.WW, "y")),
                 third, fourth, 1);
 
-        var solver = new SISolverInduced<>(
+        var solver = SISolverTestSupport.create(
                 history, graph, List.of(required, irrelevant));
 
         assertFalse(solver.solve());

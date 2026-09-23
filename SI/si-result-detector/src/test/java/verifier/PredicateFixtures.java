@@ -52,6 +52,11 @@ public final class PredicateFixtures {
         }
 
         @Override
+        default boolean isRowLocal() {
+            return true;
+        }
+
+        @Override
         default QueryEvaluation<KeyType, ValueType> evaluate(
                 VisibleState<KeyType, ValueType> state) {
             var inputs = new LinkedHashMap<KeyType, ValueType>();

@@ -29,22 +29,22 @@ from typing import Any, Dict, List, Optional
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_JAR = ROOT / "build" / "libs" / "si-result-detector-1.0.0-SNAPSHOT.jar"
 DEFAULT_MONOSAT_NATIVE_DIR = ROOT / "build" / "monosat"
-VERDICT_RE = re.compile(r"\[\[\[\[\s*(ACCEPT|REJECT)\s*\]\]\]\]")
+VERDICT_RE = re.compile(r"SI audit result:\s*(ACCEPT|REJECT|ERROR)")
 TIMER_RE = re.compile(r"^([A-Z0-9_]+):\s+([0-9]+)ms$", re.MULTILINE)
+COUNTER_RE = re.compile(r"^([A-Z][A-Z0-9_]+):\s+([0-9]+)\s*$", re.MULTILINE)
 COUNT_RES = {
-    "sessions_count": re.compile(r"Sessions count:\s*([0-9]+)"),
-    "transactions_count": re.compile(r"Transactions count:\s*([0-9]+)"),
-    "events_count": re.compile(r"Events count:\s*([0-9]+)"),
-    "unresolved_ww_choices": re.compile(r"Unresolved WW choices:\s*([0-9]+)"),
-    "conditional_dependency_implications": re.compile(
-        r"Conditional dependency implications:\s*([0-9]+)"),
-    "ww_initial_constraints": re.compile(r"WW_INITIAL_CONSTRAINTS:\s*([0-9]+)"),
-    "ww_after_baseline": re.compile(r"WW_AFTER_BASELINE:\s*([0-9]+)"),
-    "ww_initial_implications": re.compile(r"WW_INITIAL_IMPLICATIONS:\s*([0-9]+)"),
-    "ww_after_baseline_implications": re.compile(
-        r"WW_AFTER_BASELINE_IMPLICATIONS:\s*([0-9]+)"),
+    "transactions_count": re.compile(r"Transactions:\s*([0-9,]+)"),
+    "events_count": re.compile(r"Events:\s*([0-9,]+)"),
+    "ww_initial_choices": re.compile(r"WW_INITIAL_CHOICES:\s*([0-9]+)"),
+    "ww_after_reachability": re.compile(r"WW_AFTER_REACHABILITY:\s*([0-9]+)"),
+    "gmwr_initial_constraints": re.compile(r"GMWR_INITIAL_CONSTRAINTS:\s*([0-9]+)"),
+    "gmwr_residual_constraints": re.compile(r"GMWR_RESIDUAL_CONSTRAINTS:\s*([0-9]+)"),
+    "gmwr_forced_facts": re.compile(r"GMWR_FORCED_FACTS:\s*([0-9]+)"),
+    "gmwr_removed_candidates": re.compile(r"GMWR_REMOVED_CANDIDATES:\s*([0-9]+)"),
+    "si_oracle_builds": re.compile(r"SI_ORACLE_BUILDS:\s*([0-9]+)"),
+    "si_oracle_updates": re.compile(r"SI_ORACLE_UPDATES:\s*([0-9]+)"),
 }
-MAX_MEMORY_RE = re.compile(r"Max memory:\s*(.+)")
+MAX_MEMORY_RE = re.compile(r"(?:Peak|Max) memory:\s*(.+)")
 
 
 def load_json(path: pathlib.Path) -> Any:
@@ -164,15 +164,33 @@ def safe_name(value: str) -> str:
 
 def parse_metrics(log_text: str) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {}
-    verdict_match = VERDICT_RE.search(log_text)
+    lines = log_text.rstrip().splitlines()
+    verdict_match = VERDICT_RE.fullmatch(lines[-1].strip()) if lines else None
     if verdict_match:
         metrics["actual_verdict"] = verdict_match.group(1)
     for key, regex in COUNT_RES.items():
         match = regex.search(log_text)
         if match:
-            metrics[key] = int(match.group(1))
+            metrics[key] = int(match.group(1).replace(",", ""))
     for name, millis in TIMER_RE.findall(log_text):
         metrics[f"time_{name.lower()}_ms"] = int(millis)
+    for name, count in COUNTER_RE.findall(log_text):
+        metrics[name.lower()] = int(count)
+    summary = re.search(r"PRUNING_COMPARISON_STATS (.+)", log_text)
+    if summary:
+        fields = {name: int(value) for name, value in re.findall(r"([a-z_]+)=([0-9]+)", summary.group(1))}
+        for source, target in {
+            "ww_original": "ww_initial_choices", "ww_residual": "ww_after_reachability",
+            "gmwr_obligations_original": "gmwr_initial_constraints",
+            "gmwr_obligations_residual": "gmwr_residual_constraints",
+            "ww_time_ms": "time_ww_reachability_prune_ms",
+        }.items():
+            if source in fields:
+                metrics.setdefault(target, fields[source])
+    ww = re.search(r"^WW\n([0-9,]+) -> ([0-9,]+)", log_text, re.MULTILINE)
+    if ww:
+        metrics.setdefault("ww_initial_choices", int(ww.group(1).replace(",", "")))
+        metrics.setdefault("ww_after_reachability", int(ww.group(2).replace(",", "")))
     memory_match = MAX_MEMORY_RE.search(log_text)
     if memory_match:
         metrics["max_memory"] = memory_match.group(1).strip()
@@ -193,11 +211,10 @@ def run_case(case: Dict[str, Any], args: argparse.Namespace, output_root: pathli
         "-jar",
         str(args.jar),
         "audit",
-        "--solver-timeout-seconds",
-        str(args.solver_timeout_seconds),
-        "--ww-pruning",
-        args.ww_pruning,
+        "--gmwr" if args.gmwr else "--no-gmwr",
     ]
+    if args.no_gmwr_prepropagation:
+        cmd.append("--no-gmwr-prepropagation")
     if args.solver_stats:
         cmd.append("--solver-stats")
     cmd.append(str(hist_dir))
@@ -225,7 +242,14 @@ def run_case(case: Dict[str, Any], args: argparse.Namespace, output_root: pathli
     elapsed_ms = int((time.monotonic() - start) * 1000)
     log_path.write_text(log_text, encoding="utf-8", errors="replace")
     metrics = parse_metrics(log_text)
-    actual = metrics.get("actual_verdict", "TIMEOUT" if timed_out else "RUNTIME_ERROR")
+    reported = metrics.pop("actual_verdict", None)
+    expected_exit = {"ACCEPT": 0, "REJECT": 255, "ERROR": 1}
+    if timed_out:
+        actual = "PROCESS_TIMEOUT"
+    elif reported is not None and exit_code == expected_exit[reported]:
+        actual = reported
+    else:
+        actual = "RUNTIME_ERROR"
     expected = case["expected_verdict"]
     matched = actual == expected
     return {
@@ -257,7 +281,8 @@ def write_results(output_root: pathlib.Path, results: List[Dict[str, Any]], conf
         key
         for result in results
         for key in result.keys()
-        if key.startswith("time_") or key in COUNT_RES or key in ("max_memory",)
+        if key.startswith("time_") or key.endswith("_count")
+        or key in COUNT_RES or key in ("max_memory",)
     })
     fieldnames = [
         "suite", "case_index", "case", "expected_verdict", "manifest_expected_verdict", "actual_verdict",
@@ -271,12 +296,11 @@ def write_results(output_root: pathlib.Path, results: List[Dict[str, Any]], conf
 
     paper_fields = [
         "suite", "case", "expected_verdict", "manifest_expected_verdict", "actual_verdict", "matched_expected",
-        "transactions_count", "events_count", "unresolved_ww_choices",
-        "conditional_dependency_implications", "ww_initial_constraints",
-        "ww_after_baseline", "ww_initial_implications",
-        "ww_after_baseline_implications",
+        "transactions_count", "events_count", "ww_initial_choices", "ww_after_reachability",
+        "gmwr_initial_constraints", "gmwr_residual_constraints", "gmwr_forced_facts",
+        "si_oracle_builds", "si_oracle_updates",
         "time_entire_experiment_ms", "time_oneshot_cons_ms",
-        "time_si_prune_ms", "time_oneshot_solve_ms",
+        "time_ww_reachability_prune_ms", "time_oneshot_solve_ms",
         "elapsed_wall_ms", "max_memory",
     ]
     with (output_root / "paper_table.csv").open("w", encoding="utf-8", newline="") as f:
@@ -323,13 +347,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Extra JVM option; repeat for multiple options")
     parser.add_argument("--monosat-native-dir", type=pathlib.Path, default=DEFAULT_MONOSAT_NATIVE_DIR,
                         help="Directory containing MonoSAT native library, e.g. libmonosat.so")
-    parser.add_argument("--solver-timeout-seconds", type=int, default=1800,
-                        help="Timeout passed to the solver backend")
     parser.add_argument("--timeout-seconds", type=int, default=2100,
                         help="Wall-clock timeout per case enforced by this runner")
     parser.add_argument("--solver-stats", action="store_true", help="Print and parse solver stats when supported")
-    parser.add_argument("--ww-pruning", choices=("NONE", "REACHABILITY"), default="REACHABILITY",
-                        help="Hidden detector WW-pruning ablation")
+    gmwr = parser.add_mutually_exclusive_group()
+    gmwr.add_argument("--gmwr", dest="gmwr", action="store_true")
+    gmwr.add_argument("--no-gmwr", dest="gmwr", action="store_false")
+    parser.set_defaults(gmwr=True)
+    parser.add_argument("--no-gmwr-prepropagation", action="store_true",
+                        help="Disable SI vis/repair prepropagation")
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N catalog cases")
     parser.add_argument("--fail-fast", action="store_true", help="Stop after first mismatch, runtime error, or timeout")
     return parser.parse_args(argv)
@@ -373,10 +399,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "heap": args.heap,
         "stack": args.stack,
         "jvm_opt": args.jvm_opt,
-        "solver_timeout_seconds": args.solver_timeout_seconds,
         "runner_timeout_seconds": args.timeout_seconds,
         "solver_stats": args.solver_stats,
-        "ww_pruning": args.ww_pruning,
+        "predicate_encoding": "GMWR" if args.gmwr else "EAGER",
+        "gmwr_prepropagation": args.gmwr and not args.no_gmwr_prepropagation,
     }
     dump_json(output_root / "config.json", config)
     dump_json(output_root / "machine.json", machine_info(args.java, args.jar))

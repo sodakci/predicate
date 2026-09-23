@@ -24,6 +24,7 @@ dependencies {
     implementation 'info.picocli:picocli:4.6.3'
     implementation 'org.roaringbitmap:RoaringBitmap:0.9.35'
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.18.2'
+    implementation 'com.github.luben:zstd-jni:1.5.7-7'
     implementation files('build/monosat/monosat.jar')
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.8.2'

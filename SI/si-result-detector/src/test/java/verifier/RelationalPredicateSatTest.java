@@ -162,7 +162,7 @@ class RelationalPredicateSatTest {
     }
 
     @Test
-    void distinctSingleTableQueryKeepsWholeSnapshotSemantics() throws Exception {
+    void distinctQueryIsUnsupportedBeforeSatEvenWithInvalidResult() throws Exception {
         var initialState = "["
                 + "{\"key\":\"kv:k0\",\"value\":7},"
                 + "{\"key\":\"kv:k1\",\"value\":7}]";
@@ -182,8 +182,10 @@ class RelationalPredicateSatTest {
                         singleTableRead(true, inputs,
                                 "[{\"value\":7},{\"value\":7}]")));
 
-        assertTrue(audit(correct));
-        assertFalse(audit(duplicate));
+        org.junit.jupiter.api.Assertions.assertThrows(history.query.QueryException.class,
+                () -> audit(correct));
+        org.junit.jupiter.api.Assertions.assertThrows(history.query.QueryException.class,
+                () -> audit(duplicate));
     }
 
     @Test
@@ -258,6 +260,24 @@ class RelationalPredicateSatTest {
         assertFalse(audit(history));
     }
 
+    @Test
+    void selfJoinAliasesPreserveDuplicateProjectionAndPhysicalInputs() throws Exception {
+        var inputs = "[{\"key\":\"kv:k0\",\"value\":7},{\"key\":\"kv:k1\",\"value\":7}]";
+        var query = "{\"from\":{\"relation\":\"kv\",\"alias\":\"l\"},"
+                + "\"joins\":[{\"relation\":\"kv\",\"alias\":\"r\",\"type\":\"INNER\","
+                + "\"on\":[\"l.value = r.value\"]}],"
+                + "\"select\":{\"columns\":[\"l.value AS value\"],\"distinct\":false}}";
+        var correct = writeHistory("self-join-bag", inputs,
+                transaction(1, 1, "{\"type\":\"pr\",\"query\":" + query
+                        + ",\"result\":{\"inputs\":" + inputs
+                        + ",\"values\":[{\"value\":7},{\"value\":7},{\"value\":7},{\"value\":7}]}}"));
+        var wrongBag = writeHistory("self-join-missing-duplicates", inputs,
+                transaction(1, 1, "{\"type\":\"pr\",\"query\":" + query
+                        + ",\"result\":{\"inputs\":" + inputs + ",\"values\":[{\"value\":7}]}}"));
+        assertTrue(audit(correct));
+        assertFalse(audit(wrongBag));
+    }
+
     private static String singleTableRead(
             boolean distinct, String inputs, String values) {
         return "{\"type\":\"pr\",\"query\":{"
@@ -294,6 +314,23 @@ class RelationalPredicateSatTest {
     }
 
     private static boolean audit(Path historyDirectory) {
-        return new SIVerifier<>(new PredicateHistoryLoader(historyDirectory)).audit();
+        var loaded = new PredicateHistoryLoader(historyDirectory).loadHistory();
+        PredicateAnalysis.validateSupportedPredicates(loaded);
+        boolean expected = SIExecutionOracle.accepts(loaded);
+        for (var mode : SIVerifier.PredicateMode.values()) {
+            for (boolean prepropagation : java.util.List.of(false, true)) {
+                if (mode == SIVerifier.PredicateMode.EAGER && prepropagation) {
+                    continue;
+                }
+                var settings = SIVerifier.SolverSettings.defaults();
+                settings.predicateMode = mode;
+                settings.gmwrPrepropagation = prepropagation;
+                boolean actual = new SIVerifier<>(new PredicateHistoryLoader(historyDirectory),
+                        settings, false).audit();
+                org.junit.jupiter.api.Assertions.assertEquals(expected, actual,
+                        historyDirectory + " mode=" + mode + " prepropagation=" + prepropagation);
+            }
+        }
+        return expected;
     }
 }

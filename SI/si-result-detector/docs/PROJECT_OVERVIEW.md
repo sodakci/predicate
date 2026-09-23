@@ -1,6 +1,6 @@
 # SI 检测器当前架构与实现说明
 
-本文档以当前代码为准，说明 SI detector 的判定目标、A/B typed dependency 图语义、剪枝模式、分阶段 MonoSAT 编码、谓词求解和与 SER 的对齐边界。运行命令见 `SI/README.md`。
+本文按批准的 SI 对齐契约和 2026-09-23 当前代码说明判定目标、typed dependency 与 VIS、分阶段分析/剪枝/编码、谓词求解和 SER 对齐边界。运行命令见 `SI/README.md`，验证状态以实施计划及变更记录为准。
 
 ## 1. 项目定位
 
@@ -9,75 +9,49 @@ SI detector 读取 PRHIST 事务历史，判断是否存在一个能够解释全
 输出为：
 
 ```text
-[[[[ ACCEPT ]]]]
+SI audit result: ACCEPT
 ```
 
 或：
 
 ```text
-[[[[ REJECT ]]]]
+SI audit result: REJECT
 ```
 
 - `ACCEPT`：至少存在一组合法的同 key 写顺序、快照 frontier 和 typed dependency 赋值。
 - `REJECT`：内部一致性、剪枝或最终 MonoSAT 公式证明不存在这样的 SI 解释。
+- `ERROR`：解析、不支持的查询或运行异常，通过 CLI 异常流程输出；不属于隔离级别判定。
 
 SI 不要求所有事务组成严格串行顺序。典型 write skew 可以被 SI 接受，因此不能把 SER 的 AR 全序或“所有 RW 都直接判环”逻辑搬入 SI。
 
 ## 2. 最终判定使用的图
 
-当前实现采用 Adya typed dependency：
+保留原始 typed dependency，并用共享 VIS 的正负分支补足快照约束：
 
 ```text
-A = {SO, WR, WW, PR_WR}
-B = {RW, PR_RW}
-InducedSI = A ∪ (A ∘ B)
+A_t = {SO, WR, WW, PR_WR}
+B_t = {RW, PR_RW}
+A_s = A_t ∪ {W→R | VIS(W,R)}
+B_s = B_t ∪ {R→W | NOT VIS(W,R)}
+InducedSI = A_s ∪ (A_s ∘ B_s)
 ```
 
-组合 `A ∘ B` 表示：
+这里的 VIS 辅助关系不是新的 PR 类型；最终要求同 key WW、完整查询结果和 `InducedSI` 无环同时成立。
 
-```text
-T1 --A--> T2 --B--> T3
-```
+### 2.1 不引入事务串行顺序
 
-产生 induced edge：
-
-```text
-T1 ----------> T3
-```
-
-最终条件是：
-
-```text
-存在合法 WW/frontier 赋值
-AND 所有读结果与快照一致
-AND InducedSI 无环
-```
-
-### 2.1 不是旧 AR 序列图
-
-最终 verdict 不再建立旧式 `ar(T1,T2)` 序列变量，也不要求所有事务两两可比。求解器处理的是带类型和 key witness 的 dependency edge。
+每个实际消费的外部事务对 `(W,R)` 共用一个 VIS literal。`VIS(W,R)` 与 `VIS(R,W)` 是不同变量，不要求互补，允许两者均 false。无环 induced 图的拓扑序只用于构造提交先后与每个 reader 的开始 cut，不要求事务串行执行。
 
 ### 2.2 MonoSAT 中的实际表示
 
-`SISolverInduced` 的实际数据结构是：
+| 结构 | 职责 |
+| --- | --- |
+| `dependencyEdgesA/B` | 保留带 guard 的原始 typed edges。 |
+| `visibilityChoices` | 外部事务对共享 VIS；正分支支持辅助 A，负分支支持辅助 B。 |
+| `incomingDependencyA/outgoingDependencyB` | 按中间事务索引 typed 和辅助支持。 |
+| `inducedGraph` | 唯一 native 图，承载 A_s direct 和完整 A_s∘B_s。 |
 
-```text
-dependencyEdgesA
-    保存 A 类 typed edges 及其 guard。
-
-dependencyEdgesB
-    保存 B 类 typed edges 及其 guard。
-
-depGraph
-    MonoSAT 中的 A 图，也用于 predicate visibility reachability。
-
-inducedGraph
-    MonoSAT 中真正执行 acyclic() 的 verdict 图。
-```
-
-B 不需要单独执行无环检查，因此没有建立一个独立的 MonoSAT `Graph B`。每加入一条 A 或 B，统一入口 `addDependencyEdge` 都会与另一侧已有边组合，把对应 `A ∘ B` 边加入 `inducedGraph`。无论 A/B 的编码先后如何，组合都会补齐。
-
-因此当前物理实现是“A typed graph + B typed edge 集合 + induced verdict graph”，语义仍严格对应两类 typed dependency，而不是 AR 图。
+初始依赖、谓词约束和 VIS 都登记后，按中间事务组合 typed×typed、typed×aux、aux×typed、aux×aux，封闭物理边支持并断言无环。不再用独立 A 可达性 native 图解释快照。
 
 ### 2.3 边类型路由
 
@@ -116,87 +90,43 @@ txn     = -1
 
 ## 3. 与 SER 的对齐边界
 
-除用户明确暂缓的 GMWR 外，SI 已同步 SER 当前非图语义主结构；保留的差异来自隔离级别定义。
+| 模块 | 对齐内容 | SI 语义边界 |
+| --- | --- | --- |
+| PRHIST/QueryPlan | 输入、能力检查、完整 bag/provenance | 支持 row-local 与非 DISTINCT 单调 JOIN。 |
+| 公共分析 | 共享写索引、scope、行贡献缓存 | 不创建 SAT 对象、不提交候选顺序事实。 |
+| 谓词准备/剪枝 | prepared observation/key、PR_WR 固定点、GMWR residual items | 使用唯一 SI Oracle；准备结束后由 verifier 单向执行 WW-feedback，不在传播器内回调 WW。 |
+| 编码/求解 | 阶段化、物理边复用、单次 solve、原生 assumption 冲突 | 使用共享 VIS 与完整 induced，而非 SER 事务顺序。 |
+| B 关系 | 保留 RW/PR_RW 类型和 guard | 只经 A_s∘B_s 进入 verdict，不直接将 B 判环。 |
 
-| 模块 | 当前状态 | SI/SER 关系 |
-|---|---|---|
-| PRHIST loader、History/Event、QueryPlan | 已对齐 | 输入与查询语义一致 |
-| 内部一致性预检 | 已对齐 | source、事务内 latest write、相同谓词继承一致 |
-| Adya typed edge 模型 | 已对齐 | 都保留边类型和 key witness |
-| 分阶段 solver 编码 | 已对齐 | setup、known、WW、RW、predicate、acyclic |
-| row-local EAGER | 已对齐 | 求解前逐 key 编码 |
-| general query refinement | 已对齐 | 预编码 guarded `PR_*`，模型不匹配时加 no-good |
-| predicate source constraint 统计 | 已对齐 | 每个 external `(read,key)` 计数 |
-| `NONE/REACHABILITY` | 已对齐 | 正式基线保留 SI-specific induced-graph oracle；NONE 只用于消融 |
-| bottom 过滤 | 已对齐 | 不进入最终真实事务图 |
-| UNSAT constraint 缩减 | 已对齐 | 递归求解禁用冲突提取，外层贪心缩减 WW choices |
-| GMWR | 暂未同步 | SI 当前只有 EAGER，按要求不扩展 |
-| 最终图公式 | 必须不同 | SER 检查 typed dependency/辅助顺序；SI 检查 `A ∪ (A ∘ B)` |
-| visibility/order | 必须不同 | SER 可用辅助串行顺序；SI predicate visibility 使用 A reachability |
-| RW/PR_RW | 必须不同 | SI 放入 B，只通过 `A ∘ B` 影响 verdict |
-
-不能同步到 SI 的 SER 行为包括：
-
-- 为全部事务对建立 total AR。
-- 把 `RW/PR_RW` 直接当作 A 边。
-- 因 B-only 双向边直接拒绝 write skew。
+不能把 SER 的串行 orderLiteral、A+B 判环或模型事后补救搬入 SI。B-only 双向反依赖的 write skew 是允许行为。
 
 ## 4. 端到端控制流
 
 ```text
-PRHIST
-  |
-  v
-PredicateHistoryLoader
-  |
-  v
-Utils.verifyInternalConsistency
-  | false
-  +------------------------------------> REJECT
-  |
-  v
-KnownGraph
-  - A: fixed SO/WR
-  - B: fixed RW/PR_RW（若已有）
-  - readFrom / allWrites / txnWrites
-  - predicate observations
-  |
-  v
-generateConstraintsSI
-  - same-key WW binary choices
-  - branch-associated ordinary RW implications
-  - transaction-pair coalescing
-  |
-  v
-WW pruning from audit settings
-  - NONE / REACHABILITY
-  | inconsistent
-  +------------------------------------> REJECT
-  |
-  v
-SISolverInduced constructor
-  1. SETUP
-  2. KNOWN_EDGES
-  3. WW
-  4. RW
-  5. PREDICATE
-  6. ACYCLIC
-  |
-  v
-MonoSAT solve
-  | model has wrong general-query snapshot
-  +---- add no-good clause ----+
-  |                            |
-  +<---------------------------+
-  |
-  + SAT stable model -----------------> ACCEPT
-  |
-  + UNSAT -> conflict reduction ------> REJECT
+PRHIST loader
+  -> 查询能力检查（不支持 -> ERROR）
+  -> 内部一致性（矛盾 -> REJECT）
+  -> KnownGraph + WW/RW choices
+  -> 唯一 SIReachabilityOracle
+  -> WW reachability pruning
+  -> PredicateAnalysis + PredicatePruning
+     写/source/行贡献分析、prepared observations、PR_WR 固定点
+     GMWR items 与可选预传播、residual 数据
+     已证明冲突 -> REJECT（不创建 native solver）
+  -> 单向 WW-feedback（GMWR、预传播及 WW 剪枝均开启时）
+  -> SISolverInduced
+     SETUP -> KNOWN_EDGES -> WW -> RW -> PREDICATE
+     -> DEPENDENCIES -> ACYCLIC
+  -> MonoSAT solve(assumptions) 一次
+     SAT -> ACCEPT
+     UNSAT -> 本次 conflict clause -> REJECT
 ```
+
+各阶段共用同一确定 Oracle；候选 guard 不反写 Oracle。关闭 GMWR 选择 EAGER；关闭预传播仍构建 residual obligations。
 
 ## 5. 输入模型
 
-当前公开输入类型为 `PRHIST`。路径可以指向 `history.prhist.jsonl`，也可以指向包含它的历史目录。
+当前公开输入类型为 `PRHIST`。路径可以指向 `history.prhist.jsonl`（或 `.zst`），也可以指向包含它的历史目录。
 
 ```text
 hist-00000/
@@ -258,11 +188,11 @@ Java loader 读取前两个文件；`manifest.json` 由生成器和实验工具�
 - 单表 scan/filter。
 - 一个或多个 INNER JOIN。
 - 字段路径、别名和投影。
-- `DISTINCT`。
+- 非 DISTINCT 的单调查询；`distinct=true` 不支持。
 - bag/multiset 结果。
 - `=`、`>`、`<`、`%`、`AND` 和括号。
 
-当前不接受任意 SQL 文本。紧凑格式依赖 `(key,value)` 能唯一定位写版本，并拒绝 `write_id`、`source_write_id`、`source_txn`、`source_op_index` 等 provenance 字段。
+声明 row-local 的自定义谓词也受支持；不支持的 whole-snapshot 谓词、DISTINCT 和不受支持的查询在能力检查时走 ERROR。当前不接受任意 SQL 文本。紧凑格式依赖 `(key,value)` 能唯一定位写版本，并拒绝 `write_id`、`source_write_id`、`source_txn`、`source_op_index` 等 provenance 字段。
 
 ## 6. 内部一致性预检
 
@@ -286,13 +216,13 @@ Java loader 读取前两个文件；`manifest.json` 由生成器和实验工具�
 - 本地 source 必须是谓词事件前最后一次同 key 写。
 - recorded result 的 `inputs` 必须与解析结果一致。
 
-预检按 `predicate.identity()` 跟踪同一事务中前一次相同谓词读：
+仅对 row-local 谓词，预检按 `predicate.identity()` 跟踪同一事务中前一次相同谓词读并继承逐 key 结果；JOIN 不通过先前结果继承覆盖：
 
 - 两次相同谓词之间没有本地更新时，结果逐 key 继承。
 - 有本地更新时，以当前事件前最后一次本地写为准。
 - 不同 predicate identity 的先前读取不会把 key 错误标成 INTERNAL。
 
-JOIN、投影、重复行和 `DISTINCT` 的完整结果由 solver 的 QueryPlan 求值处理。
+受支持 JOIN、投影与重复行的完整结果在首次 solve 前编码；all-INTERNAL 也必须执行完整 QueryPlan 校验。
 
 ## 7. KnownGraph
 
@@ -336,7 +266,7 @@ predicateObservations
 ```text
 INTERNAL
     当前谓词事件之前本事务已经写过该 key；
-    或同一 predicate identity 的更早 observation 已覆盖该 key。
+    或 row-local 的同一 predicate identity 的更早 observation 已覆盖该 key。
 
 EXTERNAL
     没有上述事务内依据，需要 solver 选择 snapshot frontier。
@@ -378,7 +308,7 @@ Treader --RW(x)--> Twriter
 
 生成的 `SIConstraint` 因此可以同时包含 WW 和 RW。两处消费者行为不同：
 
-- `REACHABILITY` 试加一个分支时使用该分支的全部 WW/RW typed edges。
+- `REACHABILITY` 对生成器的单方向 WW(u,v) 与共同指向 v 的 RW 分支执行完整冲突检查，补齐新 WW 与已有 B 的组合成环，不试加边或复制闭包。非标准分支保留原逐边充分检查；多个未定分支共同成立仍由轮末检查和最终求解验证。
 - 最终 `SISolverInduced` 的 WW 阶段只读取 WW；随后 RW 阶段从 `readFrom + wwOrder` 重新生成相同的 guarded RW。
 
 这样最终公式中的 RW 来源统一，不依赖 constraint 中重复保存的派生边。
@@ -389,400 +319,132 @@ Treader --RW(x)--> Twriter
 
 coalescing 合并的是 choice 组织结构，不会把 A/B 类型抹掉。
 
-## 9. WW 剪枝
+## 9. 共享分析与 WW/谓词剪枝
 
-一个 audit 的 `SolverSettings.pruningMode` 只允许：
+每个 audit 只构建一个 `SIReachabilityOracle`，依次供 WW、PR_WR、GMWR 和 SAT 编码使用。它保存确定事实；Oracle 未证明 VIS=I*;A 不等于不可见，无法判定的 VIS 留给 SAT。WW 只按确定 induced 闭包排除已证明冲突的 branch，固定时提交完整 WW/RW side；每轮批量更新后检查冲突，停止后 residual choices 留给 solver。
 
-```text
-NONE
-REACHABILITY
-```
+`PredicateAnalysis` 拥有共享写索引、scope、latest self、完整外部 final writes、记录完整性和行贡献缓存。`PredicatePruning` 准备 `PreparedObservation/PreparedKey`、确定 PR_WR 固定点和 `ResidualItem`，通过 `Result` 将同一 analysis/Oracle 与 residual 数据交给 solver。
 
-`NONE` 是必要消融，直接把全部 WW choices 交给 MonoSAT。
-`REACHABILITY` 是正式基线，实现在 `Pruning.java`。它对 constraint
-两侧分别调用同一个 `SIVerifier.InducedGraph.Oracle`：
+GMWR 按 `(reader,badWriter)` 分组，但每个 key/observation item 按 AND 保留：
 
 ```text
-两侧都成环     -> pruning REJECT
-仅一侧成环     -> 固定另一侧并写回 KnownGraph
-两侧都不成环   -> 保留给 MonoSAT
+NOT VIS(bad,R) OR OR_good(WW_k(bad,good) AND VIS(good,R))
 ```
 
-oracle 保持 SI 的 A/B 分区，并精确检查 `A ∪ (A ∘ B)`；它不是 SER 的
-普通有向图 reachability。旧 `SNAPSHOT/PRUN` 分派、shared-snapshot
-implementation 与 `Prun.java` 已删除。
-
-剪枝前后的 constraint/implication 数直接记录为
-`WW_INITIAL_CONSTRAINTS`、`WW_AFTER_BASELINE`、
-`WW_INITIAL_IMPLICATIONS`、`WW_AFTER_BASELINE_IMPLICATIONS`，由
-`audit --solver-stats` 输出，不再维护 constraint-only 执行路径。
+无 repair 推导 NOT_VIS；bad 确定可见且唯一 repair 时推导 WW 与 VIS。NOT_VIS 不是反向 VIS，不将普通提交顺序当成快照可见性。GMWR 确定事实在准备结束后单向反馈到残余 WW，整侧提交 WW/RW 至固定点；不再次执行 GMWR。候选 PR_WR guard 不能成为证明自己的确定路径。
 
 ## 10. 求解核心：分阶段 MonoSAT 编码
 
-最终求解器是 `SISolverInduced`。它不构造事务的全序 AR，也不要求任意两个事务可比较；它只为待定 WW 方向、谓词 source 选择和图可达性建立 Boolean/graph theory 约束，并直接判定：
-
-```text
-A = SO ∪ WR ∪ WW ∪ PR_WR
-B = RW ∪ PR_RW
-InducedSI = A ∪ (A ∘ B)
-
-SAT  <=> 在当前已编码范围内，存在一组 WW/source 选择，使 InducedSI 无环，且所有进入 EAGER/PredicateCheck 的谓词结果一致
-```
-
 ### 10.1 求解器内部状态
 
-| 状态 | 含义 | 核心不变量 |
-| --- | --- | --- |
-| `solver` | MonoSAT 主求解器 | Boolean 选择、图边、可达性和无环性处于同一公式中 |
-| `depGraph` | A 图 | 只包含 `SO/WR/WW/PR_WR`；谓词 snapshot 可见性只查询该图 |
-| `inducedGraph` | verdict 图 | 包含所有激活的 A 边和所有激活的 `A ∘ B` 合成边 |
-| `dependencyEdgesA` | 已登记的 guarded A typed edges | 新 B 边到达时可与所有既有 A 边组合 |
-| `dependencyEdgesB` | 已登记的 guarded B typed edges | B 本身不直接进入 verdict 图 |
-| `wwOrder` | `(writer1,writer2,key) -> Lit` | 普通 RW、谓词 frontier 和 `PR_RW` 共用同一 WW 方向变量 |
-| `guardedEdgesByGuard` | guarded typed-edge 去重表 | 相同 guard 下相同语义边只编码一次 |
-| `inducedEdgesByGuard` | guarded induced-edge 去重表 | 相同 guard 下相同合成端点只编码一次 |
-| `writesByKey` | key 到全部版本的索引 | bottom 优先，其后按事务 id 和事件位置稳定排序 |
-| `predicateChecks` | general 查询的延迟快照检查 | 只负责模型验证和 no-good refinement，不临时补图边 |
+| 状态 | 不变量 |
+| --- | --- |
+| `solver` | residual Boolean 公式与 induced 无环属于同次 solve。 |
+| `inducedGraph` | 唯一 native 辅助图 H，无环性等价于 A_s∪A_s∘B_s 无环。 |
+| `visibilityChoices` | 每个实际消费的外部事务对一个共享 VIS。 |
+| `dependencyEdgesA/B` | 原始类型化依赖，不混入伪造 PR edges。 |
+| `incomingDependencyA/outgoingDependencyB` | 包含 typed 和 VIS 支持，按中间事务建立辅助通道。 |
+| `wwOrder` | 同 key writer pair 的同一方向 guard，供 RW/latest/PR_RW 复用。 |
+| `inducedEdgeSupports` | 完整收集端点支持；约简无条件 H 图并简化已确定方向，剩余物理边与全部支持等价。 |
+| shared analysis/prepared result | 不在 solver 重新构造索引、重新预传播或裁剪候选。 |
 
-bottom transaction 表示初始版本，不创建 MonoSAT 图节点。来自 bottom 的依赖由“初始版本天然先于真实事务”的规则处理，而不是把 bottom 当作普通事务加入环检测。
+### 10.2 编码阶段
 
-### 10.2 六个编码阶段
+| 阶段 | 工作 |
+| --- | --- |
+| SETUP | 只为真实事务创建 induced 节点。 |
+| KNOWN_EDGES | 登记固定 typed A/B。 |
+| WW | 每个 residual choice 用 assumption a 和方向 f，生成 a∧f / a∧¬f。 |
+| RW | 使用与 WW 相同的 guard，按 point WR 派生 ordinary RW。 |
+| PREDICATE | 共享 VIS/latest、EAGER/GMWR、完整 JOIN bag/provenance 与 typed PR guards。 |
+| DEPENDENCIES | 合并 predicate witness，建立 A 原事务边及 A/B 辅助通道，约简 H 后封闭物理边支持。 |
+| ACYCLIC | 断言唯一 inducedGraph 无环。 |
 
-构造函数按固定顺序完成：
+bottom 恒可见、版本最早，不创建 native 节点；指向 bottom 或真实自环的有效逻辑 guard 被禁止。observation、WW 与传播事实 assumption 保留到各自结果和依赖公式中；全局 VIS 的两个结构分支独立于首次消费它的 observation。
 
-```text
-SI_GRAPH_ENCODE_SETUP
-    -> SI_GRAPH_ENCODE_KNOWN_EDGES
-    -> SI_GRAPH_ENCODE_WW
-    -> SI_GRAPH_ENCODE_RW
-    -> SI_GRAPH_ENCODE_PREDICATE
-    -> SI_GRAPH_ENCODE_ACYCLIC
-```
+## 11. 完整 induced 如何约束共同快照
 
-`SIVerifier` 另记录外层 `SI_GRAPH_ENCODE` 和 `SI_GRAPH_SOLVE`。固定分阶段的意义不仅是统计耗时：后续阶段会复用前面已经建立的 A 图、WW guard 和 typed edges。
-
-阶段与代码入口一一对应：
-
-| 阶段 | `SISolverInduced` 入口 | 产物 |
-| --- | --- | --- |
-| SETUP | `createNodes` | 两张图的真实事务节点 |
-| KNOWN_EDGES | `encodeKnownEdges` | 固定 A/B typed edges |
-| WW | `encodeWwChoices`、`addConstraintSide` | 分支 literal、guarded WW、`wwOrder` |
-| RW | `encodeRwFromWrAndWw` | 由 WR+WW 派生的 guarded B/RW |
-| PREDICATE | `encodePredicateConstraints` | frontier、guarded `PR_*`、general checks |
-| ACYCLIC | `inducedGraph.acyclic()` | 最终 InducedSI 无环断言 |
-
-### 10.3 SETUP：节点和版本索引
-
-构造开始先按 key 建立 `writesByKey`，为每个 `WriteRef` 分配稳定 id；SETUP 阶段再为每个真实事务分别创建一个 `depGraph` 节点和一个 `inducedGraph` 节点。两个图节点一一对应，但承载的边语义不同。
-
-### 10.4 KNOWN_EDGES：固定 typed dependency
-
-KnownGraph A/B 中的全部受支持边都经过 `addDependencyEdge(edge, Lit.True)`：
+### 11.1 统一支持与组合
 
 ```text
-SO / WR / WW / PR_WR -> A
-RW / PR_RW           -> B
+A_s(x,u), guardA: H(x,u) 与 H(x,u*) 均受 guardA 控制
+B_s(u,y), guardB: H(u*,y) 受 guardB 控制
+H(x,u*)→H(u*,y) 路径等价表达 D(x,y) 的 guardA AND guardB 支持
+acyclic(H) 当且仅当 acyclic(A_s ∪ (A_s;B_s))
 ```
 
-因此 known `PR_WR/PR_RW` 不是只供日志或冲突标签使用：它们和普通依赖经过完全相同的图编码，能够改变最终 ACCEPT/REJECT。
+typed×typed、typed×aux、aux×typed、aux×aux 均要组合；自环 support 为 false。PR witness 按 `(from,to,type)` 合并，物理 induced edge 按端点复用，二者不能混同。
 
-### 10.5 WW：一个二选一 guard 控制一个 constraint
+### 11.2 与 SI 执行的存在性对应
 
-每个未被剪枝固定的 `SIConstraint` 创建一个 fresh literal `forward`：
+从满足公式的 D 拓扑排序得到提交序 c，令 `cut_R=max({c_U|A_s(U,R)}∪{0})`。A_s direct 保证 cut_R<c_R；每个 `B_s(R,W)` 经完整组合保证 cut_R<c_W。因此 VIS true 对应 writer 在 cut 前提交，false 对应 cut 后提交。把 R 的开始事件放在 cut 后，即可补全未显式创建 VIS 的 pair，得到同一提交序上的各自快照。
 
-```text
-forward       => 选择 constraint.edges1 中的 WW
-NOT forward   => 选择 constraint.edges2 中的 WW
-```
+反向由合法 committed SI 执行赋实际 VIS/WW/source，每条 A_s 都是 commit→start，B_s 都是 start→commit，D 边沿提交顺序，故无环。SO、WW 保证对应事务不能违背 session 与同 key 写入排他要求；辅助提交序不等于 SER 串行事务执行。
 
-每条 WW 同时登记为：
+该证明依赖正确的 typed guards、完整 scope、latest 域和完整查询 bag/provenance，也依赖剪枝保留合法 latest 候选；详细公式和 witness 前提见 `SI_DESIGN.md` 第 6 节。
 
-```text
-wwOrder[(from, to, key)] = guard
-```
+### 11.3 必须保留的区分
 
-同一方向被多次登记时，guard 取 OR。反向查询直接返回正向 guard 的否定；known WW 返回常量 true/false；若两个真实 writer 对同一 key 的先后既不在 `wwOrder` 也不在 known WW 中，公式立即置为 false，而不是猜一个未受 constraint 约束的新顺序。
-
-`SIConstraint` 中可能携带生成阶段推导出的 RW 边，但本阶段只消费 WW。这样 RW 只有下一阶段的统一推导来源，避免一部分 RW 随 constraint side 重复进入求解语义。
-
-### 10.6 RW：由同一 WW guard 派生 B 边
-
-对每条真实读来源：
-
-```text
-source --WR(key)--> reader
-source --WW(key)--> laterWriter
-```
-
-求解器创建：
-
-```text
-reader --RW(key)--> laterWriter
-guardRW = wwOrderLiteral(source, laterWriter, key)
-```
-
-这条 RW 经统一入口登记到 B。因而 WW 分支变化时，与之对应的 RW 会在同一个模型中同步启用或关闭，不存在“WW 选了左侧、RW 仍沿用右侧”的脱节。
-
-### 10.7 PREDICATE：先编码依赖，再验证结果
-
-每个 predicate observation 依次执行：
-
-1. 将 recorded tuple sources 建成 `key -> source write`；同一 key 出现多个 source 立即令公式 UNSAT。
-2. 按 `QueryScope` 从 `writesByKey` 取出相关版本，结果按 scope cache 复用。
-3. row-local `QueryPlan` 尝试完整 EAGER 编码。
-4. 其他查询为每个 EXTERNAL key 建立 frontier，预编码所有可能激活的 `PR_WR/PR_RW`，并保存 general `PredicateCheck`。
-5. 每次 `createKeyFrontier` 将 `Predicate source constraints` 增加一；该指标统计 external `(predicate read,key)`，不是 predicate read 事件数。
-
-### 10.8 ACYCLIC：直接约束 verdict 图
-
-所有初始 typed edges 和当时可生成的组合边进入图后，最终阶段只断言：
-
-```java
-solver.assertTrue(inducedGraph.acyclic());
-```
-
-后续 general refinement 只追加 Boolean no-good clause。求解不会切换到 AR 图，也不会在模型得到后重建另一套 verdict 图。
-
-## 11. 两图如何实际参与冲突判断
-
-### 11.1 唯一入口 `addDependencyEdge`
-
-known、WW、RW、`PR_WR` 和 `PR_RW` 都必须经过 `addDependencyEdge(edge, guard)`。它先执行三类边界处理：
-
-- `guard=false`：该候选不可能激活，跳过。
-- source 是 bottom：不创建真实图边；初始版本不参加环。
-- 真实自环或 target 是 bottom：断言 `NOT guard`，禁止导致非法边的选择。
-
-然后按 edge type 分流：
-
-```text
-add A:                         add B:
-  保存 guarded A                保存 guarded B
-  A -> depGraph                 B 不直接进 inducedGraph
-  A -> inducedGraph             对每个 A(x,u) 且 B(u,y)
-  对每个 B(u,y)                   添加 induced(x,y)
-    若 A(x,u)，添加 induced(x,y)
-```
-
-A 到达时扫描已有 B，B 到达时扫描已有 A，所以 `A ∘ B` 的生成与插入先后无关。组合要求中间事务严格相接：
-
-```text
-A(x, u, guardA) AND B(u, y, guardB)
-    => induced(x, y, guardA AND guardB)
-```
-
-这正是“实际使用边判断冲突”的位置：最终 `acyclic()` 检查的 `inducedGraph` 中，A 是直接图边，B 通过每一条可成立的 `A ∘ B` 路径成为合成图边。孤立 B 不进入 verdict，B 也不会被错误折叠进 A closure。
-
-### 11.2 guard 与图边是等价关系
-
-对条件边，`bindGraphEdge` 同时加入：
-
-```text
-guard -> graphEdge
-graphEdge -> guard
-```
-
-即 `graphEdge <=> guard`。固定边使用 `guard=true` 并直接断言图边。双向绑定很关键：如果只有 `guard -> graphEdge`，虽然 guard 为真时边必须存在，但 theory solver 仍可能让无 guard 支撑的图边取值混乱；当前实现明确保证图中条件边和产生它的选择完全一致。
-
-对合成边：
-
-```text
-inducedEdge <=> (guardA AND guardB)
-```
-
-如果合成端点相同形成 `x -> x`，不向图中添加自环，而是直接断言 `NOT (guardA AND guardB)`。这会排除同时激活该 A/B 组合的模型，语义上等价于无环约束禁止该自环。
-
-### 11.3 三个必须始终成立的不变量
-
-求解正确性依赖以下不变量：
-
-1. 每条已激活 A typed edge 都同时存在于 `depGraph` 和 `inducedGraph`。
-2. 对每个已激活的 `A(x,u)` 与 `B(u,y)`，`inducedGraph` 都存在 `x -> y`；任何 B 都不会单独作为 `u -> y` 加入该图。
-3. predicate visibility 只读取 `depGraph.reaches(writer,reader)`，最终冲突只读取 `inducedGraph.acyclic()`；两种图用途不混用。
-
-因此当前求解器的核心对象确实是 typed-edge A/B 和由它们构造的两张 MonoSAT 图，不是旧式 AR 序列图。
+- `VIS(W,R)` 和 `VIS(R,W)` 可同时 false，允许 write skew。
+- `W A→X B→C` 只推出提交 W<C，不能推出 VIS(W,C)。
+- 再有 `C A→R` 时，NOT_VIS(W,R) 的负分支必须进入组合并产生冲突，不能只检查原始 typed 图。
+- Oracle 缺路径表示未知；SAT 中 source guard 不通过把自己写回 Oracle 来获得支持。
 
 ## 12. Predicate 求解核心
 
-### 12.1 候选版本与可见性 literal
+### 12.1 候选版本与共同可见性
 
-对一个 external key，候选集合只保留每个外部 writer transaction 对该 key 的最后一次写；同一事务更早的写不会成为跨事务 snapshot source。可见性定义为：
+每个 external key 只考虑各外部 writer 的 final write；同一个 writer 对多个 key 的贡献共用 `VIS(writer,reader)`。bottom 可见且最早。读前最新 self write 覆盖对应 key，读后 self write 不参与当前查询。同一 reader 的多个谓词事件共用外部快照，再分别叠加事件前自写。
 
-```text
-visible(write, reader)
-    write 属于 bottom                         = true
-    write 与 reader 同事务且位于读事件之前      = true
-    write 与 reader 同事务但位于读事件之后      = false
-    write 属于其他真实事务                     = depGraph.reaches(writer, reader)
-```
-
-这里的 `reaches` 是 MonoSAT 图 theory literal，不是在编码时把当前 A 图做一次静态闭包。后续 WW 或 `PR_WR` guard 改变 A 图时，可见性会随同一个 SAT 模型变化。
-
-版本先后 `beforeWrite(left,right)` 使用以下统一规则：
+### 12.2 latest-visible frontier
 
 ```text
-同一个 WriteRef                     = false
-同事务写                            = event index 比较
-bottom -> real                      = true
-real -> bottom                      = false
-不同真实事务、同一 key              = wwOrderLiteral(leftTxn,rightTxn,key)
+Latest_k(s,R) = VIS(s,R)
+    AND 对全部其他外部 final writer u:
+        NOT(VIS(u,R) AND WW_k(s,u))
 ```
 
-### 12.2 latest-visible frontier 的公式
+竞争域不能以裁剪后的 source 候选替代。PRHIST 对缺初始值的有限 key 提供 ABSENT bottom；它没有行贡献，但仍是最早的可见版本。有 query 前 self write 时取最后一次该 key 本地写，不再由外部 frontier 决定。
 
-令候选写 `s` 的可见性为 `V(s)`，`W(s,u)` 表示同一 key 上 `s` 先于 `u`。候选 `s` 被选择为 latest-visible source 的 guard 是：
+### 12.3 source 与 typed PR guards
 
-```text
-Select(s) = V(s) AND ∧[u != s] NOT(V(u) AND W(s,u))
-```
+选中的外部 source 产生 PR_WR；source 之后的 result-changing writer 产生 `Select(source)∧WW(source,later)` 守卫的 PR_RW。结果与依赖同时受 observation assumption 控制，使用传播裁剪的结果也保留事实 assumptions。
 
-即 `s` 自身可见，而且不存在一个也可见、并在 WW 次序上晚于 `s` 的候选。没有任何候选可见时，frontier 选择 ABSENT：
-
-```text
-Select(ABSENT) = ∧[u] NOT V(u)
-```
-
-若 reader 在谓词事件前已经写过该 key，最后一次本地写是固定 source，frontier 不再创建外部选择；recorded source 与该本地版本不同会直接导致 UNSAT。
-
-### 12.3 source 选择如何变成 PR typed edges
-
-对每个非 bottom 候选 source `s`，求解器预编码：
-
-```text
-s --PR_WR(key)--> reader
-guard = Select(s)
-```
-
-再对每个位于 `s` 之后且会改变谓词结果的写 `u` 预编码：
-
-```text
-reader --PR_RW(key)--> u
-guard = Select(s) AND W(s,u)
-```
-
-`PR_WR` 进入 A，既影响后续 snapshot visibility，也直接进入 verdict；`PR_RW` 进入 B，只通过 `A ∘ B` 参与 verdict。两类边仍调用同一个 `addDependencyEdge`，不存在仅记录在 observation 上但未进入 MonoSAT 的旁路。
-
-`writeChangesPredicateResult` 先比较 source/later 是否匹配谓词；匹配状态相同时，row-local 情况优先比较 canonical row contribution，无法使用该结果时再退回 key/value 差异。它决定是否需要 `PR_RW`，但 general 查询最终仍由完整 `QueryPlan` refinement 校验整个 snapshot。
+报告中的 absent Pred-WR witness 不等于“定义上必须是 latest”。实现选择实际 latest 作为存在性见证；合法执行必须在候选中保留该表示。任意更早的 good writer 不保证可替代，因为可能产生额外 PR_RW 冲突。
 
 ### 12.4 recorded source 的固定编码
 
-历史显式记录 source 时，source 必须出现在该 key 的 frontier candidates 中，否则公式置为 false。随后：
+recorded input/source 是待验证事实。它必须出现在合法 source 域，与 key/value、scope、final-write 或 query 前 latest self 要求相符；不能由求解器任意换成另一个来源。`result.inputs` 是结果贡献来源，并不是整个可见快照。
 
-- 普通真实 source 固定加入 `PR_WR(source,reader,key)`；bottom 或 reader 自身 source 则直接断言其可见性。
-- 对 source 之后、会改变谓词结果的每个 writer 加入 `PR_RW(reader,writer,key)`，guard 为对应的 `W(source,writer)`。
+### 12.5 row-local EAGER / GMWR
 
-也就是说 recorded source 不是求解器可以替换的建议值，而是待验证的固定读来源。
+两种模式消费同一 prepared observation/key 数据和行贡献分析。INTERNAL key 验证自写贡献；EXTERNAL recorded source 及没有隐式 bottom 备选的唯一实来源直接编码可见性和逐竞争写排除子句，跳过通用 latest 合取；JOIN 固定来源使用相同检查并保留句柄。其他来源的 latest 合取在当前 checker 内规范化、去重和缓存；PR 依赖仍保留全部竞争写与 Delta 条件；absent key 的每个 bad writer 要么不可见，要么由更晚且可见的 good writer 修复。GMWR 只改变 item 的准备、预传播和残余编码组织，不降低完整结果要求。
 
-### 12.5 row-local EAGER
+记录不匹配直接形成矛盾，不跳转到更宽松路径。compact matcher 与有界行贡献缓存由共享 analysis 提供。
 
-`QueryPlan.isRowLocal()` 为 true 时，求解器尝试在首次 `solve()` 前完成全部约束：
+### 12.6 非 DISTINCT 单调 JOIN
 
-1. 用 recorded inputs 执行查询，做 canonical `inputs/values` 校验，并确认每个 recorded source 的实际值等于 recorded input。
-2. INTERNAL key 使用谓词读之前的最后本地写；有 recorded source 时必须是同一 `WriteRef`，没有 recorded source 时该本地版本必须对结果无贡献。
-3. EXTERNAL 且有 recorded source 时，按上一节固定 `PR_WR/PR_RW`。
-4. EXTERNAL 且没有 recorded source 时，仍为所有 frontier candidate 预编码 guarded `PR_WR/PR_RW`。
-5. 对每个会错误进入结果的 bad write `b`，加入阻止它成为 latest-visible 的子句：
+首次 solve 前完成 scope 内 frontier、所有可能绑定、recorded bag 重数及 contributing inputs/provenance、额外结果绑定排除、typed PR_WR/PR_RW。完整 scope 包括没有出现在 recorded inputs 中的 key，避免遗漏额外 JOIN 行或跨 key 快照不一致。
 
-```text
-NOT V(b)
-OR ∨[good g] (V(g) AND W(b,g))
-```
+### 12.7 all-INTERNAL 与不支持查询
 
-该子句要求 bad write 要么不可见，要么被一个更晚且可见的 good write 覆盖。row-local 全 INTERNAL observation 在 `rowLocalSnapshotValid` 成功时也会在本路径完成结果校验，不依赖 external frontier 是否存在。
+all-INTERNAL 也执行完整查询校验，不因没有 EXTERNAL frontier 而跳过。DISTINCT 和不支持的 whole-snapshot 自定义谓词在能力检查阶段报 ERROR。不存在模型快照检查后追加 no-good 的循环。
 
-为避免重复执行行级表达式，compact matcher 使用按 write id 索引的缓存；一般 row contribution 使用 solver-local、有容量上限的 LRU cache。若 EAGER 无法证明 recorded snapshot 合法，则转入 general 路径，而不是直接接受。
+## 13. 单次 SAT、判定与冲突提取
 
-### 12.6 general QueryPlan 与 no-good refinement
-
-JOIN、`DISTINCT` 或其他非 row-local 查询按“预编码全部依赖 + 模型级结果校验”求解：
-
-1. 为 scope 中每个 EXTERNAL key 建立 frontier。
-2. 在第一次 `solve()` 前，为每个可能 source 预编码 selection-guarded `PR_WR/PR_RW`。
-3. 对非 frontier 的 INTERNAL key，取最后本地写或 recorded source，组成 `fixedSnapshot`。
-4. MonoSAT 给出模型后，从每个 frontier 选出模型中的 latest-visible candidate；无可见候选则该 key 为 ABSENT。
-5. 合并 `fixedSnapshot` 与这些 candidate values，执行完整 `QueryPlan`，并与 recorded result 做 canonical 比较。
-
-若模型选择为 `(s1, s2, ..., sn)` 且结果不匹配，求解器加入否定该组合的 no-good：
+### 13.1 求解流程
 
 ```text
-NOT Select_1(s1) OR NOT Select_2(s2) OR ... OR NOT Select_n(sn)
+SatSolveBackend.solve(Solver, assumptions) -> boolean
+true -> SolveStatus.SAT -> AuditResult.ACCEPT
+false -> SolveStatus.UNSAT -> AuditResult.REJECT
 ```
 
-实现没有额外创建 `Select` 变量，而是直接展开其否定：
+仅调用一次 native solve。检测器没有内部 deadline 或 TIMEOUT 状态；运行异常走 ERROR，外部 runner 超时单独记 PROCESS_TIMEOUT。
 
-- 已选 `s`：加入 `NOT V(s)`，以及每个 `V(u) AND W(s,u)`；只要 source 不再可见或出现更晚可见版本，原选择就被改变。
-- ABSENT：加入所有可取候选的 `V(u)`；只要任一候选变为可见，原 ABSENT 选择就被改变。
-- fixed frontier：不进入 no-good，因为它没有可替换选择。
+### 13.2 assumption 冲突提取
 
-如果展开后 clause 为空，说明错误 snapshot 完全由固定状态决定，公式直接置为 false。否则重新调用 MonoSAT，直到找到查询结果一致的模型或穷尽全部可能组合。
-
-refinement 阶段不新增 `PR_WR/PR_RW`。这些边已经按 `Select(s)` guard 在编码阶段进入 A/B，因此每次新模型都自动激活与当前 source 选择一致的 typed edges，并立即受同一个 `inducedGraph.acyclic()` 约束。
-
-### 12.7 当前 general all-INTERNAL 边界
-
-general 路径在 scope 中没有 EXTERNAL key 时会直接跳过，不创建 `PredicateCheck`。因此当前存在两类边界：
-
-- 非 row-local all-INTERNAL 查询不会再次执行完整 JOIN/`DISTINCT` snapshot 求值。
-- row-local all-INTERNAL 通常在 EAGER 的 `rowLocalSnapshotValid` 中完成校验；但如果该校验失败而回退 general，general 仍会因没有 EXTERNAL frontier 而跳过，不能把这条 fallback 路径描述为已经完整拒绝。
-
-这些是按当前代码记录的实现边界，不属于 `A/B` 两图公式本身。
-
-## 13. SAT 循环、判定与冲突提取
-
-### 13.1 完整求解流程
-
-```text
-build formula:
-    create real-transaction nodes
-    encode fixed known A/B edges
-    create one Boolean branch per unresolved WW constraint
-    derive guarded RW from WR + WW
-    encode predicate frontiers and all guarded PR edges
-    assert acyclic(InducedSI graph)
-
-solve/refine:
-    while MonoSAT has a model:
-        evaluate every general predicate snapshot in that model
-        if any mismatch:
-            add no-good clauses for the mismatching selections
-            continue
-        return ACCEPT
-    return REJECT
-```
-
-所以 ACCEPT 的含义不是“图暂时无环”这么单一，而是存在同一组 guard 赋值同时满足：
-
-- 每个 unresolved WW constraint 恰好选择一侧。
-- 普通 RW 与选择的 WW 一致。
-- predicate source/frontier、`PR_WR/PR_RW` 与 A 图可见性一致。
-- 所有实际进入 EAGER 或 general `PredicateCheck` 的 recorded query result 与模型 snapshot 一致。
-- `A ∪ (A ∘ B)` 无环。
-
-详细谓词指标只在 `--solver-stats` 时输出；六个编码阶段和外层求解耗时始终进入 profiler。
-
-### 13.2 REJECT 后的 constraint 缩减
-
-外层 solver 默认在 UNSAT 后执行解释缩减：
-
-```text
-if solve(constraints = empty) is UNSAT:
-    conflictConstraints = empty
-    conflictEdges = known InducedSI cycle witness
-else:
-    core = all remaining WW constraints
-    for each constraint c in traversal order:
-        if solve(core - c) is still UNSAT:
-            core = core - c
-    conflictConstraints = core
-    conflictEdges = encoded known typed edges among core transactions
-```
-
-每次试删都会构造一个新的 `SISolverInduced`，重新执行相同的 A/B、predicate 和 acyclic 公式；递归实例设置 `collectConflicts=false`，不会嵌套缩减。
-
-最终 constraint 集合是按当前遍历顺序得到的 deletion-minimal core：再删除其中任意一个已保留 constraint，当前检查会变为 SAT；它不保证是基数最小或全局唯一的 UNSAT core。
-
-如果不需要任何待定 WW 就已经 UNSAT，KnownGraph 的 cycle witness 会把 `A ∘ B` 合成边展开为实际的 A typed edge 和 B typed edge，而不是只报告无类型的合成端点。对于依赖条件 predicate guard 才形成的矛盾，当前冲突输出仍可能无法还原完整动态模型 witness；这不影响 verdict，只限制解释的完整度。
+UNSAT 后直接读取本次 `getConflictClause()`，映射 `WW_CHOICE/PREDICATE_OBLIGATION/GMWR_RULE` 与 assumption 原因，不另建 solver、不重解、不承诺最小 core。无 assumption 原因时保留确定图/剪枝冲突摘要。
 
 ## 14. CLI
 
@@ -795,22 +457,14 @@ audit HISTORY
 公开参数：
 
 ```text
---solver-timeout-seconds
+--[no-]gmwr                      # default on; off selects EAGER
+--[no-]gmwr-prepropagation       # default on; only effective with GMWR
 --solver-stats
 ```
 
-隐藏实验参数：
+输入固定为 PRHIST，backend 固定为 MonoSAT。WW reachability、witness coalescing、graph-edge interning 在 CLI 固定开启；旧 `--predicate-encoding`、`--ww-pruning`、`--solver-timeout-seconds` 和合并/边复用开关不再解析。
 
-```text
---ww-pruning NONE|REACHABILITY
---[no-]predicate-witness-coalescing
---[no-]graph-edge-interning
-```
-
-输入固定为 PRHIST，backend 固定为 MonoSAT。当前谓词实现固定为
-EAGER/general refinement；`--predicate-encoding EAGER|GMWR` 要等 SI
-GMWR 真正接入后再公开，迁移期间不提前暴露或默认选择 GMWR。旧参数不作为
-别名保留。
+默认日志分 History/WW/GMWR/SAT/Timing 段，GMWR 模式的 PR_WR 计数随阶段摘要输出，末尾为 `Peak memory` 与 `SI audit result: ...`。`--solver-stats` 追加 Predicate 细项、原始统计和旧 marker。异常显式输出 `[SI] Error`、`SI audit result: ERROR`，返回 1。
 
 ```bash
 java -Djava.library.path=build/monosat -Xmx8g \
@@ -841,8 +495,20 @@ src/main/java/verifier/SIVerifier.java
 src/main/java/verifier/SISolverInduced.java
     分阶段 typed-edge MonoSAT 编码和最终 verdict。
 
-src/main/java/verifier/Pruning.java
-    REACHABILITY 模式。
+src/main/java/verifier/SIReachabilityOracle.java
+    shared A/B reachability 和 induced-SI branch feasibility。
+
+src/main/java/verifier/SIReachabilityPruner.java
+    基于 shared oracle 的 WW branch reduction。
+
+src/main/java/verifier/SiGmwrPropagationState.java
+    row-local GMWR item 预传播，结束后单向反馈确定事实到残余 WW 剪枝至固定点。
+
+src/main/java/verifier/PredicateAnalysis.java
+    共享 scope、写/source 与行贡献。
+
+src/main/java/verifier/PredicatePruning.java
+    prepared observation/key、PR_WR 固定点、residual items。
 
 src/main/java/verifier/SIConstraint.java
 src/main/java/verifier/SIEdge.java
@@ -851,30 +517,30 @@ src/main/java/verifier/SIEdge.java
 
 ## 16. 测试覆盖
 
-当前测试包括：
+回归范围包括 loader/QueryPlan、内部一致性、write skew、同 key 写冲突、point RW、typed PR_WR/PR_RW、共同 VIS 快照、row-local 与 JOIN 的 bag/provenance、all-INTERNAL、能力错误、预传播/编码模式 parity、单次 backend 调用和原生冲突复用，以及 runner 最终 verdict/exit/外部超时契约。
 
-- loader、QueryPlan 和 MatrixGraph。
-- write skew、同 key 冲突、point-read RW。
-- known `PR_WR/PR_RW` 实际进入 verdict 图。
-- row-local 与 relational JOIN/投影/重复行/`DISTINCT`。
-- 六阶段编码 profiler。
-- REACHABILITY 的 SI induced-graph branch oracle。
-- predicate source constraint 计数和冲突缩减。
-- 单一 audit CLI、两种 WW pruning modes 和隐藏消融参数。
-- 160 组固定随机种子的三事务 A/B 图差分测试。
-
-差分测试对每个 case 穷举 WW 两个方向，独立计算 `A ∪ (A ∘ B)` 的传递闭包和环，再分别对比 NONE、REACHABILITY 与最终 solver verdict。
+纯 typed A/B 小图差分仍可验证基本 induced 规则，但不能代替含 VIS 辅助分支、完整 latest/frontier 和跨 key JOIN 的语义回归。此处列出覆盖职责，截至 2026-09-23 最近一次正式回归共 177 项，175 通过、2 项因既有外部 catalog 缺失跳过，0 失败。WW 检查的三个历史两轮交叉顺序测试均 ACCEPT，平均总耗时下降约 9.3%–14.5%；不是全 workload 性能保证。证据、样本和资源限制见根目录 CHANGE_LOG.md。
 
 ## 17. 当前边界
 
-- 按要求尚未为 SI 引入 GMWR；当前 predicate solving 为 EAGER/general refinement。
-- general 路径在全部 scope key 都为 INTERNAL 时不创建 `PredicateCheck`：非 row-local 查询没有第二次完整 QueryPlan snapshot check，row-local EAGER 校验失败后的 fallback 也会跳过该检查。
-- REACHABILITY 的 BitSet oracle 每个分支复制 `directA/directB` rows 并重算 SI induced graph；不会退化为 SER 普通有向图剪枝。
-- `--solver-timeout-seconds` 已连接到 solve/refinement 的 backend deadline。
-- 只支持结构化 QueryPlan，不接受任意 SQL 文本。
-- 紧凑 PRHIST 要求 `(key,value)` source 唯一。
-- `tools/` 当前只有 `audit-prhist.sh` 和 `run_catalog_experiment.py`，没有 SI 版 `validate_prhist_suite.py`。
-- 冲突 constraint 集合经过贪心缩减，但不承诺全局最小 core，也不承诺完整还原某个 UNSAT 动态 guard 模型。
+- 仅支持批准的 row-local、非 DISTINCT 单调 QueryPlan；不接受任意 SQL 文本。
+- 紧凑 PRHIST 要求 `(key,value)` 唯一 source；snapshot 域是历史已知的有限 key。
+- 生成器形状的 WW 分支已补齐相对当前确定图的冲突检查；非标准形状仍保留充分检查。逐个可行的分支组合未必可行，最终完整 induced 公式负责剩余选择。
+- 单次 solve 前的 JOIN 绑定枚举仍可能有较大开销，不通过模型补救降低语义要求。
+- 唯一确定 Oracle 与 VIS SAT 选择各有职责；不将缺路径误读为不可见。
+- runner 只使用外部进程期限；最后 verdict 与 exit 必须一致，ERROR/截断不能算 REJECT。
+- assumption conflict 不保证最小 core；文档不替代最终编译、回归和实验验收。
+
+截至 2026-09-23 的源码核查还发现以下性能候选，尚未实施，也未测得加速收益：
+
+| 候选 | 当前证据 | 验证边界 |
+| --- | --- | --- |
+| residual item 按 observation 分组 | SI 每次 row-local 编码都扫描全部 residual items；SER 独立遍历一次 residual 列表。 | 可减少重复遍历，必须保留每个 item 的 observation/rule assumption。 |
+| prepared 数据索引 | SI 的 Result.observation 和 PreparedObservation.key 均线性查找，JOIN 每个 key 重复调用；SER 的 observation 使用 Map。 | 可传递已准备对象或索引，需同时评估内存成本。 |
+| 编码临时集合及时释放 | SI 的 typed guard 集合、A/B support 索引与 H support 集合保留至求解；SER 在消费后清理相应队列。 | 只释放无后续消费者的数据，保留冲突原因；是否降低 RSS/耗时需实测。 |
+| latest 之外的 guard 合取共享 | SI 的通用 and 帮助方法仍直接创建公式；SER 的依赖路径可保存条件项并直接发子句。 | 不能照搬 SER 单向蕴含而破坏 SI 物理边与支持条件的等价关系，须先测重复度及公式规模。 |
+
+已完成的固定来源路径、latest 合取缓存、直接子句、见证 OR 链消除、增量 Oracle/watcher、共享最终写、辅助图 H、物理边复用和 WW-feedback 不再列为缺项。已回退的确定 PR_RW 传播与来源联合假设剪枝也不属于遗漏，不能自动恢复。
 
 ## 18. 新人阅读顺序
 
@@ -883,6 +549,7 @@ src/main/java/verifier/SIEdge.java
 3. `PredicateHistoryLoader.java`：输入到 History。
 4. `KnownGraph.java`：A/B、readFrom、predicate observations。
 5. `SIVerifier.java`：约束生成、剪枝分派和诊断。
-6. `Pruning.java`：NONE/REACHABILITY 的调用边界与正式基线。
-7. `SISolverInduced.java`：分阶段编码、predicate frontier、induced graph。
-8. `SISolverInducedStageTest`、`SISolverInducedParityTest`、`SISolverInducedDifferentialTest`：用回归测试核对实际语义。
+6. `SIReachabilityOracle.java`、`SIReachabilityPruner.java`：shared A/B oracle 与 WW reduction。
+7. `PredicateAnalysis.java`、`PredicatePruning.java`、`SiGmwrPropagationState.java`：共享分析、准备与 GMWR item 预传播。
+8. `SISolverInduced.java`：分阶段编码、predicate frontier、induced graph。
+9. `SIGmwrParityTest`、`SISolverInducedParityTest`、`SISolverInducedDifferentialTest`：用回归测试核对实际语义。

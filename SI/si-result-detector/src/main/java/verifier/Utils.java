@@ -1,5 +1,8 @@
 package verifier;
 
+import static history.query.PredicateReadSemantics.predicateSnapshotMatches;
+import static history.query.PredicateReadSemantics.relationResolverFor;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -23,8 +26,6 @@ import history.Transaction;
 import history.Event.EventType;
 import history.query.MapVisibleState;
 import history.query.QueryException;
-import history.query.QueryPlan;
-import history.query.RelationResolver;
 
 class Utils {
     @lombok.Data
@@ -78,11 +79,14 @@ class Utils {
                 var predicate = ev.getPredicate();
                 var identity = predicate == null ? null : predicate.identity();
                 var current = checkPredicateRead(ev, i, writesByKeyValue,
-                        txnWrites, previousPredicateReads.get(identity));
+                        txnWrites, predicate != null && predicate.isRowLocal()
+                                ? previousPredicateReads.get(identity) : null);
                 if (current == null) {
                     return false;
                 }
-                previousPredicateReads.put(identity, current);
+                if (predicate.isRowLocal()) {
+                    previousPredicateReads.put(identity, current);
+                }
             }
         }
         return true;
@@ -215,8 +219,7 @@ class Utils {
             }
         }
 
-        if (predicate instanceof QueryPlan
-                && !((QueryPlan<?, ?>) predicate).isRowLocal()) {
+        if (!predicate.isRowLocal()) {
             var snapshot = new HashMap<KeyType, ValueType>();
             boolean allLocal = true;
             for (var key : coveredKeys) {
@@ -269,54 +272,6 @@ class Utils {
         }
 
         return new PredicateReadState<>(pos, new HashMap<>(resultByKey));
-    }
-
-    private static <KeyType, ValueType> boolean predicateSnapshotMatches(
-            Event<KeyType, ValueType> event, Map<KeyType, ValueType> snapshot) {
-        try {
-            var evaluation = event.getPredicate().evaluate(
-                    new MapVisibleState<>(snapshot, relationResolverFor(event)));
-            var recorded = event.getRecordedPredicateResult();
-            if (recorded != null) {
-                if (!evaluation.canonicalEquals(recorded)) {
-                    System.err.printf("%s whole-snapshot query does not match recorded result\n", event);
-                    return false;
-                }
-                return true;
-            }
-            var expectedInputs = new HashMap<KeyType, ValueType>();
-            for (var result : event.getPredResults()) {
-                if (expectedInputs.putIfAbsent(result.getKey(), result.getValue()) != null) {
-                    System.err.printf("%s has duplicate key in predicate result\n", event);
-                    return false;
-                }
-            }
-            if (!evaluation.inputs().equals(expectedInputs)) {
-                System.err.printf("%s whole-snapshot query does not match recorded inputs\n", event);
-                return false;
-            }
-            return true;
-        } catch (QueryException exception) {
-            System.err.printf("%s whole-snapshot query evaluation failed: %s\n",
-                    event, exception.getMessage());
-            return false;
-        }
-    }
-
-    private static <KeyType, ValueType> RelationResolver<KeyType> relationResolverFor(
-            Event<KeyType, ValueType> event) {
-        var relations = event.getPredicate().scope().relations();
-        return resolvedKey -> {
-            var canonical = String.valueOf(resolvedKey);
-            var separator = canonical.indexOf(':');
-            if (separator > 0) {
-                return canonical.substring(0, separator);
-            }
-            if (relations.size() == 1) {
-                return relations.iterator().next();
-            }
-            return "__legacy__";
-        };
     }
 
     private static <KeyType, ValueType> boolean predicateMatchesRow(

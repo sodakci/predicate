@@ -24,10 +24,10 @@ class SIOptimizationParityTest {
         var graph = new KnownGraph<String, Integer>(history);
         graph.putEdge(first, second, new Edge<>(EdgeType.WR, "a"));
 
-        var oracle = new SIVerifier.InducedGraph.Oracle<String, Integer>(graph);
-        assertEquals(false, oracle.canAddAll(List.of(
+        var oracle = new SIReachabilityOracle<String, Integer>(graph);
+        assertEquals(true, oracle.hasConflict(List.of(
                 new SIEdge<>(second, first, EdgeType.RW, "b"))));
-        assertEquals(true, oracle.canAddAll(List.of(
+        assertEquals(false, oracle.hasConflict(List.of(
                 new SIEdge<>(first, second, EdgeType.RW, "b2"))));
     }
 
@@ -38,12 +38,10 @@ class SIOptimizationParityTest {
             for (boolean interning : List.of(false, true)) {
                 var history = predicateCycleHistory();
                 var graph = new KnownGraph<>(history);
-                var settings = SIVerifier.SolverSettings.defaults(
-                        SIVerifier.PruningMode.NONE);
+                var settings = SIVerifier.SolverSettings.defaults();
                 settings.predicateWitnessCoalescing = coalescing;
                 settings.graphEdgeInterning = interning;
-                settings.solverTimeoutSeconds = 0;
-                statuses.add(new SISolverInduced<>(history, graph,
+                statuses.add(SISolverTestSupport.create(history, graph,
                         SIVerifier.generateConstraintsSI(history, graph),
                         false, false, settings).solveStatus());
             }
@@ -57,20 +55,26 @@ class SIOptimizationParityTest {
         var history = new History<String, Integer>();
         var bottom = history.addTransaction(history.addSession(-1L), -1L);
         bottom.setStatus(Transaction.TransactionStatus.COMMIT);
-        var reader = history.addTransaction(history.addSession(1L), 1L);
-        var writer = history.addTransaction(history.addSession(2L), 2L);
-
-        history.addWriteEvent(reader, "dep", 7, null);
-        history.addPredicateReadEvent(reader,
+        var first = history.addTransaction(history.addSession(1L), 1L);
+        var second = history.addTransaction(history.addSession(2L), 2L);
+        history.addWriteEvent(bottom, "k1", 0, null);
+        history.addWriteEvent(bottom, "k2", 0, null);
+        history.addPredicateReadEvent(first,
                 (PredicateFixtures.RowPredicate<String, Integer>)
-                        (key, value) -> key.startsWith("k") && value > 0,
-                List.of(new Event.PredResult<>("k1", 1),
-                        new Event.PredResult<>("k2", 2)));
-        history.addReadEvent(writer, "dep", 7, null, null, null);
-        history.addWriteEvent(writer, "k1", 1, null);
-        history.addWriteEvent(writer, "k2", 2, null);
-        reader.setStatus(Transaction.TransactionStatus.COMMIT);
-        writer.setStatus(Transaction.TransactionStatus.COMMIT);
+                        (key, value) -> key.startsWith("k") && value == 0,
+                List.of(new Event.PredResult<>("k1", 0),
+                        new Event.PredResult<>("k2", 0)));
+        history.addWriteEvent(first, "k1", 1, null);
+        history.addWriteEvent(first, "k2", 2, null);
+        history.addPredicateReadEvent(second,
+                (PredicateFixtures.RowPredicate<String, Integer>)
+                        (key, value) -> key.startsWith("k") && value == 0,
+                List.of(new Event.PredResult<>("k1", 0),
+                        new Event.PredResult<>("k2", 0)));
+        history.addWriteEvent(second, "k1", 3, null);
+        history.addWriteEvent(second, "k2", 4, null);
+        first.setStatus(Transaction.TransactionStatus.COMMIT);
+        second.setStatus(Transaction.TransactionStatus.COMMIT);
         return history;
     }
 }

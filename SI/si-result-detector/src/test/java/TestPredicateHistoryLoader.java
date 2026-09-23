@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.github.luben.zstd.ZstdOutputStream;
 import graph.KnownGraph;
 import history.Event;
 import history.History;
@@ -20,6 +21,7 @@ import verifier.PredicateFixtures;
 import verifier.SIVerifier;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -290,6 +292,22 @@ public class TestPredicateHistoryLoader {
         assertEquals(2, history.getTransactions().size());
         assertEquals(Transaction.TransactionStatus.COMMIT, history.getTransaction(0).getStatus());
         assertNotNull(history.getTransaction(-1));
+    }
+
+    @Test
+    void loadsZstdJsonlFromDirectoryAndDirectPath() throws Exception {
+        var historyDir = Files.createTempDirectory("zstd-prhist");
+        Files.writeString(historyDir.resolve("initial_state.json"),
+                "[{\"key\":\"kv:0\",\"value\":0}]");
+        var historyFile = historyDir.resolve("history.prhist.jsonl.zst");
+        try (var output = new ZstdOutputStream(Files.newOutputStream(historyFile))) {
+            output.write(("{\"session\":0,\"session_seq\":1,\"txn\":0,"
+                    + "\"status\":\"commit\",\"ops\":[]}\n")
+                    .getBytes(StandardCharsets.UTF_8));
+        }
+
+        assertNotNull(new PredicateHistoryLoader(historyDir).loadHistory().getTransaction(0));
+        assertNotNull(new PredicateHistoryLoader(historyFile).loadHistory().getTransaction(0));
     }
 
     @Test

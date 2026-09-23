@@ -19,15 +19,15 @@ class SISolverInducedDifferentialTest {
     private static final int CASES = 160;
 
     @Test
-    void solverAndBothPruningModesMatchBruteForceInducedGraphOracle() {
+    void solverAndReachabilityReductionMatchBruteForceInducedGraphOracle() {
         var random = new Random(0x51AD7A);
         for (int caseId = 0; caseId < CASES; caseId++) {
             var specification = CaseSpecification.random(random);
             boolean expected = specification.bruteForceSatisfiable();
-            for (var mode : SIVerifier.PruningMode.values()) {
-                assertEquals(expected, solve(specification, mode),
+            for (boolean reduction : List.of(false, true)) {
+                assertEquals(expected, solve(specification, reduction),
                         () -> "case=" + specification.id
-                                + " mode=" + mode
+                                + " reduction=" + reduction
                                 + " A=" + specification.knownA
                                 + " B=" + specification.knownB
                                 + " forward=" + specification.extraForward
@@ -38,23 +38,25 @@ class SISolverInducedDifferentialTest {
 
     private static boolean solve(
             CaseSpecification specification,
-            SIVerifier.PruningMode mode) {
+            boolean reduction) {
         var instance = specification.instantiate();
-        boolean rejected;
-        switch (mode) {
-        case NONE:
-            rejected = false;
-            break;
-        case REACHABILITY:
-            rejected = Pruning.pruneConstraints(
-                    instance.graph, instance.constraints).isPresent();
-            break;
-        default:
-            throw new IllegalStateException("unknown mode " + mode);
+        var oracle = new SIReachabilityOracle<String, Integer>(instance.graph);
+        if (reduction) {
+            while (true) {
+                var result = SIReachabilityPruner.reduceOnce(
+                        instance.graph, instance.constraints, oracle);
+                if (result.rejected) {
+                    return false;
+                }
+                if (instance.constraints.isEmpty()
+                        || result.forced <= 0.01 * Math.max(1, instance.constraints.size())) {
+                    break;
+                }
+            }
         }
-        return !rejected && new SISolverInduced<>(
+        return SISolverTestSupport.solveStatus(
                 instance.history, instance.graph, instance.constraints,
-                false, false).solve();
+                false, false, SIVerifier.SolverSettings.defaults(), oracle) == SolveStatus.SAT;
     }
 
     private static final class CaseSpecification {

@@ -2,17 +2,19 @@
 
 SI 是本仓库中的谓词感知快照隔离检测器。它读取 PRHIST 历史，构造 Adya typed dependency 的 A/B 边、待定写写顺序和谓词读约束，并调用 MonoSAT 判断是否存在一个合法的 SI 解释。
 
-当前最终判定不是旧式 AR 序列图：
+逻辑依赖按 SI 语义分为 A/B 两类：
 
 ```text
 A = {SO, WR, WW, PR_WR}
 B = {RW, PR_RW}
-InducedSI = A ∪ (A ∘ B)
+A_s = A ∪ VIS 的正分支辅助支持
+B_s = B ∪ VIS 的负分支辅助支持
+InducedSI = A_s ∪ (A_s ∘ B_s)
 ```
 
-求解器要求 `InducedSI` 无环。实现中 `depGraph` 表示 A，B 以带 guard 的 typed edge 保存；每加入 A 或 B 都同步补齐 `A ∘ B` 到实际参与 verdict 的 `inducedGraph`。
+每个实际消费的外部 writer/reader 事务对共用一个 `VIS(writer,reader)`：正分支提供 `A_s(writer,reader)`，负分支提供 `B_s(reader,writer)`。它们与全部 typed A/B 支持一起参与 induced 组合；辅助支持不计作 `PR_WR/PR_RW`。物理图采用辅助节点 H 编码：A(U,V) 对应 U→V 与 U→V*，B(U,V) 对应 U*→V，避免逐对展开 A;B。辅助节点只表示组合通道；每个 guard 赋值下 acyclic(H) 等价于 acyclic(A_s∪(A_s;B_s))。H 的确定部分约简后，剩余物理边与其全部 support 的析取绑定，MonoSAT 对唯一 `inducedGraph` 断言无环。该约束使所有 key 和查询共用合法 SI 快照；已删除以 `depGraph.reaches()` 代替可见性的旧路径。`NOT_VIS(writer,reader)` 不等于反向 VIS，两个事务可以互不可见。
 
-详细的项目结构和关键文件说明见 [PROJECT_OVERVIEW.md](si-result-detector/docs/PROJECT_OVERVIEW.md)；其中“求解核心：分阶段 MonoSAT 编码”“两图如何实际参与冲突判断”“Predicate 求解核心”和“SAT 循环、判定与冲突提取”四节给出了 guard 公式、A/B 组合、frontier/refinement 与 UNSAT 缩减的完整说明。
+详细的项目结构、快照与 guard 公式、完整 induced 组合及冲突解释见 [PROJECT_OVERVIEW.md](si-result-detector/docs/PROJECT_OVERVIEW.md) 和 [SI_DESIGN.md](si-result-detector/docs/SI_DESIGN.md)。
 
 ## 目录说明
 
@@ -86,19 +88,21 @@ cd SI/si-result-detector
 ./gradlew test
 ```
 
+测试集包含 row-local 谓词分类及同一事务内重复谓词读继承语义的回归检查。
+
 ## 输入格式
 
 当前公开入口是 `PRHIST`。输入可以是：
 
-- 一个 `history.prhist.jsonl` 文件。
-- 一个包含 `history.prhist.jsonl` 和 `initial_state.json` 的 `hist-00000` 目录。
+- 一个 `history.prhist.jsonl.zst` 或旧版 `history.prhist.jsonl` 文件。
+- 一个包含上述 history 文件和 `initial_state.json` 的 `hist-00000` 目录；两种 history 同时存在时优先读取压缩文件。
 
 目录形态：
 
 ```text
 hist-00000/
   initial_state.json
-  history.prhist.jsonl
+  history.prhist.jsonl.zst
   manifest.json
 ```
 
@@ -113,7 +117,7 @@ hist-00000/
 ]
 ```
 
-`history.prhist.jsonl` 每行一个已提交事务：
+history 解压后是 JSONL，每行一个已提交事务：
 
 ```json
 {"session":0,"session_seq":1,"txn":1001,"status":"commit","ops":[{"type":"r","key":"kv:0","value":0},{"type":"w","key":"kv:0","value":10}]}
@@ -160,10 +164,12 @@ select.columns
     必填，支持字段路径和 AS 别名。
 
 select.distinct
-    可选布尔值，默认 false。
+    可选布尔值，默认 false；检测器不支持 true。
 ```
 
 条件和投影表达式支持字段路径、整数/字符串/布尔/null 字面量、`=`、`>`、`<`、`%`、`AND` 和括号。单表 KV 的 `TRUE`、`value = n`、`value % m = r`、`value > n`、`value < n` 继续受支持；对象 `value` 可以通过 `relation.value.field` 访问。`result.values` 按多重集比较，`result.inputs` 必须列出结果实际依赖的可见 `(key,value)` 版本。对象和数组结果支持相等性比较，但 `<`、`>` 只适用于可排序的标量值。
+
+查询支持 row-local `QueryPlan`、声明 `isRowLocal()` 的程序化逐行 evaluator，以及受支持的非 DISTINCT 单调 JOIN。DISTINCT、自定义全快照及其他不支持的非单调查询明确输出 `ERROR`。所有路径共用结果多重集和贡献来源比较规则；`result.inputs` 不是完整快照，不会据此裁掉可能产生额外结果的 key。外部读取使用同一事务快照，查询事件之前的最后一次自写覆盖对应 key。
 
 注意：`PredicateHistoryLoader` 只接受紧凑 `query/result` 形态，并拒绝 `write_id`、`source_write_id`、`source_txn`、`source_op_index` 等 source provenance 字段。带 `predicate/results` 字段或直接保存 SQL 文本的历史不属于当前输入格式。
 
@@ -182,56 +188,39 @@ java -Djava.library.path=build/monosat -Xmx8g \
 `constraint-stat`、`stat`、`dump`，也不再接受单选的 `--type` 或
 `--solver`。
 
-SI detector 正常运行时会打印：
+默认输出按 `History`、`WW`、`GMWR`、`SAT`、`Timing` 分段，
+最后打印 `Peak memory` 和 `SI audit result: ACCEPT|REJECT`。
+EAGER 模式不输出 GMWR 段；提前拒绝时只输出已完成的阶段。
 
-```text
-Mode: SI, solving Adya typed dependency graphs A/B and checking the induced SI graph
-```
+- `ACCEPT`：存在满足检测器约束的 SI 解释，退出码 0。
+- `REJECT`：不存在合法解释，Java 退出码 -1（Linux 进程退出码为 255）。
+- 加载或运行异常：输出 `[SI] Error: ...` 和 `SI audit result: ERROR`，退出码 1。
 
-输出末尾会包含稳定 verdict 标记：
-
-```text
-[[[[ ACCEPT ]]]]
-[[[[ REJECT ]]]]
-[[[[ TIMEOUT ]]]]
-```
-
-- `ACCEPT`：存在一个满足点读、写入和谓词读可见性的 SI 解释。
-- `REJECT`：当前历史在检测器模型下不存在合法 SI 解释。
-- `TIMEOUT`：MonoSAT 在配置的求解期限内没有完成，退出码为 124。
+`--solver-stats` 额外输出 Predicate 细项、原始计时、计数、配置和 `[[[[ ACCEPT/REJECT ]]]]` marker，最终 verdict 仍为最后一行。检测器内部不设置求解超时；实验时限由外部 runner 的 `--timeout-seconds` 控制。`tools/run_catalog_experiment.py` 将进程超时记为 `PROCESS_TIMEOUT`，按最终 verdict 核对退出码；ERROR、截断日志或退出码不一致均不会作为 REJECT。
 
 ## audit 参数
 
-普通 `audit --help` 公开：
+`audit --help` 公开以下参数：
 
 ```text
---solver-timeout-seconds
-    MonoSAT 求解与 refinement 的总超时秒数；0 禁用后端超时。
-
+--[no-]gmwr
+    默认开启 GMWR；--no-gmwr 使用 EAGER。
+--[no-]gmwr-prepropagation
+    默认开启，只在 GMWR 模式下执行 vis/repair 预传播。
 --solver-stats
-    打印 MonoSAT/CNF、谓词编码、WW constraint 和 implication 统计。
+    输出详细统计和旧 verdict marker。
 ```
 
-当前 SI 谓词编码固定为 EAGER/general refinement。row-local EAGER 使用
-`ENCODED/UNSUPPORTED/INVALID` 三态：只有 `UNSUPPORTED` 转 general，`INVALID`
-直接加入矛盾约束。`--predicate-encoding`
-将在 SI 的 GMWR 实现接入后再公开；当前不会把未完成的 GMWR 作为默认值或
-可选值。
+WW reachability、predicate witness coalescing、graph-edge interning 在生产 CLI 固定开启。
+不再接受 `--solver-timeout-seconds`、`--predicate-encoding`、`--ww-pruning`、witness coalescing 或 interning 开关。
 
-实验消融参数仍可解析，但在帮助中隐藏：
+当前 WW 检查针对生成器的 WW(u,v) 加共同指向 v 的 RW 分支，补齐新 WW 与已有 B 组合后成环的情况；通过 BitSet 与既有反向闭包求交，不复制闭包。非标准分支保留原充分检查。
 
-```text
---ww-pruning NONE|REACHABILITY
---[no-]predicate-witness-coalescing
---[no-]graph-edge-interning
-```
+每次 audit 创建唯一 `SIReachabilityOracle`，WW 剪枝、谓词预处理和求解器共享这个确定事实实例。未知 VIS 由 SAT 的共享 literal 决定，候选 guard 不反写 Oracle；没有已知路径不等于不可见。
 
-`REACHABILITY` 是正式 WW 基线：每个候选分支仍由
-`SIVerifier.InducedGraph.Oracle` 按 `A ∪ (A ∘ B)` 检查；`NONE`
-仅用于跳过这一步的必要消融。WW constraint 始终按 writer transaction pair
-合并，predicate witness coalescing 和 graph-edge interning 默认开启。
+WW 剪枝后准备 GMWR 义务，并按开关执行预传播。相同 reader/bad writer 的各 key/observation item 仍按 AND 保留，不合并 repair 集合。不存在 repair 时约束 `NOT_VIS(bad,reader)`；bad 已确定可见且 repair 唯一时产生同 key WW/VIS 确定事实，由 assumption 守卫的 SAT 约束落实，不创建人工 PR 边。GMWR、预传播与 WW 剪枝均开启时，准备完成后单向将确定事实反馈给残余 WW，迭代至没有新确定项，不再重跑 GMWR。关闭预传播仍编码未解决 item；进入求解阶段后仅调用一次 MonoSAT。
 
-求解器构造分为六个可单独计时的阶段：
+求解器构造按以下阶段计时：
 
 ```text
 SI_GRAPH_ENCODE_SETUP
@@ -239,19 +228,20 @@ SI_GRAPH_ENCODE_KNOWN_EDGES
 SI_GRAPH_ENCODE_WW
 SI_GRAPH_ENCODE_RW
 SI_GRAPH_ENCODE_PREDICATE
+SI_GRAPH_ENCODE_DEPENDENCIES
 SI_GRAPH_ENCODE_ACYCLIC
 ```
 
-`--solver-stats` 会同时输出
-`WW_INITIAL_CONSTRAINTS`、`WW_AFTER_BASELINE`、
-`WW_INITIAL_IMPLICATIONS` 和 `WW_AFTER_BASELINE_IMPLICATIONS`；
-不再需要独立 constraint-only 加载和遍历。REJECT 使用统一的文本 cycle
-witness，不再提供 DOT/legacy 两套输出。
+`--solver-stats` 输出 `WW_INITIAL_CHOICES`、`WW_AFTER_REACHABILITY`、
+`WW_AFTER_GMWR_FEEDBACK`、`WW_GMWR_FEEDBACK_FORCED`、`WW_BRANCH_EXTRA_CONFLICTS`、
+`GMWR_INITIAL_CONSTRAINTS`、`GMWR_RESIDUAL_CONSTRAINTS` 和 `GMWR_FORCED_FACTS`。
+`Generated/Fixed PR_WR/PR_RW` 是两类合计；PR_WR 来源候选统计与最终 H 物理边数量是不同口径。`WW_BRANCH_EXTRA_CONFLICTS` 是增强检查命中次数，跨轮可能重复，不等于新增固定 WW 数。
+UNSAT 直接读取本次 MonoSAT assumption conflict clause，映射到 `WW_CHOICE`、
+`PREDICATE_OBLIGATION`、`GMWR_RULE`；不再重建 solver 缩核或输出旧 stdout cycle witness。
 
-结构化谓词会按 SAT 模型构造 latest-visible 快照并执行完整查询。错误的 JOIN、
-投影、重复行或遗漏行都会被拒绝；改变查询结果的后续写会生成相应的
-`PR_RW` anti-dependency。谓词依赖只由实际 MonoSAT 编码路径产生，不再额外
-构造或比较 debug-only 派生谓词图。
+固定返回来源及无隐式 bottom 备选的唯一来源直接编码可见性和全部竞争写排除；未定来源复用 latest 合取缓存。PR 见证合并保留去重 guard 集合，物理边使用直接子句精确绑定全部支持，不构造见证 OR 链。
+
+row-local 路径按 key 编码 latest-visible 版本，GMWR 只改变公式组织和剪枝。受支持 JOIN 在求解前枚举完整 contributing bindings，固定记录来源并排除额外结果，结果变化的 `PR_RW` 保留其他关系的上下文条件。两条路径都使用共同 VIS、同 key WW 和查询前自写，不在求解后读取模型快照、追加 no-good 或重复求解。
 
 当前 SI detector 也可直接审计 `History_Generator` 生成的结构化 MultiKV
 JOIN 历史：

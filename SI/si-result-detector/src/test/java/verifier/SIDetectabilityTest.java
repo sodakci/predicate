@@ -68,6 +68,14 @@ public class SIDetectabilityTest {
         }
     }
 
+    @Test
+    void rowPredicateFixtureDeclaresRowLocalSemantics() {
+        PredicateFixtures.RowPredicate<String, Integer> predicate =
+                (key, value) -> value > 5;
+
+        assertTrue(predicate.isRowLocal());
+    }
+
     // ================================================================
     // 维度一：基础 WW 冲突
     // ================================================================

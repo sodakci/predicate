@@ -27,6 +27,15 @@ class BlackBoxSIAuditTest {
     Path tempDir;
 
     @Test
+    void auditCliReportsExplicitErrorForMissingHistory() throws Exception {
+        var result = runAuditCommand("audit", tempDir.resolve("missing").toString());
+        assertEquals(1, result.exitCode);
+        assertTrue(result.stderr.contains("[SI] Error"));
+        assertTrue(result.stderr.contains("SI audit result: ERROR"));
+        assertFalse(result.stderr.contains("at history."));
+    }
+
+    @Test
     void auditCli_acceptsSerializableHistory() throws Exception {
         var result = runAudit(List.of(
                 "w(1,1,1,1)",
@@ -34,7 +43,11 @@ class BlackBoxSIAuditTest {
         ));
 
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"),
+        assertFalse(result.stderr.contains("[[[[ ACCEPT ]]]]"));
+        assertTrue(result.stderr.contains("History"));
+        assertTrue(result.stderr.contains("Timing"));
+        assertFalse(result.stderr.contains("Generated PR_WR/PR_RW"));
+        assertTrue(result.stderr.contains("SI audit result: ACCEPT"),
                 () -> "expected ACCEPT marker, stderr was:\n" + result.stderr);
     }
 
@@ -50,27 +63,25 @@ class BlackBoxSIAuditTest {
         ));
 
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"),
+        assertTrue(result.stderr.contains("SI audit result: ACCEPT"),
                 () -> "expected ACCEPT marker, stderr was:\n" + result.stderr);
     }
 
     @Test
-    void wwPruningAblationRunsThroughAuditAndReportsConstraintCounts() throws Exception {
-        var historyDir = writeTextHistoryAsPrhist("pruning-modes", List.of(
+    void preprocessingReportsReachabilityAndGmwrCounts() throws Exception {
+        var historyDir = writeTextHistoryAsPrhist("preprocessing", List.of(
                 "w(1,1,1,1)",
                 "r(1,1,2,2)"));
 
-        for (var mode : List.of("NONE", "REACHABILITY")) {
-            var audit = runAuditCommand(
-                    "audit", "--ww-pruning", mode, "--solver-stats",
-                    historyDir.toString());
-            assertEquals(0, audit.exitCode,
-                    () -> mode + " audit failed:\n" + audit.stderr);
-            assertTrue(audit.stderr.contains("WW_INITIAL_CONSTRAINTS:"));
-            assertTrue(audit.stderr.contains("WW_AFTER_BASELINE:"));
-            assertTrue(audit.stderr.contains("WW_INITIAL_IMPLICATIONS:"));
-            assertTrue(audit.stderr.contains("WW_AFTER_BASELINE_IMPLICATIONS:"));
-        }
+        var audit = runAuditCommand(
+                "audit", "--solver-stats", historyDir.toString());
+        assertEquals(0, audit.exitCode,
+                () -> "audit failed:\n" + audit.stderr);
+        assertTrue(audit.stderr.contains("WW_INITIAL_CHOICES:"));
+        assertTrue(audit.stderr.contains("WW_AFTER_REACHABILITY:"));
+        assertTrue(audit.stderr.contains("GMWR_RESIDUAL_CONSTRAINTS:"));
+        assertTrue(audit.stderr.contains("GMWR_FORCED_FACTS:"));
+        assertTrue(audit.stderr.contains("SI_ORACLE_BUILDS:"));
     }
 
     @Test
@@ -96,7 +107,7 @@ class BlackBoxSIAuditTest {
         var result = runAuditCommand("audit", historyDir.toString());
 
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ REJECT ]]]]"),
+        assertTrue(result.stderr.contains("SI audit result: REJECT"),
                 () -> "expected REJECT marker, stderr was:\n" + result.stderr);
     }
 
@@ -113,7 +124,7 @@ class BlackBoxSIAuditTest {
         // Theory: serial order T1 -> T2 -> T3. WR: T1->T2 on x and
         // T2->T3 on y. WW: T1->T3 on x. No RW edge points backward.
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"),
+        assertTrue(result.stderr.contains("SI audit result: ACCEPT"),
                 () -> "expected ACCEPT marker, stderr was:\n" + result.stderr);
     }
 
@@ -127,7 +138,7 @@ class BlackBoxSIAuditTest {
                 historyDir.toString());
 
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"));
+        assertTrue(result.stderr.contains("SI audit result: ACCEPT"));
         assertTrue(result.stderr.contains("backend=monosat"), () -> "stderr was:\n" + result.stderr);
     }
 
@@ -141,7 +152,7 @@ class BlackBoxSIAuditTest {
                 historyDir.toString());
 
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"));
+        assertTrue(result.stderr.contains("SI audit result: ACCEPT"));
         assertTrue(result.stderr.contains("backend=monosat"), () -> "stderr was:\n" + result.stderr);
     }
 
@@ -158,7 +169,7 @@ class BlackBoxSIAuditTest {
         var monosat = runAuditCommand("audit", historyDir.toString());
 
         assertEquals(0, monosat.exitCode);
-        assertTrue(monosat.stderr.contains("[[[[ ACCEPT ]]]]"));
+        assertTrue(monosat.stderr.contains("SI audit result: ACCEPT"));
     }
 
     @Test
@@ -225,10 +236,9 @@ class BlackBoxSIAuditTest {
         // because T2 read the initial y=0 and T1 overwrote y. Each partition
         // is acyclic by itself, but A union B has T1 -> T2 -> T1.
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stdout.contains("known WR key=1"),
-                () -> "expected WR edge in cycle witness, stdout was:\n" + result.stdout);
-        assertTrue(result.stdout.contains("RW key=2"),
-                () -> "expected RW edge in cycle witness, stdout was:\n" + result.stdout);
+        assertTrue(result.stderr.contains("[SI] Reject reason:"));
+        assertTrue(result.stderr.contains("[SI] Conflict core:"));
+        assertTrue(result.stdout.isEmpty());
     }
 
     @Test
@@ -246,7 +256,7 @@ class BlackBoxSIAuditTest {
         // PR_WR/source edge T1->T0 for inventory_onhand_x. The SER graph has
         // the cycle T0 -> T1 -> T0.
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ REJECT ]]]]"),
+        assertTrue(result.stderr.contains("SI audit result: REJECT"),
                 () -> "expected REJECT marker, stderr was:\n" + result.stderr);
     }
 
@@ -263,8 +273,10 @@ class BlackBoxSIAuditTest {
         // Theory: WR T1->T0 on dep_y, and empty PR on x requires PR_RW
         // T0->T1 because T1 writes a matching x. The cycle is T1 -> T0 -> T1.
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stdout.contains("PR_RW key=inventory_onhand_x"),
-                () -> "expected PR_RW edge in cycle witness, stdout was:\n" + result.stdout);
+        assertTrue(result.stderr.contains("[SI] 谓词剪枝发现确定性冲突："));
+        assertTrue(result.stderr.contains("key=inventory_onhand_x"));
+        assertFalse(result.stderr.contains("[SI] Conflict clause:"));
+        assertTrue(result.stdout.isEmpty());
     }
 
     @Test
@@ -288,7 +300,7 @@ class BlackBoxSIAuditTest {
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_y\",\"value\":400000002,\"semantic\":40,\"write_id\":46}]}"));
 
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ REJECT ]]]]"));
+        assertTrue(result.stderr.contains("SI audit result: REJECT"));
     }
 
     @Test
@@ -303,7 +315,7 @@ class BlackBoxSIAuditTest {
         ));
 
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"));
+        assertTrue(result.stderr.contains("SI audit result: ACCEPT"));
     }
 
     @Test
@@ -324,7 +336,7 @@ class BlackBoxSIAuditTest {
 
         // Latest-visible frontier semantics accepts this serial manual fixture.
         assertEquals(0, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ ACCEPT ]]]]"),
+        assertTrue(result.stderr.contains("SI audit result: ACCEPT"),
                 () -> "expected ACCEPT marker, stderr was:\n" + result.stderr);
     }
 
@@ -354,7 +366,7 @@ class BlackBoxSIAuditTest {
                         + "{\"type\":\"w\",\"key\":\"inventory_onhand_C_0000\",\"value\":430000008,\"semantic\":43,\"write_id\":8}]}"));
 
         assertEquals(-1, result.exitCode);
-        assertTrue(result.stderr.contains("[[[[ REJECT ]]]]"),
+        assertTrue(result.stderr.contains("SI audit result: REJECT"),
                 () -> "expected REJECT marker, stderr was:\n" + result.stderr);
     }
 
@@ -616,9 +628,9 @@ class BlackBoxSIAuditTest {
     private void assertAblationMatrix(Path historyPath, int expectedExitCode) throws Exception {
         var optionSets = List.of(
                 List.<String>of(),
-                List.of("--ww-pruning", "NONE"),
-                List.of("--no-predicate-witness-coalescing"),
-                List.of("--no-graph-edge-interning"));
+                List.of("--no-gmwr-prepropagation"),
+                List.of("--no-gmwr"),
+                List.of("--gmwr", "--gmwr-prepropagation"));
 
         for (var options : optionSets) {
             var args = new java.util.ArrayList<String>();
@@ -630,7 +642,7 @@ class BlackBoxSIAuditTest {
             assertEquals(expectedExitCode, result.exitCode,
                     () -> String.format("options=%s stderr:%n%s%nstdout:%n%s",
                             options, result.stderr, result.stdout));
-            assertTrue(result.stderr.contains(expectedExitCode == 0 ? "[[[[ ACCEPT ]]]]" : "[[[[ REJECT ]]]]"),
+            assertTrue(result.stderr.contains(expectedExitCode == 0 ? "SI audit result: ACCEPT" : "SI audit result: REJECT"),
                     () -> String.format("options=%s stderr:%n%s", options, result.stderr));
         }
     }

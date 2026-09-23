@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class SIVerifierPredicateTest {
     @Test
-    void knownPrWrIsUsedAsAnAEdgeByTheActualSiSolver() {
+    void knownPrWrIsUsedAsAnAEdgeBySiStages() {
         var history = twoTransactionHistory();
         var first = history.getTransaction(1L);
         var second = history.getTransaction(2L);
@@ -22,21 +22,21 @@ public class SIVerifierPredicateTest {
         var withoutPredicateEdge = new KnownGraph<String, Integer>(history);
         withoutPredicateEdge.putEdge(second, first,
                 new Edge<>(EdgeType.WR, "dependency"));
-        assertTrue(new SISolverInduced<>(
-                history, withoutPredicateEdge, List.of()).solve());
+        assertTrue(SISolverTestSupport.solve(
+                history, withoutPredicateEdge, List.of()));
 
         var withPredicateEdge = new KnownGraph<String, Integer>(history);
         withPredicateEdge.putEdge(second, first,
                 new Edge<>(EdgeType.WR, "dependency"));
         withPredicateEdge.putEdge(first, second,
                 new Edge<>(EdgeType.PR_WR, "predicate"));
-        assertFalse(new SISolverInduced<>(
-                history, withPredicateEdge, List.of()).solve(),
+        assertFalse(SISolverTestSupport.solve(
+                history, withPredicateEdge, List.of()),
                 "PR_WR must enter A and close the A-edge cycle");
     }
 
     @Test
-    void knownPrRwIsUsedAsABEdgeByTheActualSiSolver() {
+    void knownPrRwIsUsedAsABEdgeBySiStages() {
         var history = twoTransactionHistory();
         var first = history.getTransaction(1L);
         var second = history.getTransaction(2L);
@@ -44,7 +44,7 @@ public class SIVerifierPredicateTest {
         var bOnly = new KnownGraph<String, Integer>(history);
         bOnly.putEdge(second, first,
                 new Edge<>(EdgeType.PR_RW, "predicate"));
-        assertTrue(new SISolverInduced<>(history, bOnly, List.of()).solve(),
+        assertTrue(SISolverTestSupport.solve(history, bOnly, List.of()),
                 "a standalone B edge is not itself an induced-SI edge");
 
         var withComposition = new KnownGraph<String, Integer>(history);
@@ -52,8 +52,8 @@ public class SIVerifierPredicateTest {
                 new Edge<>(EdgeType.WR, "dependency"));
         withComposition.putEdge(second, first,
                 new Edge<>(EdgeType.PR_RW, "predicate"));
-        assertFalse(new SISolverInduced<>(
-                history, withComposition, List.of()).solve(),
+        assertFalse(SISolverTestSupport.solve(
+                history, withComposition, List.of()),
                 "PR_RW must enter B so A composition B creates a self-cycle");
         var conflicts = SIVerifier.InducedGraph.extractCycleEdges(withComposition);
         assertTrue(conflicts.stream()

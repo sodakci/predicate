@@ -2,6 +2,7 @@ package history.loaders;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.luben.zstd.ZstdInputStream;
 import history.Event;
 import history.History;
 import history.InvalidHistoryError;
@@ -15,7 +16,10 @@ import history.query.StructuredQueryParser;
 import history.query.ValueAdapter;
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileReader;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -29,7 +33,8 @@ import lombok.EqualsAndHashCode;
 import lombok.SneakyThrows;
 
 public class PredicateHistoryLoader implements history.HistoryLoader<String, PredicateHistoryLoader.PredicateValue> {
-    private static final String HISTORY_FILE = "history.prhist.jsonl";
+    private static final String COMPRESSED_HISTORY_FILE = "history.prhist.jsonl.zst";
+    private static final String LEGACY_HISTORY_FILE = "history.prhist.jsonl";
     private static final String INITIAL_STATE_FILE = "initial_state.json";
     private static final long INIT_SESSION_ID = -1L;
     private static final long INIT_TXN_ID = -1L;
@@ -49,7 +54,14 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
     public PredicateHistoryLoader(Path path) {
         var file = path.toFile();
         var root = file.isDirectory() ? file : file.getParentFile();
-        historyFile = file.isDirectory() ? path.resolve(HISTORY_FILE).toFile() : file;
+        if (file.isDirectory()) {
+            var compressed = path.resolve(COMPRESSED_HISTORY_FILE).toFile();
+            historyFile = compressed.isFile()
+                    ? compressed
+                    : path.resolve(LEGACY_HISTORY_FILE).toFile();
+        } else {
+            historyFile = file;
+        }
         initialStateFile = root == null ? new File(INITIAL_STATE_FILE) : root.toPath().resolve(INITIAL_STATE_FILE).toFile();
 
         if (!historyFile.isFile()) {
@@ -65,7 +77,8 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
 
         var transactions = new ArrayList<ParsedTransaction>();
         var sessionSequences = new HashMap<Long, Set<Long>>();
-        try (var in = new BufferedReader(new FileReader(historyFile))) {
+        try (var in = new BufferedReader(new InputStreamReader(
+                historyInputStream(), StandardCharsets.UTF_8))) {
             String line;
             while ((line = in.readLine()) != null) {
                 if (line.isBlank()) {
@@ -89,6 +102,14 @@ public class PredicateHistoryLoader implements history.HistoryLoader<String, Pre
         }
 
         return history;
+    }
+
+    private InputStream historyInputStream() throws java.io.IOException {
+        var input = new FileInputStream(historyFile);
+        if (historyFile.getName().endsWith(".zst")) {
+            return new ZstdInputStream(input);
+        }
+        return input;
     }
 
     @SneakyThrows

@@ -1,35 +1,35 @@
 import org.junit.jupiter.api.Test;
 import picocli.CommandLine;
-import verifier.SIVerifier;
 
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class SIPruningCliTest {
     @Test
-    void exposesOneAuditCommandAndOnlyTheSupportedPruningModes() {
+    void exposesCompactProductionCliAndPredicateBaseline() {
         var commandLine = new CommandLine(new Main());
         assertEquals(Set.of("audit"), commandLine.getSubcommands().keySet());
 
         var audit = commandLine.getSubcommands().get("audit");
-        var option = audit.getCommandSpec().findOption("--ww-pruning");
-        assertNotNull(option);
-        assertEquals(SIVerifier.PruningMode.class, option.type());
-        assertEquals(java.util.List.of(
-                        SIVerifier.PruningMode.NONE,
-                        SIVerifier.PruningMode.REACHABILITY),
-                java.util.Arrays.asList(SIVerifier.PruningMode.values()));
-        assertEquals(true, option.hidden());
+        assertNull(audit.getCommandSpec().findOption("--ww-pruning"));
 
-        assertNotNull(audit.getCommandSpec().findOption("--solver-timeout-seconds"));
+        assertNull(audit.getCommandSpec().findOption("--predicate-encoding"));
+        var gmwr = audit.getCommandSpec().findOption("--gmwr");
+        assertNotNull(gmwr);
+        assertEquals(false, gmwr.hidden());
+        assertEquals(true, gmwr.negatable());
+        assertNull(audit.getCommandSpec().findOption("--solver-timeout-seconds"));
+        assertThrows(CommandLine.ParameterException.class,
+                () -> commandLine.parseArgs("audit", "--solver-timeout-seconds", "1", "history"));
         assertNotNull(audit.getCommandSpec().findOption("--solver-stats"));
-        assertEquals(true, audit.getCommandSpec()
-                .findOption("--predicate-witness-coalescing").hidden());
-        assertEquals(true, audit.getCommandSpec()
-                .findOption("--graph-edge-interning").hidden());
+        assertEquals(false, audit.getCommandSpec()
+                .findOption("--gmwr-prepropagation").hidden());
+        assertNull(audit.getCommandSpec().findOption("--predicate-witness-coalescing"));
+        assertNull(audit.getCommandSpec().findOption("--graph-edge-interning"));
 
         assertNull(audit.getCommandSpec().findOption("--type"));
         assertNull(audit.getCommandSpec().findOption("--solver"));
@@ -39,6 +39,5 @@ class SIPruningCliTest {
         assertNull(audit.getCommandSpec().findOption("--dot-output"));
         assertNull(audit.getCommandSpec()
                 .findOption("--compare-derived-predicate-edges"));
-        assertNull(audit.getCommandSpec().findOption("--predicate-encoding"));
     }
 }
