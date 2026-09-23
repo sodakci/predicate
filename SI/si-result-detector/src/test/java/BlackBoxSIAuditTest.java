@@ -27,6 +27,22 @@ class BlackBoxSIAuditTest {
     Path tempDir;
 
     @Test
+    void wwFeedbackCliReportsEffectiveSetting() throws Exception {
+        var path = writeTextHistoryAsPrhist("feedback-cli", List.of("w(1,1,1,1)"));
+        var options = List.of(List.<String>of(), List.of("--ww-feedback"),
+                List.of("--no-ww-feedback"), List.of("--ww-feedback", "--no-gmwr"),
+                List.of("--ww-feedback", "--no-gmwr-prepropagation"));
+        for (int i = 0; i < options.size(); i++) {
+            var args = new ArrayList<>(List.of("audit", "--solver-stats"));
+            args.addAll(options.get(i));
+            args.add(path.toString());
+            var result = runAuditCommand(args);
+            assertEquals(0, result.exitCode, result.stderr);
+            assertTrue(result.stderr.contains("[solver-stats] ww-feedback=" + (i < 2)), result.stderr);
+        }
+    }
+
+    @Test
     void auditCliReportsExplicitErrorForMissingHistory() throws Exception {
         var result = runAuditCommand("audit", tempDir.resolve("missing").toString());
         assertEquals(1, result.exitCode);
@@ -629,6 +645,7 @@ class BlackBoxSIAuditTest {
         var optionSets = List.of(
                 List.<String>of(),
                 List.of("--no-gmwr-prepropagation"),
+                List.of("--no-ww-feedback"),
                 List.of("--no-gmwr"),
                 List.of("--gmwr", "--gmwr-prepropagation"));
 

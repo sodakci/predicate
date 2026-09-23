@@ -54,6 +54,8 @@ public class SIVerifier<KeyType, ValueType> {
         boolean wwReachabilityPruning = true;
         /** SI visibility/repair propagation before SAT encoding. */
         public boolean gmwrPrepropagation = true;
+        /** GMWR 准备结束后单向反馈确定事实到残余 WW。 */
+        public boolean wwFeedback = true;
         public boolean detailedPredicateMetrics;
         public SatSolveBackend satSolveBackend;
         public Consumer<AuditStage> auditProgressListener = ignored -> { };
@@ -167,7 +169,8 @@ public class SIVerifier<KeyType, ValueType> {
         try {
             if (!prepared.hasConflict() && !prepared.observations().isEmpty()
                     && solverSettings.predicateMode == PredicateMode.GMWR
-                    && solverSettings.gmwrPrepropagation && solverSettings.wwReachabilityPruning) {
+                    && solverSettings.gmwrPrepropagation && solverSettings.wwReachabilityPruning
+                    && solverSettings.wwFeedback) {
                 // 只反馈确定事实；沿用完整 WW/RW 分支提交，不重建谓词阶段。
                 while (!constraints.isEmpty()) {
                     var reduction = SIReachabilityPruner.reduceOnce(graph, constraints, vis);

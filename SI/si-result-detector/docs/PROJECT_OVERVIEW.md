@@ -113,7 +113,7 @@ PRHIST loader
      写/source/行贡献分析、prepared observations、PR_WR 固定点
      GMWR items 与可选预传播、residual 数据
      已证明冲突 -> REJECT（不创建 native solver）
-  -> 单向 WW-feedback（GMWR、预传播及 WW 剪枝均开启时）
+  -> 单向 WW-feedback（WW-feedback、GMWR、预传播及 WW 剪枝均开启时）
   -> SISolverInduced
      SETUP -> KNOWN_EDGES -> WW -> RW -> PREDICATE
      -> DEPENDENCIES -> ACYCLIC
@@ -122,7 +122,7 @@ PRHIST loader
      UNSAT -> 本次 conflict clause -> REJECT
 ```
 
-各阶段共用同一确定 Oracle；候选 guard 不反写 Oracle。关闭 GMWR 选择 EAGER；关闭预传播仍构建 residual obligations。
+各阶段共用同一确定 Oracle；候选 guard 不反写 Oracle。关闭 GMWR 选择 EAGER；关闭预传播仍构建 residual obligations；`--no-ww-feedback` 只跳过准备后的反馈阶段。
 
 ## 5. 输入模型
 
@@ -458,7 +458,8 @@ audit HISTORY
 
 ```text
 --[no-]gmwr                      # default on; off selects EAGER
---[no-]gmwr-prepropagation       # default on; only effective with GMWR
+--[no-]gmwr-prepropagation       # 默认开启，仅在 GMWR 下生效
+--[no-]ww-feedback               # 默认开启，需要 GMWR 和预传播
 --solver-stats
 ```
 
@@ -519,7 +520,7 @@ src/main/java/verifier/SIEdge.java
 
 回归范围包括 loader/QueryPlan、内部一致性、write skew、同 key 写冲突、point RW、typed PR_WR/PR_RW、共同 VIS 快照、row-local 与 JOIN 的 bag/provenance、all-INTERNAL、能力错误、预传播/编码模式 parity、单次 backend 调用和原生冲突复用，以及 runner 最终 verdict/exit/外部超时契约。
 
-纯 typed A/B 小图差分仍可验证基本 induced 规则，但不能代替含 VIS 辅助分支、完整 latest/frontier 和跨 key JOIN 的语义回归。此处列出覆盖职责，截至 2026-09-23 最近一次正式回归共 177 项，175 通过、2 项因既有外部 catalog 缺失跳过，0 失败。WW 检查的三个历史两轮交叉顺序测试均 ACCEPT，平均总耗时下降约 9.3%–14.5%；不是全 workload 性能保证。证据、样本和资源限制见根目录 CHANGE_LOG.md。
+纯 typed A/B 小图差分仍可验证基本 induced 规则，但不能代替含 VIS 辅助分支、完整 latest/frontier 和跨 key JOIN 的语义回归。此处列出覆盖职责，截至 2026-09-23 最近一次正式回归共 179 项，177 通过、2 项因既有外部 catalog 缺失跳过，0 失败。WW 检查的三个历史两轮交叉顺序测试均 ACCEPT，平均总耗时下降约 9.3%–14.5%；不是全 workload 性能保证。证据、样本和资源限制见根目录 CHANGE_LOG.md。
 
 ## 17. 当前边界
 

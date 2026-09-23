@@ -26,6 +26,10 @@ class SIPruningCliTest {
         assertThrows(CommandLine.ParameterException.class,
                 () -> commandLine.parseArgs("audit", "--solver-timeout-seconds", "1", "history"));
         assertNotNull(audit.getCommandSpec().findOption("--solver-stats"));
+        var feedback = audit.getCommandSpec().findOption("--ww-feedback");
+        assertNotNull(feedback);
+        assertEquals(true, feedback.negatable());
+        assertEquals(false, feedback.hidden());
         assertEquals(false, audit.getCommandSpec()
                 .findOption("--gmwr-prepropagation").hidden());
         assertNull(audit.getCommandSpec().findOption("--predicate-witness-coalescing"));

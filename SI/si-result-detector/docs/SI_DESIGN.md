@@ -6,7 +6,7 @@
 
 主链为“PRHIST → 查询能力检查 → 内部一致性 → KnownGraph → WW choices → 唯一确定 Oracle → WW 剪枝 → PredicateAnalysis/PredicatePruning → 可选单向 WW-feedback → residual MonoSAT 编码 → 单次 solve → ACCEPT/REJECT”。不支持的查询通过异常流程得到 ERROR。
 
-公开 `audit HISTORY`，保留 `--[no-]gmwr`、`--[no-]gmwr-prepropagation`、`--solver-stats`；WW 剪枝、witness coalescing 和 edge interning 在 CLI 固定开启。没有内部求解超时选项。
+公开 `audit HISTORY`，保留 `--[no-]gmwr`、`--[no-]gmwr-prepropagation`、`--[no-]ww-feedback`、`--solver-stats`；WW 剪枝、witness coalescing 和 edge interning 在 CLI 固定开启。没有内部求解超时选项。
 
 ```text
 A_t = SO ∪ WR ∪ WW ∪ PR_WR
@@ -33,7 +33,7 @@ Main.Audit.call
      -> SIReachabilityPruner（固定完整 WW/RW side）
      -> PredicateAnalysis（只读共享索引/行贡献）
      -> PredicatePruning（准备、确定 PR_WR 固定点、可选 GMWR 预传播）
-     -> 单向 WW-feedback（GMWR、预传播及 WW 剪枝均开启时）
+     -> 单向 WW-feedback（WW-feedback、GMWR、预传播及 WW 剪枝均开启时）
      -> SISolverInduced（消费同一 Oracle 与 prepared/residual 数据）
         SETUP -> KNOWN_EDGES -> WW -> RW -> PREDICATE
         -> DEPENDENCIES -> ACYCLIC
@@ -207,7 +207,7 @@ WW 剪枝、唯一 PR_WR 传播、GMWR preparation/prepropagation 和 solver 共
 NOT VIS(bad,R) OR OR_good(WW_k(bad,good) AND VIS(good,R))
 ```
 
-预传播删除确定不可能的 repair。bad 已可见且只剩一个 repair 时推导相应 WW 与 VIS；无 repair 推导 NOT_VIS，不推导反向 VIS。唯一 PR_WR 进入确定事实固定点；这些确定事实在谓词准备结束后单向反馈给残余 WW 剪枝，整侧提交 WW/RW 并迭代至没有新确定项；不重新运行 GMWR 或冻结数据准备，不把候选 PR guard 当作证明自身的确定事实。关闭预传播或 WW 剪枝时不执行 feedback，仍准备和编码 residual obligations。
+预传播删除确定不可能的 repair。bad 已可见且只剩一个 repair 时推导相应 WW 与 VIS；无 repair 推导 NOT_VIS，不推导反向 VIS。唯一 PR_WR 进入确定事实固定点；这些确定事实在谓词准备结束后单向反馈给残余 WW 剪枝，整侧提交 WW/RW 并迭代至没有新确定项；不重新运行 GMWR 或冻结数据准备，不把候选 PR guard 当作证明自身的确定事实。关闭 WW-feedback、GMWR、预传播或 WW 剪枝时不执行 feedback，仍准备和编码 residual obligations。
 
 ### 4.7 Solver setup、known edges 与 WW
 

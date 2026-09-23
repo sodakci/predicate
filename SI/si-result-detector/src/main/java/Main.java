@@ -40,6 +40,10 @@ class Audit implements Callable<Integer> {
             description = "enable GMWR prepropagation (effective only with GMWR)")
     private Boolean gmwrPrepropagation;
 
+    @Option(names = { "--ww-feedback" }, negatable = true,
+            description = "启用 GMWR 后的 WW 反馈剪枝（默认开启，需要 GMWR 和预传播）")
+    private Boolean wwFeedback;
+
     @Parameters(paramLabel = "HISTORY", description = "history path")
     private Path path;
 
@@ -76,6 +80,7 @@ class Audit implements Callable<Integer> {
         var settings = SIVerifier.SolverSettings.defaults();
         settings.predicateMode = selectedPredicateEncoding;
         settings.gmwrPrepropagation = gmwrEnabled && prepropagationEnabled;
+        settings.wwFeedback = settings.gmwrPrepropagation && (wwFeedback == null || wwFeedback);
         settings.predicateWitnessCoalescing = true;
         settings.graphEdgeInterning = true;
         settings.detailedPredicateMetrics = solverStats;
@@ -102,6 +107,7 @@ class Audit implements Callable<Integer> {
                     selectedPredicateEncoding.name().toLowerCase());
             System.err.printf("[solver-stats] gmwr-prepropagation=%s%n",
                     settings.gmwrPrepropagation);
+            System.err.printf("[solver-stats] ww-feedback=%s%n", settings.wwFeedback);
             System.err.printf("[solver-stats] predicate-witness-coalescing=%s%n",
                     settings.predicateWitnessCoalescing);
             System.err.printf("[solver-stats] graph-edge-interning=%s%n",

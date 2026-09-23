@@ -72,6 +72,31 @@ class PredicatePruningTest {
     }
 
     @Test
+    void disablingWwFeedbackKeepsInitialPruningAndGmwrActive() throws Exception {
+        var path = history("ww-feedback",
+                "[{\"key\":\"kv:k0\",\"value\":4},{\"key\":\"control:c\",\"value\":0}]",
+                txn(1, 11, write("kv:k0", 8)),
+                txn(2, 12, write("kv:k0", 7) + "," + write("control:c", 1)),
+                txn(3, 13, read("control:c", 1) + "," + emptyRead()));
+        var profiler = Profiler.getInstance();
+        for (boolean enabled : List.of(true, false)) {
+            profiler.clear();
+            var settings = SIVerifier.SolverSettings.defaults();
+            settings.wwFeedback = enabled;
+            assertTrue(settings.gmwrPrepropagation);
+            assertEquals(SIVerifier.AuditResult.ACCEPT,
+                    new SIVerifier<>(new PredicateHistoryLoader(path), settings, true).auditResult());
+            assertEquals(1, profiler.getCount("WW_AFTER_REACHABILITY"));
+            assertEquals(enabled ? 1 : 0, profiler.getCount("WW_GMWR_FEEDBACK_ROUNDS"));
+            assertEquals(enabled ? 0 : 1, profiler.getCount("SI_PROP_WW_CHOICE_VARIABLES_COUNT"));
+            assertEquals(enabled ? 1 : 0, profiler.getCount("WW_GMWR_FEEDBACK_FORCED"));
+            assertEquals(enabled ? 0 : 1, profiler.getCount("WW_AFTER_GMWR_FEEDBACK"));
+            assertEquals(1, profiler.getCount("SI_NATIVE_SOLVER_CREATIONS_COUNT"));
+            assertEquals(1, profiler.getCount("SI_ORACLE_BUILDS"));
+        }
+    }
+
+    @Test
     void finalWriterListsAreSharedImmutableAndExcludeReadersOwnFinalWrite() throws Exception {
         var path = history("shared-final-writes", initial("kv:k0", 4),
                 txn(1, 11, write("kv:k0", 7) + "," + write("kv:k0", 8)),

@@ -207,9 +207,14 @@ EAGER 模式不输出 GMWR 段；提前拒绝时只输出已完成的阶段。
     默认开启 GMWR；--no-gmwr 使用 EAGER。
 --[no-]gmwr-prepropagation
     默认开启，只在 GMWR 模式下执行 vis/repair 预传播。
+--[no-]ww-feedback
+    默认开启，只在 GMWR 和预传播均开启时执行准备后的 WW 反馈剪枝。
+    --no-ww-feedback 不关闭初始 WW 剪枝、GMWR 或预传播。
 --solver-stats
     输出详细统计和旧 verdict marker。
 ```
+
+在已有 audit 命令末尾追加 `--no-ww-feedback` 可关闭反馈；使用 `--ww-feedback` 或省略该选项保持开启。`--solver-stats` 输出 `[solver-stats] ww-feedback=true/false`，表示满足 GMWR/预传播依赖后的配置；无残余 WW 等情况仍可能实际执行零轮。
 
 WW reachability、predicate witness coalescing、graph-edge interning 在生产 CLI 固定开启。
 不再接受 `--solver-timeout-seconds`、`--predicate-encoding`、`--ww-pruning`、witness coalescing 或 interning 开关。
@@ -218,7 +223,7 @@ WW reachability、predicate witness coalescing、graph-edge interning 在生产 
 
 每次 audit 创建唯一 `SIReachabilityOracle`，WW 剪枝、谓词预处理和求解器共享这个确定事实实例。未知 VIS 由 SAT 的共享 literal 决定，候选 guard 不反写 Oracle；没有已知路径不等于不可见。
 
-WW 剪枝后准备 GMWR 义务，并按开关执行预传播。相同 reader/bad writer 的各 key/observation item 仍按 AND 保留，不合并 repair 集合。不存在 repair 时约束 `NOT_VIS(bad,reader)`；bad 已确定可见且 repair 唯一时产生同 key WW/VIS 确定事实，由 assumption 守卫的 SAT 约束落实，不创建人工 PR 边。GMWR、预传播与 WW 剪枝均开启时，准备完成后单向将确定事实反馈给残余 WW，迭代至没有新确定项，不再重跑 GMWR。关闭预传播仍编码未解决 item；进入求解阶段后仅调用一次 MonoSAT。
+WW 剪枝后准备 GMWR 义务，并按开关执行预传播。相同 reader/bad writer 的各 key/observation item 仍按 AND 保留，不合并 repair 集合。不存在 repair 时约束 `NOT_VIS(bad,reader)`；bad 已确定可见且 repair 唯一时产生同 key WW/VIS 确定事实，由 assumption 守卫的 SAT 约束落实，不创建人工 PR 边。WW-feedback、GMWR、预传播与 WW 剪枝均开启时，准备完成后单向将确定事实反馈给残余 WW，迭代至没有新确定项，不再重跑 GMWR。关闭预传播仍编码未解决 item；进入求解阶段后仅调用一次 MonoSAT。
 
 求解器构造按以下阶段计时：
 

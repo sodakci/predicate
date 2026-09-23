@@ -107,7 +107,7 @@ O(Σk wk² + Σk WRk·wk)
 | `verifier/PredicatePruning.java` | WW 完成后准备 observation/row-key 数据、PR_WR 候选和 GMWR items；可选预传播后交付 residual 数据；固定来源跳过无消费者分类，两次交接共享不可变 metadata，动态来源域独立冻结。 |
 | `verifier/SiGmwrPropagationState.java` | 按 `(reader,badWriter)` 分组，但各 key/observation item 仍按 AND 保留；无 repair 推导 NOT_VIS，唯一 repair 推导 WW 与 VIS；按受影响端点唤醒去重队列，不扫描全部关系 watcher。 |
 
-Oracle 的“尚无确定路径”是未知，不是 NOT_VIS。未证明的分支、VIS 和 source 选择留给 SAT。唯一 PR_WR 可进入确定事实固定点；候选 guard 不反写 Oracle。默认 GMWR 预传播完成后，SIVerifier 单向反馈确定事实到残余 WW，整侧提交 WW/RW 至固定点；不再重跑 GMWR，不把普通提交先后当成快照可见性。
+Oracle 的“尚无确定路径”是未知，不是 NOT_VIS。未证明的分支、VIS 和 source 选择留给 SAT。唯一 PR_WR 可进入确定事实固定点；候选 guard 不反写 Oracle。默认 GMWR 预传播完成且 WW-feedback 开启后，SIVerifier 单向反馈确定事实到残余 WW，整侧提交 WW/RW 至固定点；不再重跑 GMWR，不把普通提交先后当成快照可见性。
 
 初始 WW 停止条件为约束清空或本轮确定数量不超过剩余数量的 1%；GMWR 后单向 feedback 停止于约束清空或无新确定项。row-local preparation 与预传播不负责重新组织 WW choices；关闭预传播仍保留全部 residual obligations。
 
@@ -220,7 +220,7 @@ frontier 共用事务对 VIS 与逐 key WW，query 前 self writes 覆盖相应 
 | --- | --- | --- |
 | `--solver-stats` | false | 输出详细 predicate/physical edge/CNF counts。 |
 
-公开参数为 `--[no-]gmwr`、`--[no-]gmwr-prepropagation`，默认均开启；关闭 GMWR 使用 EAGER，预传播开关随之失效。生产 CLI 固定开启 WW reachability、witness coalescing、graph-edge interning，不接受旧 `--predicate-encoding/--ww-pruning/--solver-timeout-seconds` 和后两项开关。
+公开参数为 `--[no-]gmwr`、`--[no-]gmwr-prepropagation`、`--[no-]ww-feedback`，默认均开启；关闭 GMWR 使用 EAGER，预传播与 feedback 随之失效。`--no-ww-feedback` 仅关闭准备结束后的 WW 反馈，不关闭初始 WW 剪枝、GMWR 或预传播；关闭预传播也不执行 feedback。`--solver-stats` 的 `ww-feedback` 行显示满足模式依赖后的启用配置。生产 CLI 固定开启 WW reachability、witness coalescing、graph-edge interning，不接受旧 `--predicate-encoding/--ww-pruning/--solver-timeout-seconds` 和后两项开关。
 
 默认日志使用 History/WW/GMWR/SAT/Timing 摘要及 `SI audit result: ...`；Predicate 细项、原始统计与旧 marker 只在 `--solver-stats` 输出。异常显式输出 `[SI] Error`、`SI audit result: ERROR`，退出码 1。
 
